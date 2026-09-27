@@ -30,6 +30,7 @@ local VNCViewer = WidgetContainer:extend{
     settings = nil,      -- @{vncviewer.settings} store
     sessions = {},       -- profile name -> @{vncviewer.session}
     app = nil,           -- the (single) live @{vncviewer.app}
+    connection_list = nil, -- the connection list while it is on screen
 }
 
 function VNCViewer:init()
@@ -60,9 +61,12 @@ end
 
 -- ---------------------------------------------------------------- sessions
 
---- Reports session transitions. Errors are shown even when the app is open.
+--- Reports session transitions. Errors are shown even when the app is open, except while a
+--- connect attempt is in flight: that attempt's own callback reports the failure, and saying it
+--- twice would stack two messages on screen.
 function VNCViewer:on_session_state(session, state, err)
     if state ~= "error" then return end
+    if self._pending_connect == session then return end
     local message = tostring(err or _("unknown error"))
     if self.app and self.app.session == session then
         self.app:on_session_error(message)
@@ -94,7 +98,27 @@ function VNCViewer:show(profile_name)
             return
         end
     end
-    UIManager:show(Dialogs.connection_list(self, {}))
+    self:show_connection_list()
+end
+
+--[[--
+Shows the connection list, replacing one that is already on screen.
+
+This is what every "go back" in the connection dialogs ends up calling, so it must be safe to
+call at any point (and it never leaves two lists stacked).
+]]
+function VNCViewer:show_connection_list()
+    self:close_connection_list()
+    self.connection_list = Dialogs.open_connection_list(self, {
+        on_close = function() self.connection_list = nil end,
+    })
+end
+
+--- Closes the connection list if it is on screen.
+function VNCViewer:close_connection_list()
+    local menu = self.connection_list
+    self.connection_list = nil
+    if menu then UIManager:close(menu) end
 end
 
 --- Opens (or reopens) the viewer app for `session` and attaches it.
@@ -112,8 +136,13 @@ end
 
 --[[--
 Connects to `name` (or re-attaches an existing connection to it) and opens the viewer.
+
+--- @tparam string name profile name
+--- @tparam[opt] function on_failure called after a failed attempt (the connection list passes
+---   its "go back" here, so a failure returns the user to the list instead of dropping them out
+---   of the plugin)
 ]]
-function VNCViewer:connect_profile(name)
+function VNCViewer:connect_profile(name, on_failure)
     local profile = self.settings:get_profile(name)
     if not profile then
         UIManager:show(InfoMessage:new{ text = T(_("No connection named %1."), name), timeout = 3 })
@@ -137,16 +166,20 @@ function VNCViewer:connect_profile(name)
         return
     end
 
+    self._pending_connect = session
     session:connect(function(ok, err)
+        if self._pending_connect == session then self._pending_connect = nil end
         if not ok then
-            UIManager:show(InfoMessage:new{
-                text = T(_("Could not connect to %1: %2"), name, tostring(err)),
-                timeout = 4,
-            })
             if not self.app then
                 -- never connected: don't keep a dead session around
                 self.sessions[name] = nil
             end
+            -- go back first, so the message is shown *on top of* whatever we return to
+            if on_failure then on_failure() end
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not connect to %1: %2"), name, tostring(err)),
+                timeout = 4,
+            })
             return
         end
         self:_open_app(session)

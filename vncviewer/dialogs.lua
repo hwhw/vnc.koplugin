@@ -1,5 +1,11 @@
 --[[--
-Connection list, profile editor and delete confirmations.
+Connection list, profile actions, profile editor and delete confirmation.
+
+Every surface here has an explicit way back, and each one returns to the surface it was
+opened from: the list is the root, `profile_actions` goes back to the list, the editor goes
+back to whatever opened it, and a failed connection returns to the list instead of dropping
+the user out of the plugin. `Menu`, `ButtonDialog` and the editor's own `id = "close"` button
+(which `InputDialog:onCloseDialog` invokes for the Back key) all funnel into those callbacks.
 
 @module vncviewer.dialogs
 ]]
@@ -23,15 +29,32 @@ local function trim(s)
 end
 
 --[[--
-The list of saved connections, plus "New connection…" and "Manage connections…".
+Shows a (new) connection list. `plugin:show_connection_list()` is the way to *go back* to it,
+since it also drops a list that is already on screen.
 
 --- @tparam table plugin
 --- @tparam[opt] table opts `{ on_close = fn }`
---- @treturn table the Menu (call `UIManager:show()` on it)
+--- @treturn table the Menu that was shown
+]]
+function Dialogs.open_connection_list(plugin, opts)
+    local menu = Dialogs.connection_list(plugin, opts)
+    UIManager:show(menu)
+    return menu
+end
+
+--[[--
+The list of saved connections, plus "New connection…" and "Manage connections…".
+
+--- @tparam table plugin
+--- @tparam[opt] table opts `{ on_close = fn }`, `on_close` runs when the list is closed
+--- @treturn table the Menu (the caller shows it)
 ]]
 function Dialogs.connection_list(plugin, opts)
     opts = opts or {}
     local menu
+    -- Where every sub-dialog returns to.
+    local function back() plugin:show_connection_list() end
+
     local profiles = plugin.settings:profiles()
     local item_table = {}
     for _, profile in ipairs(profiles) do
@@ -39,16 +62,16 @@ function Dialogs.connection_list(plugin, opts)
             text = profile.name,
             mandatory = string.format("%s:%d", profile.host, profile.port),
             callback = function()
-                UIManager:close(menu)
-                plugin:connect_profile(profile.name)
+                plugin:close_connection_list()
+                plugin:connect_profile(profile.name, back)
             end,
         }
     end
     table.insert(item_table, {
         text = _("New connection…"),
         callback = function()
-            UIManager:close(menu)
-            Dialogs.edit_profile(plugin, nil, opts.on_saved, opts.on_close)
+            plugin:close_connection_list()
+            Dialogs.edit_profile(plugin, nil, { on_back = back })
         end,
     })
     if #profiles > 0 then
@@ -57,8 +80,8 @@ function Dialogs.connection_list(plugin, opts)
             manage[#manage + 1] = {
                 text = profile.name,
                 callback = function()
-                    UIManager:close(menu)
-                    UIManager:show(Dialogs.profile_actions(plugin, profile, opts))
+                    plugin:close_connection_list()
+                    UIManager:show(Dialogs.profile_actions(plugin, profile, { on_back = back }))
                 end,
             }
         end
@@ -80,10 +103,23 @@ function Dialogs.connection_list(plugin, opts)
 end
 
 --[[--
-Connect / Edit / Delete for one connection.
+Connect / Edit / Delete for one connection, with a Back button that returns to `opts.on_back`
+(the connection list). Tapping outside, or Back, does the same.
+
+--- @tparam table plugin
+--- @tparam table profile
+--- @tparam[opt] table opts `{ on_back = fn }`
+--- @treturn table the ButtonDialog (the caller shows it)
 ]]
 function Dialogs.profile_actions(plugin, profile, opts)
     opts = opts or {}
+    local function back()
+        if opts.on_back then opts.on_back() else Dialogs.open_connection_list(plugin) end
+    end
+    local function reopen_actions()
+        UIManager:show(Dialogs.profile_actions(plugin, profile, opts))
+    end
+
     local dialog
     dialog = ButtonDialog:new{
         title = profile.name,
@@ -92,14 +128,14 @@ function Dialogs.profile_actions(plugin, profile, opts)
                 text = _("Connect"),
                 callback = function()
                     UIManager:close(dialog)
-                    plugin:connect_profile(profile.name)
+                    plugin:connect_profile(profile.name, back)
                 end,
             } },
             { {
                 text = _("Edit"),
                 callback = function()
                     UIManager:close(dialog)
-                    Dialogs.edit_profile(plugin, profile, opts.on_saved, opts.on_close)
+                    Dialogs.edit_profile(plugin, profile, { on_back = reopen_actions })
                 end,
             } },
             { {
@@ -109,29 +145,47 @@ function Dialogs.profile_actions(plugin, profile, opts)
                     UIManager:show(ConfirmBox:new{
                         text = T(_("Delete connection %1?"), profile.name),
                         ok_text = _("Delete"),
+                        cancel_text = _("Cancel"),
                         dismissable = false,
                         ok_callback = function()
                             plugin:delete_profile(profile.name)
-                            if opts.on_saved then opts.on_saved() end
+                            back()
                         end,
-                        cancel_callback = function()
-                            UIManager:show(Dialogs.profile_actions(plugin, profile, opts))
-                        end,
+                        cancel_callback = reopen_actions,
                     })
                 end,
             } },
+            { {
+                text = _("Back"),
+                callback = function()
+                    UIManager:close(dialog)
+                    back()
+                end,
+            } },
         },
-        dismissable = false,
+        dismissable = true,
+        tap_close_callback = back,
     }
     return dialog
 end
 
 --[[--
-The connection editor. Validates in place: a rejected Save shows a message and leaves the
-dialog open.
+The connection editor. Cancel (or the Back key, which `InputDialog:onCloseDialog` routes to the
+`id = "close"` button) and a successful save both call `opts.on_back`.
+
+--- @tparam table plugin
+--- @tparam[opt] table profile profile to edit, or nil to create one
+--- @tparam[opt] table opts `{ on_back = fn }`
+--- @treturn table the dialog that was shown
 ]]
-function Dialogs.edit_profile(plugin, profile, on_saved, on_close)
+function Dialogs.edit_profile(plugin, profile, opts)
+    opts = opts or {}
     local dialog
+    local function finish(saved)
+        UIManager:close(dialog)
+        if saved and opts.on_saved then opts.on_saved() end
+        if opts.on_back then opts.on_back() end
+    end
     local function report(message)
         UIManager:show(InfoMessage:new{ text = message, timeout = 3 })
     end
@@ -164,12 +218,11 @@ function Dialogs.edit_profile(plugin, profile, on_saved, on_close)
         },
         buttons = { {
             {
+                -- `id = "close"` makes this the dialog's cancel action: the Back key and the
+                -- title bar's close button both end up here (see InputDialog:onCloseDialog).
                 text = _("Cancel"),
                 id = "close",
-                callback = function()
-                    UIManager:close(dialog)
-                    if on_close then on_close() end
-                end,
+                callback = function() finish(false) end,
             },
             {
                 text = _("Save"),
@@ -204,8 +257,7 @@ function Dialogs.edit_profile(plugin, profile, on_saved, on_close)
                         username = username,
                         password = password,
                     }, profile and profile.name or nil)
-                    UIManager:close(dialog)
-                    if on_saved then on_saved() end
+                    finish(true)
                 end,
             },
         } },

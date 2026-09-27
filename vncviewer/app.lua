@@ -62,9 +62,16 @@ function ViewerApp:init()
     self:_reflow()
 end
 
+--[[--
+(re)Builds the toolbar.
+`ButtonTable` computes every button's width from the screen width *at construction time*, so a
+rotation (which swaps the logical screen dimensions) needs a fresh table, otherwise the row
+stays as wide as the previous orientation and gets clipped.
+]]
 function ViewerApp:init_toolbar()
+    self._toolbar_width = Screen:getWidth()
     self.top_bar = ButtonTable:new{
-        width = Screen:getWidth(),
+        width = self._toolbar_width,
         buttons = { {
             { text = _("Menu"), callback = function() self:open_menu() end },
             { text = _("Keyboard"), callback = function() self:toggle_keyboard() end },
@@ -74,6 +81,13 @@ function ViewerApp:init_toolbar()
     }
     -- Let WidgetContainer:propagateEvent reach the buttons (we paint them ourselves).
     self[1] = self.top_bar
+end
+
+--- Rebuilds the toolbar when the screen width changed (rotation, resize).
+function ViewerApp:_refresh_toolbar()
+    if self._toolbar_width ~= Screen:getWidth() then
+        self:init_toolbar()
+    end
 end
 
 function ViewerApp:init_gestures()
@@ -137,6 +151,7 @@ end
 --- Recomputes the canvas and re-fits the view when the zoom mode asks for it.
 function ViewerApp:_reflow()
     self.dimen = Screen:getSize()
+    self:_refresh_toolbar()
     self.canvas = self:_layout()
     if self.remote and self.settings.zoom_mode == "fit" then
         self.remote:fit_view(self.canvas.w, self.canvas.h)

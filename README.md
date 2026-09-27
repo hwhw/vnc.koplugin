@@ -40,6 +40,9 @@ Gestures on the canvas (below the toolbar):
 | swipe up from the bottom | show the on-screen keyboard |
 | swipe down | hide it again |
 
+The toolbar is rebuilt whenever the logical screen size changes, so rotating the device (or the
+view) re-lays out the buttons instead of leaving them cut off at the previous orientation's width.
+
 A physical keyboard is forwarded too: printable characters via `TextInput`, and the named keys
 (Backspace, Tab, arrows, Home/End, Page Up/Down, F1-F12, modifiers, …) as X11 keysyms. `Back`
 leaves the viewer without dropping the connection.
@@ -47,7 +50,16 @@ leaves the viewer without dropping the connection.
 The in-app menu offers: the connection list, a status line, zoom presets, a
 "keyboard always visible" toggle, show/hide keyboard, the four screen orientations, "use current
 orientation as default", the keys the on-screen keyboard does not have (Enter/Tab/Esc/Delete),
-**Disconnect** (with confirmation) and **Leave (keep connection)**.
+**Disconnect** (with confirmation) and **Leave (keep connection)**. When the connection has just
+gone down, the menu leads with **Reconnect to <name>**.
+
+Every menu and dialog has a way back, and it always returns to where you came from: the
+connection list is the root, its per-connection dialog (**Connect** / **Edit** / **Delete** /
+**Back**) returns to the list, the editor's **Cancel** (and the Back key, and tapping outside)
+returns to whatever opened it, and a cancelled delete returns to the per-connection dialog. A
+**failed connection returns to the connection list** with the error on top of it instead of
+dropping you back into the file browser, and a connection lost while viewing leaves the viewer
+open (with the last picture) and offers **Reconnect** in the menu.
 
 **Leaving** the viewer closes the app but *keeps* the connection, the remote framebuffer and
 Wi-Fi up; reopening the viewer re-attaches and resynchronises with one non-incremental full
@@ -147,6 +159,25 @@ advertised.
 Requirements: `python3` with the standard library, `libcrypto` with the legacy provider
 (OpenSSL 3.x) for the mock's DES, and KOReader's own `luajit`.
 
+### UI plumbing (headless)
+
+`tools/ui_smoke.lua` drives the real plugin, its dialogs and a real viewer widget against
+KOReader's widget stack, with no KOReader process and no VNC server involved (one profile points
+at a closed port to exercise the failure path):
+
+```sh
+PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+cd /usr/lib/koreader && \
+  KO_HOME=/tmp/vncv_ui_home \
+  LUA_PATH="$PLUGIN/?.lua;;" LUA_CPATH="./common/?.so;;" \
+  ./luajit "$PLUGIN/tools/ui_smoke.lua"
+```
+
+It checks that every menu and dialog has a way back that returns to the previous surface with no
+dialog left behind (cancel and save in the editor, Back in the per-connection dialog, cancelled
+and confirmed deletes), that a failed connection returns to the connection list with exactly one
+dismissable message, and that the toolbar is rebuilt to the new screen width after a rotation.
+
 ### Live end-to-end
 
 Start the mock and KOReader, then drive the real plugin through KOReader's HTTP inspector
@@ -197,7 +228,9 @@ PYEOF
 
 Inspector URI grammar: a trailing `/` *calls* a method, no slash *reads* a field
 (`/koreader/ui/vncviewer/app/canvas`, `/koreader/ui/vncviewer/sessions/local/get_state/`),
-BlitBuffers are rendered as PNG.
+BlitBuffers are rendered as PNG. The inspector only reaches objects reachable from the file
+manager, so it can drive the connection list (`ui/vncviewer/connection_list/item_table/<n>/…`)
+but not the dialogs it opens; those flows are covered by `tools/ui_smoke.lua` instead.
 
 Verified this way: all seven encodings render the pattern in the live GUI (zrle, hextile, trle,
 raw, mixed, rre, copyrect); pointer/key input reaches the server; the toolbar/keyboard/zoom/rotate

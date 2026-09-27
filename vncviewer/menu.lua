@@ -65,8 +65,10 @@ function MenuBuilder.open(app)
     local remote = session:get_remote()
     local menu
 
+    -- Delegating to the app keeps its menu handle in sync, so a later open_menu() cannot
+    -- hand back a widget that is already closed.
     local function close_menu()
-        if menu then UIManager:close(menu) end
+        app:close_menu()
     end
     local function action(fn)
         return function()
@@ -74,8 +76,18 @@ function MenuBuilder.open(app)
             fn()
         end
     end
+    -- A failed attempt must come back to a menu, not leave the user staring at the canvas.
+    local function back_into_menu() app:open_menu() end
 
     local item_table = {}
+
+    -- ---- a lost / failed connection: offer a retry right at the top
+    if profile and session:get_state() == "error" then
+        item_table[#item_table + 1] = {
+            text = T(_("Reconnect to %1"), profile.name),
+            callback = action(function() plugin:connect_profile(profile.name, back_into_menu) end),
+        }
+    end
 
     -- ---- connections
     local connections = {}
@@ -83,12 +95,13 @@ function MenuBuilder.open(app)
         connections[#connections + 1] = {
             text = p.name,
             mandatory = string.format("%s:%d", p.host, p.port),
-            callback = action(function() plugin:connect_profile(p.name) end),
+            callback = action(function() plugin:connect_profile(p.name, back_into_menu) end),
         }
     end
     connections[#connections + 1] = {
         text = _("New connection…"),
-        callback = action(function() Dialogs.edit_profile(plugin, nil, nil, function() end) end),
+        -- the menu is closed by now, so there is nothing to return to but the canvas
+        callback = action(function() Dialogs.edit_profile(plugin, nil, {}) end),
     }
     item_table[#item_table + 1] = { text = _("Connections…"), sub_item_table = connections }
 
