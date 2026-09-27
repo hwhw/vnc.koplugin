@@ -129,6 +129,44 @@ local function pixels_equal(a, b, w, h)
     return true
 end
 
+--- Whether `rects` covers the rectangle (0,0,w,h) exactly - no gap, no overlap.
+---
+--- A client that asked for a region is owed every pixel of it, but the server may carry a large
+--- rectangle there as several (c.f., `Server.ENCODE_RECT_LIMIT`, which keeps the encoders that walk
+--- every pixel from handing one rectangle to the whole screen's worth of work at once), so the
+--- checks that care about *which region* arrived assert coverage rather than one rectangle.
+--- @treturn boolean, string|nil
+local function rects_cover(rects, w, h)
+    local spans = {}
+    for y = 0, h - 1 do spans[y] = {} end
+    for _, r in ipairs(rects) do
+        if r.x < 0 or r.y < 0 or r.w <= 0 or r.h <= 0 or r.x + r.w > w or r.y + r.h > h then
+            return false, string.format("rectangle %d,%d %dx%d is not inside %dx%d",
+                r.x, r.y, r.w, r.h, w, h)
+        end
+        for y = r.y, r.y + r.h - 1 do
+            local row = spans[y]
+            row[#row + 1] = { r.x, r.x + r.w }
+        end
+    end
+    for y = 0, h - 1 do
+        local row = spans[y]
+        table.sort(row, function(a, b) return a[1] < b[1] end)
+        local next_x = 0
+        for _, span in ipairs(row) do
+            if span[1] ~= next_x then
+                return false, string.format("row %d is covered up to x=%d, the next rectangle starts at %d",
+                    y, next_x, span[1])
+            end
+            next_x = span[2]
+        end
+        if next_x ~= w then
+            return false, string.format("row %d is covered up to x=%d of %d", y, next_x, w)
+        end
+    end
+    return true
+end
+
 --- The client pixel format this plugin's own client negotiates (32bpp, RGB in the low bytes).
 local CLIENT_FORMAT = {
     bits_per_pixel = 32, depth = 24, big_endian = 0, true_colour = 1,
@@ -247,6 +285,55 @@ check("format_8bpp_colour_map", function()
     assert_true(map[29][2] == 255 and map[29][1] == 0, "entry 28 is green")
     assert_true(map[4][3] == 255 and map[4][1] == 0, "entry 3 is blue")
     enc:free()
+    src:free()
+end)
+
+--- `convert` can be asked for the byte string alone: a client whose first encoding is Raw does not
+--- need the per-pixel array, and building it is a second pass over every pixel and four bytes per
+--- pixel of allocation. The bytes must be the same either way - and no array may be allocated -
+--- for *every* format, not just the byte-aligned one the fast path handles: a layout the fast path
+--- does not take still has to write the array only when it is there (it used to write it blindly,
+--- which is what the 16bpp/24bpp/colour-map checks caught).
+check("converting_without_the_pixel_array_matches_every_format", function()
+    local formats = {
+        { "32bpp", CLIENT_FORMAT },
+        { "32bpp big endian", { bits_per_pixel = 32, depth = 24, big_endian = 1, true_colour = 1,
+            red_max = 255, green_max = 255, blue_max = 255,
+            red_shift = 0, green_shift = 8, blue_shift = 16 } },
+        { "16bpp 565", { bits_per_pixel = 16, depth = 16, big_endian = 0, true_colour = 1,
+            red_max = 31, green_max = 63, blue_max = 31,
+            red_shift = 11, green_shift = 5, blue_shift = 0 } },
+        { "16bpp big endian 555", { bits_per_pixel = 16, depth = 15, big_endian = 1,
+            true_colour = 1, red_max = 31, green_max = 31, blue_max = 31,
+            red_shift = 10, green_shift = 5, blue_shift = 0 } },
+        { "24bpp", { bits_per_pixel = 24, depth = 24, big_endian = 0, true_colour = 1,
+            red_max = 255, green_max = 255, blue_max = 255,
+            red_shift = 16, green_shift = 8, blue_shift = 0 } },
+        { "24bpp big endian", { bits_per_pixel = 24, depth = 24, big_endian = 1, true_colour = 1,
+            red_max = 255, green_max = 255, blue_max = 255,
+            red_shift = 0, green_shift = 8, blue_shift = 16 } },
+        { "8bpp colour map", { bits_per_pixel = 8, depth = 8, big_endian = 0, true_colour = 0,
+            red_max = 7, green_max = 7, blue_max = 3,
+            red_shift = 5, green_shift = 2, blue_shift = 0 } },
+    }
+    local src = pattern_plane(7, 5)
+    local rect = { x = 0, y = 0, w = 7, h = 5 }
+    for _, entry in ipairs(formats) do
+        local name, fmt = entry[1], entry[2]
+        local wanted = ServerEnc.new()
+        wanted:set_pixel_format(fmt)
+        local bytes_wanted = wanted:convert(src, rect, true)
+        assert_true(wanted.values ~= nil, name .. ": the array must be built when it is wanted")
+        local unwanted = ServerEnc.new()
+        unwanted:set_pixel_format(fmt)
+        local bytes_unwanted = unwanted:convert(src, rect, false)
+        assert_true(bytes_unwanted == bytes_wanted, string.format(
+            "%s: the bytes must not depend on whether the per-pixel array is built (%d vs %d bytes)",
+            name, #bytes_unwanted, #bytes_wanted))
+        assert_true(unwanted.values == nil, name .. ": no array may be allocated when it is not wanted")
+        wanted:free()
+        unwanted:free()
+    end
     src:free()
 end)
 
@@ -884,15 +971,25 @@ check("server_serves_a_second_incremental_update", function()
         UIManager.handleInputEvent = original_input_event
         if not ok_input then error(input_err, 0) end
 
-        -- Ask incrementally *before* anything changes: the server holds the request, and the
-        -- change below must then reach us without another request being sent.
-        request(true)
+        -- Both changes are recorded *first*, then the request is sent: what is asserted is that a
+        -- request made after them is answered with both, in one update.
+        --
+        -- The ordering used to be the other way round - ask, sleep a little, then change - and
+        -- that only passed because a ten-byte request needed several polls to be read, so the
+        -- changes were recorded before it had been parsed. An incremental request whose answer
+        -- has nothing to report is answered *at once* with an empty update (by design: a held
+        -- request would hold the client's later messages, its keystrokes, behind it), so that
+        -- ordering depended on the server's read latency and turned into "empty update first" as
+        -- soon as reading got cheaper. What reached the client earlier in this check - the answer
+        -- to the request in the input section above - is dropped before the change, so the update
+        -- read below can only be the one this change produced.
         socket.sleep(0.05)
-        server:_poll()
+        drain_socket(cli, 0.2, server)
         bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
         bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
         server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
         server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        request(true)
         -- Two rectangles in one update: each header must be followed by its own data.
         assert_true(read_update() >= 2,
             "both changed rectangles must arrive in one update")
@@ -1000,7 +1097,14 @@ local function connect_client(server, port, encodings_wire, pump)
         end
         return nrects, rects
     end
-    return { sock = cli, request = request, read_update = read_update }
+    return { sock = cli, request = request, read_update = read_update,
+             -- `send` and `polls` let a check drive the socket and the server a *bounded* number
+             -- of times, which is what makes a "within one or two polls" assertion possible:
+             -- `read_update` above pumps until something arrives, so it cannot tell a poll from a
+             -- hundred.
+             send = function(bytes) cli:send(bytes) end,
+             polls = function(n) for _ = 1, n or 1 do step() end end,
+             step = step }
 end
 
 check("server_sends_a_change_after_the_first_full_update", function()
@@ -1093,9 +1197,9 @@ check("server_gives_a_client_that_asks_incrementally_the_whole_screen", function
         cli:send(client.request(true, 0, 0, sw, sh))
         local nrects, rects = client.read_update(plane)
         assert_true(nrects >= 1, "a client that has seen nothing must be given the screen")
-        assert_true(rects[1].x == 0 and rects[1].y == 0
-            and rects[1].w == sw and rects[1].h == sh,
-            "and it must be the whole screen, not the dirty rectangles")
+        local covered, why = rects_cover(rects, sw, sh)
+        assert_true(covered, "and it must be the whole screen, not the dirty rectangles: "
+            .. tostring(why))
         local r1, g1, b1 = get(plane, 16, 16)
         assert_true(r1 > 200 and g1 > 200 and b1 > 200, "the painted rectangle must be in it")
         local r2, g2, b2 = get(plane, sw - 4, sh - 4)
@@ -1157,6 +1261,222 @@ check("server_keeps_a_change_a_client_did_not_ask_about", function()
         cli:close()
     end)
 
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+-- ---------------------------------------------------------------- what one poll must read
+
+--- The direct regression test for reading a client's buffer instead of one field per poll.
+---
+--- The server used to read exactly the bytes the protocol owed: a six-byte PointerEvent (type,
+--- mask, x, y) cost four polls, ~41 ms, and a viewer that moved its mouse could not be served
+--- faster than about 24 messages a second. Everything a client writes in one go must be taken and
+--- parsed by the poll that sees it - `rx_len` is what the state machine still owes, so a per-field
+--- reader leaves nearly the whole write behind.
+check("a_burst_of_pointer_events_is_parsed_in_one_poll", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5891, 5899 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+
+        -- 200 motion messages (mask 0: KOReader has no hover, so they are parsed and dropped) and
+        -- then a request for a small region, all as one write.
+        local parts = {}
+        for i = 1, 200 do
+            parts[i] = string.char(5, 0, (i % 250) + 1, 1, (i % 250) + 1, 2)
+        end
+        parts[#parts + 1] = client.request(false, 0, 0, 16, 16)
+        cli:send(table.concat(parts))
+        socket.sleep(0.02)                      -- let the whole write arrive
+
+        client.polls(2)
+        local record
+        for _, r in pairs(server.clients) do record = r end
+        assert_true(record ~= nil, "the client must be registered while it is connected")
+        assert_true(record.rx_len == 0, string.format(
+            "the whole write must be parsed within two polls, %d byte(s) still unread",
+            record.rx_len))
+
+        -- ... and the request behind the burst was answered in the same poll: its update is
+        -- already on the wire, so it is read here without pumping the server any further.
+        local head, e = cli:receive(4)
+        assert_true(head ~= nil and head:byte(1) == 0, string.format(
+            "the request behind the burst must be answered within two polls (%s)", tostring(e)))
+        assert_true(head:byte(3) * 256 + head:byte(4) == 1,
+            "the 16x16 request must be answered with one rectangle")
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- The same for a message whose *fields* are the many: an encoding list of 200 entries is 200
+--- four-byte reads. It must be consumed by the poll that sees it, and the request behind it
+--- answered in that same poll.
+check("a_large_client_message_is_consumed_in_one_poll", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5881, 5889 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+
+        -- 200 encodings, all Raw, so the answer below stays a plain one-rectangle update.
+        local parts = { string.char(2, 0, 0, 200) }
+        for _ = 1, 200 do parts[#parts + 1] = string.char(0, 0, 0, 0) end
+        parts[#parts + 1] = client.request(false, 0, 0, 16, 16)
+        cli:send(table.concat(parts))
+        socket.sleep(0.02)
+
+        client.polls(2)
+        local record
+        for _, r in pairs(server.clients) do record = r end
+        assert_true(record ~= nil, "the client must be registered while it is connected")
+        assert_true(record.rx_len == 0, string.format(
+            "the whole encoding list must be parsed within two polls, %d byte(s) still unread",
+            record.rx_len))
+        assert_true(#(record.server.client.encodings or {}) == 200,
+            "all 200 announced encodings must have been recorded")
+
+        local head, e = cli:receive(4)
+        assert_true(head ~= nil and head:byte(1) == 0, string.format(
+            "the request behind the encoding list must be answered within two polls (%s)",
+            tostring(e)))
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- An incremental request whose answer has nothing to report is answered with an *empty* update,
+--- and it is answered at once - in the poll that read the request. A client that had to wait for
+--- that answer could not send its next message (a keystroke) until the screen happened to change,
+--- which is what "input does nothing until I touch the screen" looks like from a viewer.
+check("an_incremental_request_with_nothing_changed_is_answered_at_once", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5871, 5879 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        -- the first frame, so this client owes nothing afterwards
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        plane:free()
+
+        -- nothing changed since: ask incrementally and pump exactly two polls
+        cli:send(client.request(true, 0, 0, sw, sh))
+        socket.sleep(0.02)
+        client.polls(2)
+
+        local head, e = cli:receive(4)
+        assert_true(head ~= nil and head:byte(1) == 0, string.format(
+            "an incremental request must be answered within two polls (%s)", tostring(e)))
+        local nrects = head:byte(3) * 256 + head:byte(4)
+        assert_true(nrects == 0, string.format(
+            "with nothing changed the answer must be an empty update, got %d rectangle(s)", nrects))
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- One conversion per pixel format per poll: two clients of the same format asking about the same
+--- rectangle in the same tick must not convert the same pixels twice. Counted by wrapping the
+--- module function the server calls, so the plugin itself needs nothing.
+check("two_clients_of_one_format_share_one_conversion", function()
+    local Server = require("vnc/server")
+    local ServerEnc = require("vnc/serverenc")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5861, 5869 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local calls = 0
+    local original_convert = ServerEnc.convert
+    ServerEnc.convert = function(self, ...)
+        calls = calls + 1
+        return original_convert(self, ...)
+    end
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local a = connect_client(server, port, set_encodings_wire())
+        local b = connect_client(server, port, set_encodings_wire())
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+        a.send(a.request(false, 0, 0, sw, sh))
+        assert_true(a.read_update(plane) >= 1, "the first update must carry the screen")
+        b.send(b.request(false, 0, 0, sw, sh))
+        assert_true(b.read_update(plane) >= 1, "the first update must carry the screen")
+        plane:free()
+
+        -- one change, 200x100: a single rectangle for every encoding (it is below the limit the
+        -- encoders that walk every pixel are given) and the same pixel format for both clients
+        bb:paintRect(8, 8, 200, 100, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 200, h = 100 })
+
+        -- both ask in the same tick
+        a.send(a.request(true, 0, 0, sw, sh))
+        b.send(b.request(true, 0, 0, sw, sh))
+        socket.sleep(0.02)                  -- both requests are on the wire
+        calls = 0                           -- the first frames are not part of this
+        server:_poll()
+        assert_true(calls == 1, string.format(
+            "two clients of one pixel format must share one conversion, converted %d time(s)",
+            calls))
+
+        -- ... and both were served in that poll: their answers are already on the wire
+        local ahead = a.sock:receive(4)
+        local bhead = b.sock:receive(4)
+        assert_true(ahead ~= nil and ahead:byte(1) == 0 and bhead ~= nil and bhead:byte(1) == 0,
+            "both clients must be answered by the poll that shares the conversion")
+        a.sock:close()
+        b.sock:close()
+    end)
+
+    ServerEnc.convert = original_convert
     server:stop()
     if not ok then error(err, 0) end
 end)
@@ -1335,9 +1655,9 @@ check("server_serves_a_client_that_asks_for_more_than_the_screen", function()
         cli:send(client.request(false, 0, 0, 0xFFFF, 0xFFFF))
         local nrects, rects = client.read_update(plane)
         assert_true(nrects >= 1, "a 65535x65535 request must be answered with the screen")
-        assert_true(rects[1].x == 0 and rects[1].y == 0 and rects[1].w == sw and rects[1].h == sh,
-            string.format("an oversized request must be clamped to the screen, got %d,%d %dx%d of %dx%d",
-                rects[1].x, rects[1].y, rects[1].w, rects[1].h, sw, sh))
+        local clamped, why = rects_cover(rects, sw, sh)
+        assert_true(clamped, "an oversized request must be clamped to the screen, got "
+            .. tostring(why) .. string.format(" of %dx%d", sw, sh))
         local r0, g0, b0 = get(plane, 16, 16)
         assert_true(r0 < 60 and g0 < 60 and b0 < 60, "and the screen it does have must be in it")
 
