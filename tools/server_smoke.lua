@@ -1524,5 +1524,578 @@ check("server_stays_live_after_a_client_pointer_press", function()
     if not ok then error(err, 0) end
 end)
 
+-- ------------------------------------------------- a click that stays a click (the real UI loop)
+
+--- A PointerEvent as it arrives on the wire (RFC 6143 §7.5.5).
+local function pointer_event(mask, x, y)
+    return string.char(5, mask, math.floor(x / 256), x % 256, math.floor(y / 256), y % 256)
+end
+
+--- The stage the three checks below share: a server on a test port, a widget that records what
+--- reaches it, and the *real* UI loop, driven step by step with a budgeted headless
+--- `waitForEvent` exactly the way `server_stays_live_after_a_client_pointer_press` drives it - so
+--- nothing but the scheduled poll task ever reads from or writes to the client.
+---
+--- Everything a check asserts on is recorded with the fts it happened at: the input frames the
+--- server fed to Input (`injected`), the gestures the UI was told about (`ges`) and what the widget
+--- did about them (`acted`), so that "the click came out as a hold" can be reported with the
+--- numbers that show it.
+---
+--- Also returned: `server`, `client` (the wire connection, already past its first full update),
+--- `plane`, `sw`, `sh`, `hold_interval` (the detector's own long-press interval, in fts),
+--- `ui_step()`, `pump_ui(seconds, until_fn)`, `send_later(seconds, msg)` - a message an independent
+--- client would have put on the wire by then, flushed from inside the UI loop's own wait -
+--- `describe()`, and `restore()` (nil-safe; a check that failed early can still call it).
+local function live_input_stage()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+    local time = require("ui/time")
+    require("ffi/linux_input_h")        -- EV_*/ABS_MT_*/BTN_TOUCH/SYN_REPORT (and ETIME)
+    local C = ffi.C
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local GestureRange = require("ui/gesturerange")
+
+    local server, port
+    for candidate = 5991, 5999 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local bb = Screen.bb
+    local sw, sh = bb:getWidth(), bb:getHeight()
+    bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+    server:_record_dirty("full", nil)
+
+    local Input = Device.input
+    local hold_interval = Input.gesture_detector.ges_hold_interval
+
+    local injected, ges, acted = {}, {}, {}
+
+    -- A headless local input device: every wait reports a timeout after a short sleep, so the loop
+    -- can be driven by hand - and a wait that cannot give control back to UIManager (the UI thread
+    -- stuck on a timer) is reported instead of hanging the suite.
+    local WEDGE_BUDGET = time.s(3)
+    local step_deadline
+    local real_wait = Input.input.waitForEvent
+    -- A client puts its bytes on the wire when it wants them read. While the UI thread is inside
+    -- `waitEvent` (which is where it goes while it is blocked on a timer) nothing else in this test
+    -- runs, so this is where the test's own client acts - exactly as another process' bytes would
+    -- already be in the kernel's buffer when the poll task finally gets around to reading them.
+    local sends, stage_client = {}, nil
+    local function flush_sends()
+        for i = #sends, 1, -1 do
+            if sends[i].at <= time.now() then
+                stage_client.sock:send(sends[i].msg)
+                table.remove(sends, i)
+            end
+        end
+    end
+    Input.input.waitForEvent = function()
+        if stage_client then flush_sends() end
+        if step_deadline and time.now() > step_deadline then
+            local timer = Input.timer_callbacks[1]
+            local detail = ""
+            if timer then
+                detail = string.format(" (a pending input timer is due in %.1f s: the loop is not"
+                    .. " returning to UIManager)", time.to_s(timer.deadline - time.now()))
+            end
+            error("the UI loop is stuck inside Input:waitForEvent" .. detail, 0)
+        end
+        socket.sleep(0.002)
+        return false, C.ETIME
+    end
+
+    -- Every input frame the server feeds to Input, and its kind: whether the client's press was
+    -- injected on its own (before its release could be read) or together with the release, is
+    -- exactly what the checks below measure.
+    local real_handle_touch = Input.handleTouchEv
+    local frame_kind
+    Input.handleTouchEv = function(input, ev)
+        if ev.type == C.EV_ABS then
+            if ev.code == C.ABS_MT_TRACKING_ID then
+                frame_kind = ev.value == -1 and "lift" or "down"
+            elseif ev.code == C.ABS_MT_POSITION_X and not frame_kind then
+                frame_kind = "motion"
+            end
+        elseif ev.type == C.EV_SYN and ev.code == C.SYN_REPORT then
+            injected[#injected + 1] = { kind = frame_kind or "?", t = time.now() }
+            frame_kind = nil
+        end
+        return real_handle_touch(input, ev)
+    end
+
+    -- Every gesture the UI is told about, and what a real widget did about it.
+    local real_handle_input_event = UIManager.handleInputEvent
+    UIManager.handleInputEvent = function(mgr, ev)
+        if ev.handler == "onGesture" and ev.args and ev.args[1] and ev.args[1].pos then
+            local g = ev.args[1]
+            ges[#ges + 1] = { ges = g.ges, x = g.pos.x, y = g.pos.y, t = time.now() }
+        end
+        return real_handle_input_event(mgr, ev)
+    end
+
+    local full_range = Geom:new{ x = 0, y = 0, w = 4000, h = 4000 }
+    local widget = InputContainer:new{
+        dimen = Screen:getSize(),
+        ges_events = {
+            Tap = { GestureRange:new{ ges = "tap", range = full_range } },
+            Hold = { GestureRange:new{ ges = "hold", range = full_range } },
+            HoldRelease = { GestureRange:new{ ges = "hold_release", range = full_range } },
+            Pan = { GestureRange:new{ ges = "pan", range = full_range } },
+            Swipe = { GestureRange:new{ ges = "swipe", range = full_range } },
+        },
+        key_events = { KeyPress = { { "Down" } } },
+    }
+    local function recorder(what)
+        -- `EventListener:handleEvent` calls the handler as `handler(self, event.args...)`, and the
+        -- gesture is the *second* of those (the first is the `ges_events` entry's own `args`).
+        return function(_, _, ges)
+            acted[#acted + 1] = { what = what, x = ges and ges.pos and ges.pos.x or nil,
+                                  y = ges and ges.pos and ges.pos.y or nil }
+            return true
+        end
+    end
+    widget.onTap = recorder("tap")
+    widget.onHold = recorder("hold")
+    widget.onHoldRelease = recorder("hold_release")
+    widget.onPan = recorder("pan")
+    widget.onSwipe = recorder("swipe")
+    widget.onKeyPress = function() acted[#acted + 1] = { what = "key" } return true end
+    UIManager:show(widget)
+
+    --- One iteration of the real loop, the way UIManager:run drives it.
+    local function ui_step()
+        step_deadline = time.now() + WEDGE_BUDGET
+        local ok, err = pcall(UIManager.handleInput, UIManager)
+        if not ok then error(err, 0) end
+    end
+
+    --- Drives the loop for up to `seconds`, stopping early once `until_fn` says so.
+    local function pump_ui(seconds, until_fn)
+        local deadline = time.now() + time.s(seconds)
+        while time.now() < deadline do
+            ui_step()
+            if until_fn and until_fn() then return true end
+        end
+        return not until_fn or until_fn()
+    end
+
+    --- Events for the local (device) side, stamped and routed the way a backend's are:
+    --- ffi/SDL3.lua's genEmuEvent uses CLOCK_MONOTONIC_COARSE ("synthetic ones in the same timescale
+    --- as the UI"). A tap like this is what the user performs on KOReader's own menu before the
+    --- server ever sees a client, and it is what makes GestureDetector probe the device's clock.
+    local function local_ev(ev_type, code, value)
+        local sec, usec = time.split_s_us(time.monotonic_coarse())
+        return { type = ev_type, code = code, value = value, time = { sec = sec, usec = usec } }
+    end
+    local function local_frame(evs)
+        for _, ev in ipairs(evs) do
+            if ev.type == C.EV_KEY then
+                Input:handleKeyBoardEv(ev)
+            else
+                Input:handleTouchEv(ev)
+            end
+        end
+    end
+    local function local_tap(x, y)
+        local_frame({
+            local_ev(C.EV_ABS, C.ABS_MT_SLOT, 0),
+            local_ev(C.EV_ABS, C.ABS_MT_TRACKING_ID, 1),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_X, x),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_Y, y),
+            local_ev(C.EV_KEY, C.BTN_TOUCH, 1),
+            local_ev(C.EV_SYN, C.SYN_REPORT, 0),
+        })
+        local_frame({
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_X, x),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_Y, y),
+            local_ev(C.EV_ABS, C.ABS_MT_SLOT, 0),
+            local_ev(C.EV_ABS, C.ABS_MT_TRACKING_ID, -1),
+            local_ev(C.EV_KEY, C.BTN_TOUCH, 0),
+            local_ev(C.EV_SYN, C.SYN_REPORT, 0),
+        })
+    end
+
+    -- Start from a blank slate (a device freshly booted, or one that just came back from suspend),
+    -- so the clock this stage depends on does not come from whatever an earlier check injected,
+    -- then let the device's own tap put its event clock on record.
+    Input:resetState()
+    local_tap(300, 300)
+    assert_true(Input.gesture_detector:getClockSource() == C.CLOCK_MONOTONIC,
+        "this stage needs the device's events to be stamped like KOReader's own are")
+    -- The device's own tap above is not the *server's* input: the records below are about what the
+    -- server injects, so they start from an empty slate.
+    for i = #injected, 1, -1 do table.remove(injected, i) end
+
+    local client, plane
+    -- The poll task's runs, and how often our connection was *answered* (the protocol moved its
+    -- `sent_gen`, i.e. an update - if only an empty one - was produced and written in that run).
+    -- This is the server-side fact behind "updates keep flowing", and unlike reading the socket it
+    -- does not depend on when this single-threaded test gets around to it (every socket read below
+    -- can cost a 200 ms receive timeout, which is more than the hold interval).
+    local stats = { polls = 0, served = 0 }
+    local server_client
+    local real_poll = server._poll
+    server._poll = function(srv)
+        stats.polls = stats.polls + 1
+        local before = server_client and server_client.sent_gen
+        real_poll(srv)
+        if server_client and server_client.sent_gen ~= before then
+            stats.served = stats.served + 1
+        end
+    end
+
+    local function restore()
+        server._poll = real_poll
+        Input.input.waitForEvent = real_wait
+        Input.handleTouchEv = real_handle_touch
+        UIManager.handleInputEvent = real_handle_input_event
+        UIManager:close(widget)
+        if client then client.sock:close() end
+        Input:resetState()
+        server:stop()
+    end
+
+    local connected, connect_err = pcall(function()
+        -- From here on only the UI loop's own poll task services the server.
+        client = connect_client(server, port, set_encodings_wire(), ui_step)
+        stage_client = client
+        for _, record in pairs(server.clients) do server_client = record.server.client end
+        plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+        client.sock:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+    end)
+    if not connected then
+        restore()
+        error(connect_err, 0)
+    end
+
+    --- A one-line account of what happened, for the failure messages: the frames the server
+    --- injected (kind, and when, relative to the first of them), the gestures the UI was told
+    --- about, and what the widget acted on.
+    local function describe()
+        local t0 = injected[1] and injected[1].t or (ges[1] and ges[1].t) or time.now()
+        local f = {}
+        for _, fr in ipairs(injected) do
+            f[#f + 1] = string.format("%s@+%dms", fr.kind, time.to_ms(fr.t - t0))
+        end
+        local g = {}
+        for _, ge in ipairs(ges) do
+            g[#g + 1] = string.format("%s@+%dms", ge.ges, time.to_ms(ge.t - t0))
+        end
+        local a = {}
+        for _, w in ipairs(acted) do a[#a + 1] = w.what end
+        return string.format("input frames [%s], UI gestures [%s], widget acted on [%s]",
+            table.concat(f, " "), table.concat(g, " "), table.concat(a, " "))
+    end
+
+    local function send_later(seconds, msg)
+        sends[#sends + 1] = { at = time.now() + time.s(seconds), msg = msg }
+    end
+
+    return {
+        server = server, client = client, plane = plane, sw = sw, sh = sh,
+        hold_interval = hold_interval, stats = stats,
+        injected = injected, ges = ges, acted = acted,
+        ui_step = ui_step, pump_ui = pump_ui, send_later = send_later,
+        describe = describe, restore = restore,
+    }
+end
+
+check("a_client_click_in_the_live_loop_is_a_tap", function()
+    -- The reported defect: a client *click* (press, then release ~100 ms later) is delivered as a
+    -- *hold*. Once any contact is down, core arms its hold timer (`Contact:handleNonTap` ->
+    -- `Input:setTimeout(slot, "hold", cb, tev.timev, ges_hold_interval)`), and `Input:waitEvent`
+    -- does not give control back to UIManager while an input timer is pending - it keeps polling
+    -- the *device* for one that expires. A press injected the moment it is read therefore starves
+    -- this very poll task: the client's release cannot be read, so the hold fires first and the
+    -- click comes out as onHold + onHoldRelease.
+    --
+    -- A click is press *and* release, so it can be judged before anything is injected: the server
+    -- can keep the client's contact to itself for a moment and, once the release is in, hand core a
+    -- contact down and up in one frame - which is what the kernel delivers for a click too. Nothing
+    -- is pending on the UI thread then, so the loop keeps running and the release is read the
+    -- moment it arrives.
+    local stage = live_input_stage()
+    local ok, err = pcall(function()
+        local time = require("ui/time")
+        local cli = stage.client.sock
+        local bb, plane = Screen.bb, stage.plane
+
+        -- Updates flow before the click (a viewer keeps an incremental request outstanding).
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        stage.server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        cli:send(stage.client.request(true, 0, 0, stage.sw, stage.sh))
+        assert_true(stage.client.read_update(plane) >= 1,
+            "a change must reach the client before the click (" .. stage.describe() .. ")")
+        local r, g, b = get(plane, 16, 16)
+        assert_true(r > 200 and g > 200 and b > 200,
+            "and the changed pixels must come through (" .. stage.describe() .. ")")
+
+        -- The click: the press now, the release 100 ms later, both while the real loop runs. The
+        -- release goes on the wire from inside the loop's own wait, because that is what an
+        -- independent client does - it does not wait to be read.
+        cli:send(pointer_event(1, 343, 36))
+        stage.send_later(0.1, pointer_event(0, 343, 36))
+
+        -- Let it finish.
+        assert_true(stage.pump_ui(2, function()
+                for _, w in ipairs(stage.acted) do
+                    if w.what == "tap" or w.what == "hold" then return true end
+                end
+                return false
+            end),
+            "the click must reach the widget (" .. stage.describe() .. ")")
+
+        local kinds, order = {}, {}
+        for _, w in ipairs(stage.acted) do kinds[w.what] = true order[#order + 1] = w.what end
+        local down, lift
+        for _, f in ipairs(stage.injected) do
+            if f.kind == "down" and not down then down = f end
+            if f.kind == "lift" and not lift then lift = f end
+        end
+        print(string.format("   [click] press and release injected %d ms apart (hold interval %d ms),"
+            .. " hold fired: %s, widget: %s",
+            down and lift and time.to_ms(lift.t - down.t) or -1, time.to_ms(stage.hold_interval),
+            kinds.hold and "yes" or "no", table.concat(order, ",")))
+
+        assert_true(kinds.tap,
+            "a fast client click must reach the widget as onTap (" .. stage.describe() .. ")")
+        assert_true(not kinds.hold and not kinds.hold_release,
+            "a fast client click must not be a hold (" .. stage.describe() .. ")")
+        assert_true(stage.acted[1].what == "tap" and stage.acted[1].x == 343 and stage.acted[1].y == 36,
+            string.format("the tap must land where the client clicked, got %s at %s,%s (%s)",
+                stage.acted[1].what, tostring(stage.acted[1].x), tostring(stage.acted[1].y),
+                stage.describe()))
+        for _, ge in ipairs(stage.ges) do
+            assert_true(ge.ges ~= "hold",
+                "the detector must not judge a click a hold (" .. stage.describe() .. ")")
+        end
+        assert_true(down and lift, "the click must be injected as a press and a release ("
+            .. stage.describe() .. ")")
+        assert_true(time.to_ms(lift.t - down.t) < time.to_ms(stage.hold_interval),
+            string.format("the release was injected %d ms after the press, i.e. only once core's"
+                .. " hold timer had fired: the click had become a hold (%s)",
+                time.to_ms(lift.t - down.t), stage.describe()))
+
+        -- Updates keep flowing afterwards, too.
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        stage.server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        cli:send(stage.client.request(true, 0, 0, stage.sw, stage.sh))
+        assert_true(stage.client.read_update(plane) >= 1,
+            "a change must still reach the client after the click")
+        local r2, g2, b2 = get(plane, 68, 68)
+        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and the changed pixels must come through")
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
+check("a_client_button_held_past_the_hold_interval_is_a_hold", function()
+    -- A long press has to stay a long press. The server keeps a client's contact to itself only
+    -- until it is clear which gesture it is: with the button still down after the detector's own
+    -- long-press interval it is a hold, so the press is injected on its own *then* and core's timer
+    -- (armed from that injected event) runs it, exactly as for a finger. The release closes it as a
+    -- hold_release, and no tap is involved.
+    local stage = live_input_stage()
+    local ok, err = pcall(function()
+        local time = require("ui/time")
+        local cli = stage.client.sock
+        local bb, plane = Screen.bb, stage.plane
+        local t_press = time.now()
+
+        cli:send(pointer_event(1, 200, 200))
+
+        -- The press must *not* be injected on sight: a press injected now would arm core's hold
+        -- timer, and while that timer is pending `Input:waitEvent` never returns to UIManager - so
+        -- this poll task, the only thing that can read the client's release, would not run again
+        -- until the hold had fired. Give the loop ~150 ms to read the press: no frame may have been
+        -- injected with it.
+        stage.pump_ui(0.15)
+        assert_true(#stage.injected == 0,
+            "the client's press must not be injected before the hold interval is up - a press"
+            .. " injected on sight starves the poll task that has to read the release ("
+            .. stage.describe() .. ")")
+
+        -- While the contact is only held back, nothing is pending on the UI thread, so the loop
+        -- keeps servicing the client: the poll task runs, and an update request is answered within
+        -- it (the protocol moves the connection's `sent_gen`, which is it producing - and writing -
+        -- an update, empty or not). That is what "updates keep flowing" means here, and it is also
+        -- what lets a release be noticed next.
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        stage.server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        local polls_before, served_before = stage.stats.polls, stage.stats.served
+        cli:send(stage.client.request(true, 0, 0, stage.sw, stage.sh))
+        stage.pump_ui(0.15)
+        print(string.format("   [hold] while buffered: %d poll(s), %d update(s) answered",
+            stage.stats.polls - polls_before, stage.stats.served - served_before))
+        assert_true(stage.stats.served > served_before,
+            "the client's update request must be answered while the contact is only held back ("
+            .. stage.describe() .. ")")
+        assert_true(stage.stats.polls - polls_before >= 5,
+            string.format("the poll task must keep running while the contact is held back: it ran"
+                .. " %d time(s) (%s)", stage.stats.polls - polls_before, stage.describe()))
+        assert_true(#stage.injected == 0 and #stage.acted == 0,
+            "the contact must still only be held back at this point (" .. stage.describe() .. ")")
+        -- Take the answer that was produced: it is what the client would have drawn, and it must
+        -- not be left in the socket for the "after the release" read below to trip over.
+        assert_true(stage.client.read_update(plane) >= 1,
+            "the update answered while the contact was held back must reach the client ("
+            .. stage.describe() .. ")")
+
+        -- Hold it past the interval; the release follows once the hold has fired.
+        stage.send_later(0.7, pointer_event(0, 200, 200))
+        assert_true(stage.pump_ui(3, function()
+                for _, w in ipairs(stage.acted) do
+                    if w.what == "hold_release" then return true end
+                end
+                return false
+            end),
+            "a held button must reach the widget as a hold and its release ("
+            .. stage.describe() .. ")")
+
+        local order = {}
+        for _, w in ipairs(stage.acted) do order[#order + 1] = w.what end
+        local down
+        for _, f in ipairs(stage.injected) do
+            if f.kind == "down" then down = f break end
+        end
+        local hold_at
+        for _, ge in ipairs(stage.ges) do
+            if ge.ges == "hold" then hold_at = ge.t break end
+        end
+        print(string.format("   [hold] press injected %d ms after the client's press (hold interval"
+            .. " %d ms), hold %d ms after the client's press (%d ms after the injection), widget: %s",
+            down and time.to_ms(down.t - t_press) or -1, time.to_ms(stage.hold_interval),
+            hold_at and time.to_ms(hold_at - t_press) or -1,
+            down and hold_at and time.to_ms(hold_at - down.t) or -1, table.concat(order, ",")))
+
+        assert_true(table.concat(order, ",") == "hold,hold_release",
+            "a held button must be onHold first, then its release: got ["
+            .. table.concat(order, ",") .. "] (" .. stage.describe() .. ")")
+        assert_true(down and down.t - t_press >= stage.hold_interval - time.ms(2),
+            string.format("the press was injected %d ms after the client pressed it, i.e. before"
+                .. " the %d ms hold interval was up (%s)", down and time.to_ms(down.t - t_press) or -1,
+                time.to_ms(stage.hold_interval), stage.describe()))
+        -- The injected frame carries the moment the client's press was read, so core's own hold
+        -- timer is due the moment it is armed: the widget gets onHold one interval after the
+        -- client pressed, exactly where a finger's long press would be.
+        assert_true(hold_at and hold_at - t_press >= stage.hold_interval - time.ms(2),
+            string.format("the hold must reach the widget one hold interval after the client"
+                .. " pressed, got %d ms (%s)", hold_at and time.to_ms(hold_at - t_press) or -1,
+                stage.describe()))
+
+        -- ... and updates keep flowing after the release.
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        stage.server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        cli:send(stage.client.request(true, 0, 0, stage.sw, stage.sh))
+        assert_true(stage.client.read_update(plane) >= 1,
+            "a change must still reach the client after the release")
+        local r2, g2, b2 = get(plane, 68, 68)
+        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and the changed pixels must come through")
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
+check("a_client_drag_in_the_live_loop_is_a_pan", function()
+    -- A drag must keep its meaning (and its 4 px threshold) while a client's contact is held back:
+    -- motion that stays within 4 px of the press point is a mouse wobble and the click is a tap,
+    -- while motion beyond it is a drag - and then the press is injected together with the motion
+    -- that made it a drag.
+    local stage = live_input_stage()
+    local ok, err = pcall(function()
+        local time = require("ui/time")
+        local cli = stage.client.sock
+        local bb, plane = Screen.bb, stage.plane
+
+        -- Motion with no button down is nothing KOReader has: no hover, so nothing may be injected.
+        cli:send(pointer_event(0, 500, 500))
+        for _ = 1, 5 do stage.ui_step() end
+        assert_true(#stage.injected == 0 and #stage.acted == 0,
+            "motion without a button down must be forwarded to nothing (" .. stage.describe() .. ")")
+
+        -- (1) A wobble under the threshold stays a tap, at the point it was released.
+        cli:send(pointer_event(1, 300, 260))
+        cli:send(pointer_event(1, 301, 260))
+        cli:send(pointer_event(1, 301, 261))
+        cli:send(pointer_event(0, 300, 260))
+        assert_true(stage.pump_ui(1, function() return #stage.acted > 0 end),
+            "a click with a 2 px wobble must reach the widget (" .. stage.describe() .. ")")
+        assert_true(stage.acted[1].what == "tap" and stage.acted[1].x == 300
+                and stage.acted[1].y == 260,
+            "a 2 px wobble is not a drag: the tap lands where it was released ("
+            .. stage.describe() .. ")")
+        for _, f in ipairs(stage.injected) do
+            assert_true(f.kind ~= "motion",
+                "motion within the 4 px threshold must not be forwarded (" .. stage.describe() .. ")")
+        end
+
+        -- (2) Past the threshold it is a drag - and it must not be judged a hold, which is what a
+        -- press injected on its own becomes when the motion behind it has to wait for a pending
+        -- hold timer to fire before this poll task can run again.
+        local mark_f, mark_w = #stage.injected, #stage.acted
+        cli:send(pointer_event(1, 300, 320))                    -- press
+        stage.send_later(0.02, pointer_event(1, 340, 320))      -- 40 px: past the 4 px threshold
+        stage.send_later(0.05, pointer_event(1, 380, 320))      -- ... and the detector's own 35 px
+        stage.send_later(0.1, pointer_event(1, 420, 320))       --     pan threshold
+        stage.send_later(0.25, pointer_event(0, 420, 320))
+        assert_true(stage.pump_ui(3, function()
+                for i = mark_w + 1, #stage.acted do
+                    local what = stage.acted[i].what
+                    if what == "pan" or what == "swipe" or what == "hold" or what == "tap" then
+                        return true
+                    end
+                end
+                return false
+            end),
+            "a drag must reach the widget as a pan or a swipe (" .. stage.describe() .. ")")
+
+        local what, order, motion = {}, {}, 0
+        for i = mark_w + 1, #stage.acted do
+            what[stage.acted[i].what] = true
+            order[#order + 1] = stage.acted[i].what
+        end
+        for i = mark_f + 1, #stage.injected do
+            if stage.injected[i].kind == "motion" then motion = motion + 1 end
+        end
+        print(string.format("   [drag] %d motion frame(s) injected, widget: %s",
+            motion, table.concat(order, ",")))
+        assert_true(what.pan or what.swipe,
+            "a drag past the threshold must reach the widget as a pan or a swipe ("
+            .. stage.describe() .. ")")
+        assert_true(not what.tap, "a drag must not be a tap (" .. stage.describe() .. ")")
+        assert_true(not what.hold, "a drag must not be a hold (" .. stage.describe() .. ")")
+        assert_true(motion > 0,
+            "a drag past the 4 px threshold must forward the motion (" .. stage.describe() .. ")")
+
+        -- An update after the drag (the drag itself must not have left a timer behind).
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        stage.server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        cli:send(stage.client.request(true, 0, 0, stage.sw, stage.sh))
+        assert_true(stage.client.read_update(plane) >= 1,
+            "a change must still reach the client after the drag (" .. stage.describe() .. ")")
+        local r, g, b = get(plane, 68, 68)
+        assert_true(r > 200 and g > 200 and b > 200, "and the changed pixels must come through")
+
+        -- Where the rest of the drag went: the contact's remaining motion is only read once core's
+        -- hold timer - armed by the injected down, as it is for a finger - has expired, because
+        -- `Input:waitEvent` does not give UIManager (and so this poll task) back before that. A
+        -- finger's own motion arrives on the device fd and breaks that wait; a socket's cannot.
+        local motions, down_at, lift_at = 0, nil, nil
+        for i = mark_f + 1, #stage.injected do
+            local f = stage.injected[i]
+            if f.kind == "motion" then motions = motions + 1
+            elseif f.kind == "down" then down_at = f.t
+            elseif f.kind == "lift" then lift_at = f.t end
+        end
+        print(string.format("   [drag] by the end: %d motion frame(s), lift injected %d ms after the down",
+            motions, down_at and lift_at and time.to_ms(lift_at - down_at) or -1))
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
 print(string.format("%d check(s), %d failure(s)", checks, failures))
 os.exit(failures == 0 and 0 or 1)

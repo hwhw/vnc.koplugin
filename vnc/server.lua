@@ -54,6 +54,10 @@ Server.STALL_TIMEOUT = 10
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
+--- How far a client's pointer may move with the button down before it is a drag rather than the
+--- pixel or two of wobble a mouse makes while clicking (in both axes' distance, like core's
+--- gesture thresholds are).
+Server.DRAG_THRESHOLD = 4
 
 --[[--
 Creates a server (it does not listen until @{Server:start} is called).
@@ -572,6 +576,14 @@ function Server:_poll()
             logger.err("vnc: servicing a client failed:", tostring(err))
             self:_drop_client(client, tostring(err))
         end
+        -- A press whose client has not released or moved yet is a long press once a full hold
+        -- interval has passed; that is decided here, on the poll, because while the contact is
+        -- buffered no core timer keeps this task from running (c.f., Server:_on_pointer). The
+        -- buffer lives on the connection's *input state* - the bag the protocol hands to the
+        -- pointer callback - not on this bookkeeping record.
+        if not client.dropped then
+            self:_flush_pointer(client.server.client)
+        end
         -- A message that is *partially* received and then goes quiet means we are waiting for
         -- bytes that are never coming (a length we mis-read, so every later message is being
         -- swallowed as its payload). Waiting for a client's *next* message is normal and must not
@@ -590,6 +602,10 @@ function Server:_poll()
         end
         ::continue_client::
     end
+
+    -- The state bag Server:inject_pointer drives (KOReader's HTTP inspector, the tests) goes
+    -- through the same contact buffering and needs the same flush.
+    self:_flush_pointer(self._inject_client)
 
     -- The dirty list is deliberately *not* cleared here: each client remembers the generation it
     -- was last served (`sent_gen`), and the list's eviction age tells us when a client has to be
@@ -629,19 +645,32 @@ local function event_time()
     return time.split_s_us(fts)
 end
 
+--- The same clock as an fts number, for the decisions the server makes *between* injected frames
+--- (how long a client's button has been down) and for stamping a frame that stands for something
+--- the client did earlier: a buffered press carries the time the client's contact was read, so the
+--- hold timer it arms lands where a finger's would rather than one interval after we got around to
+--- injecting it.
+local function event_now()
+    local sec, usec = event_time()
+    return time.s(sec) + time.us(usec)
+end
+
 --[[--
 Feeds Linux-input style events to KOReader and dispatches whatever gestures come out.
 
 This is the seam KOReader's own device backends use (`EV_ABS` for positions, a `SYN_REPORT` to
 close an input frame), so a single implementation serves every device: mouse-like clients become
 taps, drags and long presses exactly as a finger would.
+
+`at` (an fts in the device's event clock, optional) is the time the frame happened at; it defaults
+to now, and only a frame that stands for a client action from a moment ago passes it.
 ]]
-function Server:_inject(evs)
+function Server:_inject(evs, at)
     local input = Device.input
     if not input then return end
     local handled = {}
     -- One timestamp for the whole frame, like the kernel's SYN_REPORT carries for the real ones.
-    local sec, usec = event_time()
+    local sec, usec = time.split_s_us(at or event_now())
     for _, ev in ipairs(evs) do
         ev.time = { sec = sec, usec = usec }
         if input.eventAdjustHook then input:eventAdjustHook(ev) end
@@ -677,13 +706,78 @@ end
 
 local SYN = { type = C.EV_SYN, code = C.SYN_REPORT, value = 0 }
 
+--- The frames a client's contact is fed to core with, in the same shape (and with the same
+--- per-frame timestamp) the kernel uses for a finger's.
+local function down_frame(x, y)
+    return {
+        abs_ev(C.ABS_MT_SLOT, 0),
+        abs_ev(C.ABS_MT_TRACKING_ID, 1),
+        abs_ev(C.ABS_MT_TOOL_TYPE, 0),          -- finger
+        abs_ev(C.ABS_MT_POSITION_X, x),
+        abs_ev(C.ABS_MT_POSITION_Y, y),
+        key_ev(C.BTN_TOUCH, 1),                 -- the "snow" protocol wants this too
+        SYN,
+    }
+end
+
+local function lift_frame(x, y)
+    return {
+        abs_ev(C.ABS_MT_POSITION_X, x),
+        abs_ev(C.ABS_MT_POSITION_Y, y),
+        abs_ev(C.ABS_MT_SLOT, 0),
+        abs_ev(C.ABS_MT_TRACKING_ID, -1),
+        key_ev(C.BTN_TOUCH, 0),
+        SYN,
+    }
+end
+
+local function motion_frame(x, y)
+    return {
+        abs_ev(C.ABS_MT_POSITION_X, x),
+        abs_ev(C.ABS_MT_POSITION_Y, y),
+        SYN,
+    }
+end
+
+--[[--
+The detector's long-press interval, in the device's own timescale (fts), or nil when there is no
+gesture detector to arm a hold timer in - in which case a contact is injected on sight, since
+nothing about it can be judged later.
+]]
+local function hold_interval()
+    local detector = Device.input and Device.input.gesture_detector
+    local interval = detector and detector.ges_hold_interval
+    if not interval or interval <= 0 then return nil end
+    return interval
+end
+
 --- PointerEvent: a press/release at a position, with the button mask doing the rest.
 ---
 --- `client` is the connection's input state bag (`buttons`, `press_x`/`press_y`, `dragging`,
---- `pointer_x`/`pointer_y`), and this function is its only writer: the protocol layer hands over
---- the PointerEvent as it arrived and leaves that state alone (c.f., vnc/rfbserver.lua's
+--- `pointer_x`/`pointer_y`, `buffered`), and this function is its only writer: the protocol layer
+--- hands over the PointerEvent as it arrived and leaves that state alone (c.f., vnc/rfbserver.lua's
 --- `_message_loop`). Reading `client.buttons` as the *previous* mask is what turns a message into a
 --- press or a release; anything that stores the new mask first makes every click look like motion.
+---
+--- A press is not injected the moment it is read, though. The moment a contact is down, core arms
+--- its hold timer (`Contact:handleNonTap` -> `Input:setTimeout(slot, "hold", ..., tev.timev,
+--- ges_hold_interval)`), and while an input timer is pending `Input:waitEvent` does *not* give
+--- control back to UIManager - it keeps polling the device for a timer to expire. So a press
+--- injected on sight starves the very poll task that is the only thing able to read the client's
+--- release: the hold fires first and a click is delivered as a hold. And a client's lift is a
+--- socket message, not a device event, so it cannot break that wait the way a finger's lift does.
+---
+--- The client's contact is therefore kept in `client.buffered` until it is *actionable*, which
+--- three things make it:
+---   * the lift. A click is press *and* release: both are injected now, in one frame each, which is
+---     what the kernel delivers for a click too, and the detector judges a tap from them. That
+---     leaves no timer pending, so the loop keeps running and the release is read as it arrives.
+---   * motion past @{Server.DRAG_THRESHOLD}: a drag, so the down it starts from is injected
+---     together with the motion that made it one, and everything after it is forwarded as before.
+---   * @{Server:_flush_pointer}: the button is still down one hold interval later, so it is a long
+---     press - the down goes in on its own then and core's own hold timer takes it from there.
+--- While the contact is buffered no core timer exists, so the loop keeps running - which is what
+--- makes the release readable at all, and what keeps updates flowing during a held contact.
 function Server:_on_pointer(client, x, y, mask)
     local was_down = (client.buttons or 0) ~= 0
     local down = mask ~= 0
@@ -701,50 +795,72 @@ function Server:_on_pointer(client, x, y, mask)
     else
         logger.dbg("vnc: client pointer motion at", x, y, "mask", mask)
     end
-    if down == was_down then
-        if down then
-            -- A drag: the button is still down, so the position update is a touch move KOReader
-            -- has to see. With no button down there is nothing to report (KOReader has no hover).
-            --
-            -- A mouse moves by a pixel or two while its button is pressed, and forwarding that
-            -- turns every click into a drag (KOReader cancels the tap and pans instead): motion is
-            -- only forwarded once the pointer has really left the press point.
-            if not client.dragging then
-                local dx = math.abs(x - (client.press_x or x))
-                local dy = math.abs(y - (client.press_y or y))
-                if dx + dy < 4 then return end
-                client.dragging = true
-            end
-            self:_inject({
-                abs_ev(C.ABS_MT_POSITION_X, x),
-                abs_ev(C.ABS_MT_POSITION_Y, y),
-                SYN,
-            })
+    if down and not was_down then
+        client.press_x, client.press_y, client.dragging = x, y, false
+        if hold_interval() then
+            -- Buffer it: see the note above. The time is the device's own event clock, the same
+            -- one the frame that carries it will be stamped with.
+            client.buffered = { x = x, y = y, at = event_now() }
+            return
         end
+        self:_inject(down_frame(x, y))
         return
     end
-    local slot = abs_ev(C.ABS_MT_SLOT, 0)
-    if down then
-        client.press_x, client.press_y, client.dragging = x, y, false
-        self:_inject({
-            slot,
-            abs_ev(C.ABS_MT_TRACKING_ID, 1),
-            abs_ev(C.ABS_MT_TOOL_TYPE, 0),          -- finger
-            abs_ev(C.ABS_MT_POSITION_X, x),
-            abs_ev(C.ABS_MT_POSITION_Y, y),
-            key_ev(C.BTN_TOUCH, 1),                 -- the "snow" protocol wants this too
-            SYN,
-        })
-    else
-        self:_inject({
-            abs_ev(C.ABS_MT_POSITION_X, x),
-            abs_ev(C.ABS_MT_POSITION_Y, y),
-            abs_ev(C.ABS_MT_SLOT, 0),
-            abs_ev(C.ABS_MT_TRACKING_ID, -1),
-            key_ev(C.BTN_TOUCH, 0),
-            SYN,
-        })
+    if not down and was_down then
+        local buffered = client.buffered
+        if buffered then
+            -- The whole click is known: contact down and up, in one frame each (and the down
+            -- stamped with the moment the client's press was read, so the detector sees the click
+            -- the client made, not the moment we got around to injecting it).
+            client.buffered = nil
+            self:_inject(down_frame(buffered.x, buffered.y), buffered.at)
+            self:_inject(lift_frame(x, y))
+            return
+        end
+        self:_inject(lift_frame(x, y))
+        return
     end
+    -- Motion (the button mask has not changed).
+    if not down then
+        -- With no button down there is nothing to report (KOReader has no hover).
+        return
+    end
+    local buffered = client.buffered
+    if buffered then
+        -- The pointer left the press point before the contact was ever injected: this is a drag,
+        -- so inject the down it starts from and then the motion that made it one.
+        if math.abs(x - buffered.x) + math.abs(y - buffered.y) < Server.DRAG_THRESHOLD then return end
+        client.buffered = nil
+        client.dragging = true
+        self:_inject(down_frame(buffered.x, buffered.y), buffered.at)
+        self:_inject(motion_frame(x, y))
+        return
+    end
+    -- A mouse moves by a pixel or two while its button is pressed, and forwarding that turns every
+    -- click into a drag (KOReader cancels the tap and pans instead): motion is only forwarded once
+    -- the pointer has really left the press point.
+    if not client.dragging then
+        local dx = math.abs(x - (client.press_x or x))
+        local dy = math.abs(y - (client.press_y or y))
+        if dx + dy < Server.DRAG_THRESHOLD then return end
+        client.dragging = true
+    end
+    self:_inject(motion_frame(x, y))
+end
+
+--[[--
+Injects a buffered contact whose client has held the button for a full @{GestureDetector} long-press
+interval: that is a long press, and core has to own it (its hold timer, its `onHold`/
+`onHoldRelease`, its hold-pan). Called once per poll tick for every client, so one that keeps
+holding - or has gone quiet - still gets its press.
+]]
+function Server:_flush_pointer(client)
+    local buffered = client.buffered
+    if not buffered then return end
+    local interval = hold_interval()
+    if interval and event_now() - buffered.at < interval then return end
+    client.buffered = nil
+    self:_inject(down_frame(buffered.x, buffered.y), buffered.at)
 end
 
 --- KeyEvent: printable keysyms become text, named ones a real key press.
@@ -802,6 +918,11 @@ Feeds one pointer event into KOReader as if a VNC client had sent it.
 
 Kept public (unlike the underscore-prefixed internals) so it can be driven from KOReader's HTTP
 inspector and from tests: `.../ui/vnc/server/inject_pointer/300/200/1`.
+
+A press goes through the same contact buffering a socket client's does (c.f., @{Server:_on_pointer}),
+so it is a gesture, not a frame: a press and its release are injected together as a tap, a press and
+then motion as a drag, and a press on its own once a full hold interval has passed since it - the
+last one needs a running server, whose poll does that judging.
 ]]
 --- @tparam number|string x
 --- @tparam number|string y
