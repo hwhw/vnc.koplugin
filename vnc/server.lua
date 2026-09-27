@@ -77,6 +77,7 @@ function Server.new(opts)
         _orig_refresh = nil,
         _poll_task = nil,
     }, Server)
+    self._inject_client = {}                 -- button state for Server:inject_pointer
     self._refresh_hook = function(mgr, mode, region, dither)
         self:_record_dirty(mode, region)
         return self._orig_refresh(mgr, mode, region, dither)
@@ -566,12 +567,24 @@ local SYN = { type = C.EV_SYN, code = C.SYN_REPORT, value = 0 }
 
 --- PointerEvent: a press/release at a position, with the button mask doing the rest.
 function Server:_on_pointer(client, x, y, mask)
+    if (mask ~= 0) ~= ((client.buttons or 0) ~= 0) then
+        logger.info(string.format("vnc: client pointer %s at %s,%s",
+            mask ~= 0 and "press" or "release", tostring(x), tostring(y)))
+    end
     local was_down = (client.buttons or 0) ~= 0
     client.buttons = mask
     client.pointer_x, client.pointer_y = x, y
     local down = mask ~= 0
     if down == was_down then
-        -- motion only: KOReader has no hover, so nothing to do until a button changes
+        if down then
+            -- A drag: the button is still down, so the position update is a touch move KOReader
+            -- has to see. With no button down there is nothing to report (KOReader has no hover).
+            self:_inject({
+                abs_ev(C.ABS_MT_POSITION_X, x),
+                abs_ev(C.ABS_MT_POSITION_Y, y),
+                SYN,
+            })
+        end
         return
     end
     local slot = abs_ev(C.ABS_MT_SLOT, 0)
@@ -599,6 +612,7 @@ end
 
 --- KeyEvent: printable keysyms become text, named ones a real key press.
 function Server:_on_key(client, keysym, down)
+    logger.info(string.format("vnc: client key keysym=0x%X %s", keysym, down and "down" or "up"))
     if not Device.input then return end
 
     -- Printable keysyms arrive as text (KOReader types via TextInput, exactly like its own
@@ -625,7 +639,7 @@ function Server:_on_key(client, keysym, down)
     end
     local code = self:_keycode_for(name)
     if not code then
-        logger.dbg("vnc: this device has no key named", name)
+        logger.info("vnc: this device has no key named", name, "- client key ignored")
         return
     end
     self:_inject({ key_ev(code, down and 1 or 0) })
@@ -644,6 +658,27 @@ function Server:_keycode_for(name)
         end
     end
     return self._keycodes[name]
+end
+
+--[[--
+Feeds one pointer event into KOReader as if a VNC client had sent it.
+
+Kept public (unlike the underscore-prefixed internals) so it can be driven from KOReader's HTTP
+inspector and from tests: `.../ui/vnc/server/inject_pointer/300/200/1`.
+]]
+--- @tparam number|string x
+--- @tparam number|string y
+--- @tparam number|string mask RFB button mask (1 = left button down, 0 = released)
+function Server:inject_pointer(x, y, mask)
+    self:_on_pointer(self._inject_client, tonumber(x) or 0, tonumber(y) or 0, tonumber(mask) or 0)
+end
+
+--- Feeds one key event into KOReader, as if a VNC client had sent it (X11 keysym).
+--- @tparam number|string keysym
+--- @tparam boolean|string down
+function Server:inject_key(keysym, down)
+    local is_down = (down == true) or (down == "true") or (down == 1) or (down == "1")
+    self:_on_key(self._inject_client, tonumber(keysym) or 0, is_down)
 end
 
 --- ClientCutText: put it where KOReader's own clipboard lives, if it has one.

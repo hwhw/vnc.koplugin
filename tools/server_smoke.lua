@@ -46,6 +46,7 @@ local Protocol = require("vnc/protocol")
 local RfbServer = require("vnc/rfbserver")
 local ServerEnc = require("vnc/serverenc")
 local Screen = Device.screen
+local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local Util = require("vnc/util")
 
@@ -762,6 +763,47 @@ check("server_serves_a_second_incremental_update", function()
     end)
 
     server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("client_input_reaches_a_widget", function()
+    -- The end of the chain: a tap and a key from a client must make a *real widget* on KOReader's
+    -- window stack react. (The check below spies on UIManager:handleInputEvent, which only proves
+    -- the event was dispatched; this one proves it is acted upon.)
+    local Server = require("vnc/server")
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local GestureRange = require("ui/gesturerange")
+
+    local server = Server.new{ settings = { ip = "127.0.0.1", port = 5900, password = "" } }
+    local received = {}
+    local widget = InputContainer:new{
+        dimen = Screen:getSize(),
+        ges_events = {
+            Tap = { GestureRange:new{ ges = "tap", range = Geom:new{ x = 0, y = 0, w = 4000, h = 4000 } } },
+        },
+        key_events = { KeyPress = { { "Down" } } },
+    }
+    function widget:onTap(_, ges)
+        received.tap = { x = ges.pos.x, y = ges.pos.y }
+        return true
+    end
+    function widget:onKeyPress(key)
+        received.key = key.key
+        return true
+    end
+    UIManager:show(widget)
+    local ok, err = pcall(function()
+        server:inject_pointer(120, 90, 1)
+        server:inject_pointer(120, 90, 0)
+        server:inject_key(0xFF54, true)                 -- Down
+        assert_true(received.tap ~= nil, "a client tap must reach a widget's onTap")
+        assert_true(received.tap.x == 120 and received.tap.y == 90,
+            string.format("the tap must land where the client asked, got %s,%s",
+                tostring(received.tap.x), tostring(received.tap.y)))
+        assert_true(received.key == "Down",
+            "a client key must reach a widget's onKeyPress, got " .. tostring(received.key))
+    end)
+    UIManager:close(widget)
     if not ok then error(err, 0) end
 end)
 
