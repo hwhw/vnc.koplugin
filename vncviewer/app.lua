@@ -457,7 +457,11 @@ function ViewerApp:zoom_to(mode)
 end
 
 function ViewerApp:rotate(delta)
-    local mode = band(Screen:getRotationMode() + delta, 3)
+    self:set_rotation_mode(band(Screen:getRotationMode() + delta, 3))
+end
+
+--- Switches the screen orientation and re-lays out.
+function ViewerApp:set_rotation_mode(mode)
     if mode == Screen:getRotationMode() then return end
     Screen:setRotationMode(mode)
     self:_reflow()
