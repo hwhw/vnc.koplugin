@@ -66,6 +66,11 @@ function Remote:get_size()
     return self.w, self.h
 end
 
+--- @treturn number screen pixels per remote pixel
+function Remote:get_scale()
+    return self.scale
+end
+
 --- Zero-copy sub-window of the plane (shares its stride). The caller must not free it.
 function Remote:viewport(x, y, w, h)
     return self:get_plane():viewport(x, y, w, h)
@@ -92,6 +97,18 @@ function Remote:resize(w, h)
     else
         self.scale, self.view_x, self.view_y = 1, 0, 0
     end
+end
+
+--[=[--
+Tells the view which area (screen pixels) it has, and re-places it inside.
+
+@{Remote:draw_to} does this implicitly for every frame; this is for the paths that change the
+available space without painting (a zoom change, the on-screen keyboard appearing or going away,
+a rotation), so that the view is placed - and clamped - against the space it actually has.
+]=]
+function Remote:set_canvas(cw, ch)
+    self.cw, self.ch = cw, ch
+    self:_clamp()
 end
 
 --- Frees the plane and the cached scaled buffer.

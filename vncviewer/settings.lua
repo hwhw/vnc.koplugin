@@ -26,7 +26,7 @@ Settings.PROFILE_FIELDS = { "name", "host", "port", "username", "password" }
 Settings.DEFAULTS = {
     orientation = 0,                 -- Screen.DEVICE_ROTATED_UPRIGHT, used as the app default
     keyboard_always_visible = false,
-    zoom_mode = "fit",               -- "fit" or a numeric scale factor
+    zoom_mode = "fit",               -- "fit", "fit_with_keyboard", or a numeric scale factor
     enable_tight = false,            -- opt-in Tight encoding (not in RFC 6143; see README)
 }
 

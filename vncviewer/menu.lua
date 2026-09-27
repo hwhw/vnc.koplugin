@@ -23,7 +23,8 @@ local Screen = Device.screen
 local MenuBuilder = {}
 
 local ZOOM_CHOICES = {
-    { label = _("Fit framebuffer"), value = "fit" },
+    { label = _("Fit screen"), value = "fit" },
+    { label = _("Fit (with keyboard)"), value = "fit_with_keyboard" },
     { label = "25%", value = 0.25 },
     { label = "50%", value = 0.5 },
     { label = "75%", value = 0.75 },

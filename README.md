@@ -48,9 +48,11 @@ Gestures on the canvas:
 | swipe down | hide it again |
 | swipe down in the top menu zone | open the in-app menu (taps there click the remote) |
 
-The on-screen keyboard is drawn **over** the framebuffer: showing or hiding it never rescales or
-moves the view. Pan (two-finger drag) if part of the remote desktop ends up behind the keyboard —
-if the zoomed view already fits in the space above the keyboard, nothing is hidden at all. The keyboard is
+The on-screen keyboard is drawn **over** the framebuffer: showing or hiding it never rescales the
+view, and a view too large for the space the keyboard leaves keeps the whole screen — pan with a
+two-finger drag to reach what the keys cover. When the whole remote screen *does* fit in that
+space, the view is moved into it rather than losing its lower part behind the keys (the zoom is
+untouched: only the placement moves). The keyboard is
 re-laid out from the current screen dimensions whenever they change, so it fits after a rotation
 just like everything else (rotations and screen resizes go through KOReader's generic
 `SetRotationMode` / `ScreenResize` events).
@@ -86,7 +88,9 @@ Device-control keys that KOReader names `Power`, `Sym` or `ScreenKB` are ignored
 "menu" key reaches the remote as the X11 `Menu` keysym.
 
 The in-app menu offers everything the viewer can do: the connection list, a status line, zoom
-presets (**Fit framebuffer** included), a "keyboard always visible" toggle, show/hide keyboard,
+presets (**Fit screen**, which fills the screen, and **Fit (with keyboard)**, which fits the space
+the on-screen keyboard leaves and so follows it), a "keyboard always visible" toggle, show/hide
+keyboard,
 **Rotate screen** and the four screen orientations, "use current orientation as default", the
 keys the on-screen keyboard does not have (Enter/Tab/Esc/Delete), **Disconnect** (with
 confirmation) and **Leave (keep connection)**. When the connection has just
@@ -119,7 +123,7 @@ return {
     ["settings"] = {
         ["orientation"] = 0,               -- Screen.DEVICE_ROTATED_* used as the app default
         ["keyboard_always_visible"] = false,
-        ["zoom_mode"] = "fit",             -- "fit" or a numeric scale (0.25 .. 4)
+        ["zoom_mode"] = "fit",             -- "fit", "fit_with_keyboard" or a numeric scale (0.25 .. 4)
         ["enable_tight"] = false,          -- see below
     },
     ["settings_version"] = 1,
@@ -220,7 +224,8 @@ the keyboard neither rescales nor moves the view, that the keyboard is re-laid o
 screen dimensions after a rotation, that the menu swipe zone is registered while taps
 (anywhere, including the menu zone) still reach the remote desktop, that the menu's keyboard
 items really leave the keyboard in the state they promise, that the keyboard yields to menus and
-dialogs above the view (and comes back afterwards), that platform text input is enabled
+dialogs above the view (and comes back afterwards), that the fitted zoom modes follow the
+keyboard and that a view which fits above it is placed there, that platform text input is enabled
 for as long as the viewer is up (and only then), that typing reaches the remote through
 KOReader's own SDL event handler, and that physical keys are forwarded
 (Escape/Enter/Tab/arrows/context-menu/F-keys, with releases and repeats) while the Menu key is

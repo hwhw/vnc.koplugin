@@ -318,8 +318,117 @@ check("canvas_covers_the_screen", function()
     remote:free()
 end)
 
+check("zoom_modes_follow_the_keyboard", function()
+    local app, remote = new_app()
+    local size = Screen:getSize()
+    local function near(a, b) return math.abs(a - b) < 1e-9 end
+
+    -- the menu offers both fitted modes, under the names users are looking for
+    app:open_menu()
+    local labels
+    for _, item in ipairs(app.menu.item_table) do
+        if item.text == "Zoom…" then
+            labels = {}
+            for _, sub in ipairs(item.sub_item_table) do labels[#labels + 1] = sub.text end
+        end
+    end
+    assert_true(labels ~= nil, "the menu must offer a zoom submenu")
+    assert_true(labels[1] == "Fit screen", "the first choice is \"Fit screen\", got " .. tostring(labels[1]))
+    assert_true(labels[2] == "Fit (with keyboard)",
+        "the second choice is \"Fit (with keyboard)\", got " .. tostring(labels[2]))
+    app:close_menu()
+    UIManager:_checkTasks()
+
+    app:zoom_to("fit")
+    local fit = math.min(size.w / 400, size.h / 300)
+    assert_true(near(remote:get_scale(), fit),
+        string.format("\"fit screen\" fits the screen: %s", remote:get_scale()))
+
+    app:set_keyboard_visible(true)
+    local kbd_h = app.vk:getSize().h
+    assert_true(kbd_h > 0, "the keyboard must have a height")
+
+    app:zoom_to("fit_with_keyboard")
+    local fit_kbd = math.min(size.w / 400, (size.h - kbd_h) / 300)
+    assert_true(near(remote:get_scale(), fit_kbd),
+        string.format("\"fit (with keyboard)\" fits the space above the keyboard: %s", remote:get_scale()))
+    assert_true(fit_kbd < fit, "which is smaller than fitting the screen here")
+
+    -- it follows the keyboard, which is the point of the mode
+    app:set_keyboard_visible(false)
+    assert_true(near(remote:get_scale(), fit), "with the keyboard hidden it is a plain fit again")
+    app:set_keyboard_visible(true)
+    assert_true(near(remote:get_scale(), fit_kbd), "and it shrinks again when the keyboard returns")
+
+    -- a fixed ratio is never touched by the keyboard
+    app:zoom_to(0.5)
+    assert_true(near(remote:get_scale(), 0.5), "a fixed ratio is applied as-is")
+    app:set_keyboard_visible(false)
+    app:set_keyboard_visible(true)
+    assert_true(near(remote:get_scale(), 0.5), "and the keyboard does not change it")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("a_view_that_fits_goes_above_the_keyboard", function()
+    local app, remote = new_app()
+    local size = Screen:getSize()
+
+    app:set_keyboard_visible(true)
+    local kbd_h = app.vk:getSize().h
+    assert_true(kbd_h > 0, "the keyboard must have a height")
+
+    -- 50% of the 400x300 plane is 200x150: it fits in the space the keyboard leaves
+    app:zoom_to(0.5)
+    assert_true(app.canvas.h == size.h - kbd_h,
+        string.format("the canvas must be the space above the keyboard, got %d of %d", app.canvas.h, size.h))
+    assert_true(remote:get_scale() == 0.5, "placing the view must not change the zoom")
+    local dx, dy, dw, dh = remote:rect_to_canvas({ x = 0, y = 0, w = 400, h = 300 }, app.canvas.x, app.canvas.y)
+    assert_true(dy >= app.canvas.y and dy + dh <= app.canvas.y + app.canvas.h + 1,
+        string.format("the whole remote screen must be above the keyboard: y %d..%d, keyboard at %d",
+            dy, dy + dh, app.canvas.y + app.canvas.h))
+    assert_true(dx >= 0 and dx + dw <= size.w + 1, "and inside the screen horizontally")
+
+    -- a view that cannot fit there keeps the full canvas
+    app:zoom_to(4)
+    assert_true(app.canvas.h == size.h, "a view too big for that space spans the screen")
+
+    -- "fit screen" lands there too whenever its scale leaves the room for it
+    app:zoom_to("fit")
+    local fitted = 300 * remote:get_scale()
+    if fitted <= size.h - kbd_h then
+        assert_true(app.canvas.h == size.h - kbd_h, "a fitted view that leaves room goes above the keyboard")
+    else
+        assert_true(app.canvas.h == size.h, "one that does not fills the screen")
+    end
+
+    -- a pinch that lands on a fitting zoom is re-placed as well
+    app:zoom_to(4)
+    assert_true(app.canvas.h == size.h, "at 400% the view spans the screen")
+    app:_live_zoom({ pos = { x = 100, y = 100 }, span = 50, start_span = 400 })
+    app:onPinch()
+    assert_true(remote:get_scale() < 1, "the pinch zoomed out")
+    assert_true(app.canvas.h == size.h - kbd_h, "and the view moved above the keyboard")
+
+    -- "fit (with keyboard)" always fits there, by choosing the scale
+    app:zoom_to("fit_with_keyboard")
+    assert_true(app.canvas.h == size.h - kbd_h, "the keyboard-aware fit uses the space above the keyboard")
+    local _dx2, dy2, _dw2, dh2 = remote:rect_to_canvas({ x = 0, y = 0, w = 400, h = 300 },
+        app.canvas.x, app.canvas.y)
+    assert_true(dy2 >= app.canvas.y and dy2 + dh2 <= app.canvas.y + app.canvas.h + 1,
+        "and the whole remote screen is inside it")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
 check("keyboard_overlaps_without_rescaling", function()
     local app, remote = new_app()
+    local size = Screen:getSize()
+    -- a view too big for the space above the keyboard keeps the whole screen: the keyboard
+    -- overlays it and the user pans
+    app:zoom_to(4)
     local canvas = { w = app.canvas.w, h = app.canvas.h }
     local scale = remote.scale
     local view = { x = remote.view_x, y = remote.view_y }
@@ -328,15 +437,16 @@ check("keyboard_overlaps_without_rescaling", function()
     assert_true(app.vk_visible, "the keyboard must be visible")
     assert_true(app.vk:getSize().h > 0, "the keyboard must have a height")
     assert_true(app.canvas.w == canvas.w and app.canvas.h == canvas.h,
-        "showing the keyboard must not change the canvas")
+        "a view that cannot fit above the keyboard must keep the full canvas")
     assert_true(math.abs(remote.scale - scale) < 1e-9,
         string.format("showing the keyboard must not rescale the view (%s -> %s)", scale, remote.scale))
     assert_true(math.abs(remote.view_x - view.x) < 1e-9 and math.abs(remote.view_y - view.y) < 1e-9,
-        "showing the keyboard must not move the view")
+        "showing the keyboard must not move a view that does not fit above it")
 
     app:set_keyboard_visible(false)
     assert_true(not app.vk_visible, "the keyboard must hide again")
     assert_true(math.abs(remote.scale - scale) < 1e-9, "hiding it must not rescale either")
+    assert_true(app.canvas.h == size.h, "and the canvas covers the screen again")
     app:onCloseWidget()
     remote:free()
 end)

@@ -168,21 +168,80 @@ function ViewerApp:getSize()
     return self.dimen
 end
 
---- The canvas is the whole widget: the remote framebuffer gets the full screen, and the
---- on-screen keyboard is drawn over it rather than shrinking it.
+--- Height of the on-screen keyboard while it is visible (0 when it is not).
+function ViewerApp:_keyboard_height()
+    if not (self.vk and self.vk_visible) then return 0 end
+    return self.vk:getSize().h or 0
+end
+
+--[=[--
+The canvas: the area the framebuffer may be drawn in.
+
+That is the whole widget -- the on-screen keyboard is drawn *over* the framebuffer rather than
+shrinking it -- except when the whole remote screen, at the current zoom, fits in the space the
+visible keyboard leaves. Then the view belongs above the keyboard: spreading it over the full
+screen would hide part of it behind the keys and gain nothing. The zoom itself never changes
+here; only where the very same view is placed.
+]=]
 function ViewerApp:_layout(x, y)
     x, y = x or 0, y or 0
     local size = self.dimen
+    local kbd_h = self:_keyboard_height()
+    if kbd_h > 0 and self.remote then
+        local w, h = self.remote:get_size()
+        local scale = self.remote:get_scale()
+        local free_h = size.h - kbd_h
+        -- the half pixel absorbs float error when a fit lands exactly on the edge
+        if w * scale <= size.w + 0.5 and h * scale <= free_h + 0.5 then
+            return Geom:new{ x = x, y = y, w = size.w, h = free_h }
+        end
+    end
     return Geom:new{ x = x, y = y, w = size.w, h = size.h }
 end
 
---- Recomputes the canvas and re-fits the view when the zoom mode asks for it.
+--[[--
+Fits the view for the zoom modes that are computed from the screen.
+
+`"fit"` fills the screen; `"fit_with_keyboard"` fills the space the on-screen keyboard leaves,
+so it follows the keyboard exactly like the viewer did before the keyboard stopped reflowing the
+view. The fixed ratios are absolute and are left alone, so their scale never changes here (nor
+with the keyboard).
+--- @treturn boolean whether the current mode is one of the fitted ones
+]]
+function ViewerApp:_fit_zoom_mode()
+    if not self.remote then return false end
+    local size = self.dimen or Screen:getSize()
+    local mode = self.settings.zoom_mode
+    if mode == "fit" then
+        self.remote:fit_view(size.w, size.h)
+        return true
+    elseif mode == "fit_with_keyboard" then
+        self.remote:fit_view(size.w, size.h - self:_keyboard_height())
+        return true
+    end
+    return false
+end
+
+--[[--
+Recomputes the canvas and hands it to the view.
+
+The canvas decides where a view that fits above the on-screen keyboard goes, so it has to be the
+view's own idea of its space too - otherwise the next zoom change would be placed against the
+full screen while the view lives in the space above the keyboard.
+]]
+function ViewerApp:update_canvas()
+    self.canvas = self:_layout()
+    if self.remote then
+        self.remote:set_canvas(self.canvas.w, self.canvas.h)
+    end
+    return self.canvas
+end
+
+--- Recomputes the canvas and re-applies the fitted zoom modes.
 function ViewerApp:_reflow()
     self.dimen = Screen:getSize()
-    self.canvas = self:_layout()
-    if self.remote and self.settings.zoom_mode == "fit" then
-        self.remote:fit_view(self.canvas.w, self.canvas.h)
-    end
+    self:_fit_zoom_mode()
+    self:update_canvas()
 end
 
 --[[--
@@ -236,6 +295,10 @@ function ViewerApp:paintTo(bb, x, y)
     local size = self:getSize()
     bb:paintRect(x, y, size.w, size.h, BB.COLOR_BLACK)
     self.canvas = self:_layout(x, y)
+    if self.remote then
+        -- the view's space has to match the canvas we are drawing into
+        self.remote:set_canvas(self.canvas.w, self.canvas.h)
+    end
 
     -- Read once per paint: Screen.bb is replaced on rotation/resize.
     local dither = Screen.bb:getType() == BB.TYPE_BB8 and Screen.sw_dithering or false
@@ -423,6 +486,8 @@ function ViewerApp:onOutwardPan(_, ges) return self:_live_zoom(ges) end
 function ViewerApp:onPinch()
     self._last_pinch_factor = nil
     self._zoom_start_span = nil
+    -- the new zoom may put the view above the keyboard (or back on the whole screen)
+    self:update_canvas()
     UIManager:setDirty(self, "ui")
     return nil
 end
@@ -430,6 +495,8 @@ end
 function ViewerApp:onSpread()
     self._last_pinch_factor = nil
     self._zoom_start_span = nil
+    -- the new zoom may put the view above the keyboard (or back on the whole screen)
+    self:update_canvas()
     UIManager:setDirty(self, "ui")
     return nil
 end
@@ -576,17 +643,20 @@ function ViewerApp:evaluate_keyboard()
     local want = self:_wanted_keyboard_visible()
     if want == self.vk_visible then
         -- The height may still have changed (layout switch); re-flow regardless.
-        self.canvas = self:_layout()
+        self:update_canvas()
         return
     end
     self.vk_visible = want
-    -- The canvas does not change: the keyboard overlaps the framebuffer, so the view (and its
-    -- scale) stays put and the user pans if something important ends up behind the keyboard.
     if want then
         self.vk:showKeyboard()
     else
         self.vk:hideKeyboard()
     end
+    -- The keyboard decides what "fit (with keyboard)" fits into, and whether a view that fits
+    -- above it is placed there. Fixed ratios keep their scale; a view too big for the space
+    -- above the keyboard still spans the screen and is panned, as before.
+    self:_fit_zoom_mode()
+    self:update_canvas()
     UIManager:setDirty(self, "ui")
 end
 
@@ -648,6 +718,10 @@ end
 --- The keyboard reports a new height (e.g. after a layout switch). It repaints itself; we
 --- repaint the part of the canvas it used to cover.
 function ViewerApp:on_keyboard_height_changed()
+    -- A different layout (or a rotation) changes how much room the keyboard takes, which is what
+    -- "fit (with keyboard)" fits into and whether a view fits above it.
+    self:_fit_zoom_mode()
+    self:update_canvas()
     UIManager:setDirty(self, "ui")
 end
 
@@ -655,12 +729,11 @@ end
 
 function ViewerApp:zoom_to(mode)
     self.settings.zoom_mode = mode
-    if mode == "fit" then
-        local c = self:canvas_geom()
-        self.remote:fit_view(c.w, c.h)
-    else
+    if not self:_fit_zoom_mode() then
         self.remote:set_scale(mode)
     end
+    -- the new scale may put the view above the keyboard (or back on the whole screen)
+    self:update_canvas()
     UIManager:setDirty(self, "ui")
 end
 
