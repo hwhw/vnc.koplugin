@@ -16,6 +16,8 @@ Normative reference: RFC 6143 (sections 7.1-7.7 and Appendix A).
 @module vnc.rfbserver
 ]]
 
+local bit = require("bit")
+
 local Des = require("vnc/des")
 local Util = require("vnc/util")
 local logger = require("logger")
@@ -39,6 +41,14 @@ Server.SUPPORTED_ENCODINGS = {
 
 Server.PSEUDO_DESKTOP_SIZE = -223
 Server.PSEUDO_LAST_RECT = -224
+
+--- Client messages from the RFB "community" extensions that real viewers send. They are not in
+--- RFC 6143, but a viewer that sends one and gets the connection closed on it (which is all a
+--- server can do with a message whose length it does not know) looks like a viewer whose input
+--- stops working, the moment it is resized or its clipboard changes.
+Server.CLIENT_ENABLE_CONTINUOUS_UPDATES = 150
+Server.CLIENT_FENCE = 248
+Server.CLIENT_SET_DESKTOP_SIZE = 251
 
 --[[--
 Creates the server side of one client connection.
@@ -383,6 +393,47 @@ function Server:_message_loop()
             local len = r:u32()
             local text = r:bytes(len)
             if self.on_cut_text then self.on_cut_text(text, self.client) end
+        elseif msg == Server.CLIENT_FENCE then
+            -- Fence: a synchronisation/ping message. Reply when the client asks for it.
+            r:u8()                                      -- padding
+            local flags = r:u32()
+            local len = r:u8()
+            if len > 0 then r:bytes(len) end
+            if bit.band(flags, 0x80000000) ~= 0 then
+                local out = Util.writer()
+                out:u8(Server.CLIENT_FENCE)
+                out:u8(0)
+                out:u32(flags)
+                out:u8(0)
+                self:_write(out:tostring())
+            end
+        elseif msg == Server.CLIENT_SET_DESKTOP_SIZE then
+            -- We cannot resize the device's screen, so this is parsed and declined by doing
+            -- nothing (there is no reply a viewer waits for forever).
+            r:u8()                                      -- padding
+            local width, height = r:u16(), r:u16()
+            local screens = r:u8()
+            r:u8()                                      -- padding
+            for _ = 1, screens do
+                r:u32()                                 -- id
+                r:u16() r:u16() r:u16() r:u16()          -- x, y, w, h
+                r:u32()                                 -- flags
+            end
+            logger.info(string.format(
+                "vnc: client asked for a %dx%d desktop (%d screen(s)); this server follows the device screen",
+                width, height, screens))
+        elseif msg == Server.CLIENT_ENABLE_CONTINUOUS_UPDATES then
+            local enable = r:u8() ~= 0
+            r:u16() r:u16() r:u16() r:u16()             -- region
+            if enable then
+                -- We hold an update request until something changes, which is close enough; say so
+                -- so the client does not sit waiting for updates it will not get.
+                local out = Util.writer()
+                out:u8(Server.CLIENT_ENABLE_CONTINUOUS_UPDATES)
+                out:u8(0)
+                self:_write(out:tostring())
+                logger.info("vnc: client asked for continuous updates; declining")
+            end
         else
             error(string.format("unknown client message %d", msg), 0)
         end

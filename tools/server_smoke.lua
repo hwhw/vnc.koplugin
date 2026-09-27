@@ -515,15 +515,6 @@ check("server_serves_the_screen_over_a_socket", function()
         local cli = assert(socket.tcp())
         cli:settimeout(3)
         assert(cli:connect("127.0.0.1", settings.port))
-
-        local function pump_server(n)
-            for _ = 1, n or 20 do
-                server:_poll()                     -- services sockets and the coroutines
-                socket.sleep(0.02)
-            end
-        end
-        -- A small positive timeout: non-blocking sends on a fresh socket can be dropped
-        -- silently, and expect() below treats "timeout" as "pump the server and retry".
         cli:settimeout(0.2)
         local function expect(n)
             local deadline = os.time() + 5
@@ -538,6 +529,15 @@ check("server_serves_the_screen_over_a_socket", function()
             assert_true(data ~= nil, string.format("short read of %d bytes: %s", n, tostring(e)))
             return data
         end
+
+        local function pump_server(n)
+            for _ = 1, n or 20 do
+                server:_poll()                     -- services sockets and the coroutines
+                socket.sleep(0.02)
+            end
+        end
+        -- A small positive timeout: non-blocking sends on a fresh socket can be dropped
+        -- silently, and expect() below treats "timeout" as "pump the server and retry".
 
         pump_server(20)
         assert_true(expect(12) == "RFB 003.008\n", "the server must announce 3.8")
@@ -740,6 +740,37 @@ check("server_serves_a_second_incremental_update", function()
             assert_true(#injected > 0, "no KOReader input event came out of the socket path")
             assert_true(saw_key, "a KeyEvent over the wire must become a KOReader key event, got "
                 .. table.concat(injected, ","))
+
+            -- Messages a real viewer sends that RFC 6143 does not define. A server that closes
+            -- the connection on one of them looks like a viewer whose input stops working as soon
+            -- as it is resized or its clipboard changes.
+            cli:send(string.char(248, 0) .. string.char(0x80, 0, 0, 1) .. string.char(0))  -- Fence, reply requested
+            cli:send(string.char(251, 0) .. string.char(0, 200, 0, 150) .. string.char(1, 0) ..
+                string.char(0, 0, 0, 1) ..                         -- screen id
+                string.char(0, 0) .. string.char(0, 0) .. string.char(0, 200) .. string.char(0, 150) ..
+                string.char(0, 0, 0, 1))                           -- flags
+            cli:send(string.char(150, 1) .. string.char(0, 0, 0, 0, 0, 200, 0, 150))
+            cli:send(string.char(6, 0, 0, 0) .. string.char(0, 0, 0, 2) .. "hi")
+            local fence = pump_and_read(6)
+            assert_true(fence:byte(1) == 248, "a Fence request must be answered, got " .. fence:byte(1))
+            local declined = pump_and_read(2)
+            assert_true(declined:byte(1) == 150,
+                "continuous updates must be declined, got " .. declined:byte(1))
+
+            -- ... and the session must still take input afterwards
+            injected = {}
+            cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))   -- KeyEvent: Down
+            local still_alive = false
+            for _ = 1, 60 do
+                server:_poll()
+                socket.sleep(0.02)
+                for _, h in ipairs(injected) do
+                    if h == "onKeyPress" then still_alive = true end
+                end
+                if still_alive then break end
+            end
+            assert_true(still_alive,
+                "the session must still take input after non-RFC client messages (it closed)")
             -- (The pointer path is asserted in server_injects_client_input, where the gesture
             -- detector's state is deterministic; here it is enough that the message was consumed
             -- and produced no error while the session stayed up.)

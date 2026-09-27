@@ -683,7 +683,7 @@ end
 
 --- ClientCutText: put it where KOReader's own clipboard lives, if it has one.
 function Server:_on_cut_text(client, text)
-    logger.dbg("vnc: client cut text", #text, "bytes")
+    logger.info("vnc: client sent its clipboard,", #text, "bytes")
     if Device.setClipboardText then
         Device:setClipboardText(text)
     end
