@@ -164,6 +164,17 @@ callback, which has to see the mask as it was *before* the message: storing it i
 first makes every press look like motion, so no click is ever injected. Also: FFI arrays are 0-based
 while the encoders index pixels 1..count, so the pixel-value array is allocated one slot larger.
 
+Four more lessons the same socket path cost. A FramebufferUpdate is several small writes (the
+header, then each rectangle's header and payload), and with Nagle on the server's accepted socket
+the later ones wait for the first one's ACK - ~40 ms added to every update, empty answer and fence
+reply, until tcp-nodelay is set (Server:_adopt_client; the client half does the same). A poll must
+read a whole buffer, not one protocol field: reading exactly the bytes the protocol owed made every
+six-byte pointer message cost four poll intervals (~41 ms), so a client's mouse moved at about 24
+messages a second. Pure-Lua framing is ~0.3 us per message, so latency was never the interpreter's
+fault - it was a syscall per field and a poll interval per message. And a test must never depend on
+the server being slow: an incremental request with nothing changed is answered at once, so a check
+that "worked" only because the answer took 50 ms is a bug.
+
 The server is off by default; it is started from the Network menu, and the menu carries the only
 UI it has. Its Kindle firewall hole follows httpinspector.koplugin (there is no sshd plugin in this
 KOReader to follow).
