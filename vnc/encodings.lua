@@ -10,22 +10,22 @@ Every decoder takes one `ctx` table and returns `true`, or `nil` plus an error s
 
     ctx = {
       x, y, w, h,     -- rect geometry, in remote framebuffer coordinates
-      r,              -- @{vncviewer.util|reader} positioned at the rect payload
+      r,              -- @{vnc.util|reader} positioned at the rect payload
       plane,          -- the whole remote plane (BlitBuffer, TYPE_BBRGB24)
       vp,             -- plane:viewport(x, y, w, h); decoders write rect-local coords
       streams,        -- per-connection persistent state (zlib streams, palettes)
     }
 
-@module vncviewer.encodings
+@module vnc.encodings
 ]]
 
 local bit = require("bit")
 local ffi = require("ffi")
 
 local BB = require("ffi/blitbuffer")
-local PxFmt = require("vncviewer/pxfmt")
-local Util = require("vncviewer/util")
-local ZStream = require("vncviewer/zstream")
+local PxFmt = require("vnc/pxfmt")
+local Util = require("vnc/util")
+local ZStream = require("vnc/zstream")
 
 local band, rshift, lshift = bit.band, bit.rshift, bit.lshift
 

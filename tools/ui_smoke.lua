@@ -3,14 +3,14 @@
 Headless test for the viewer's UI plumbing: the connection dialogs' back-flow and the toolbar's
 reflow on rotation.
 
-It drives the real @{vncviewer.main} plugin, its @{vncviewer.dialogs} and a real
-@{vncviewer.app} against KOReader's widget stack (no KOReader process and no VNC server are
+It drives the real @{vnc.main} plugin, its @{vnc.dialogs} and a real
+@{vnc.app} against KOReader's widget stack (no KOReader process and no VNC server are
 needed; a profile pointing at a closed port is used to exercise the failure path).
 
 Run it from the KOReader root, with a writable data directory (KOReader wants a `cache/` dir):
 
   cd /usr/lib/koreader
-  PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+  PLUGIN=~/.config/koreader/plugins/vnc.koplugin
   KO_HOME=/tmp/vncv_ui_home \
     LUA_PATH="$PLUGIN/?.lua;;" LUA_CPATH="./common/?.so;;" \
     ./luajit "$PLUGIN/tools/ui_smoke.lua"
@@ -123,7 +123,7 @@ end
 -- ---------------------------------------------------------------- a plugin with two profiles
 
 local plugin_module = assert(dofile(plugin_dir .. "/main.lua"))
-plugin_module.name = "vncviewer"
+plugin_module.name = "vnc"
 local settings_path = data_dir .. "/ui_smoke_store.lua"
 os.remove(settings_path)
 os.remove(settings_path .. ".old")
@@ -262,8 +262,8 @@ end)
 --- Builds a shown viewer app with a fake session and plugin (no network involved).
 --- @treturn table, table, table the app, its remote plane and a record of what it sent
 local function new_app()
-    local ViewerApp = require("vncviewer/app")
-    local Remote = require("vncviewer/framebuffer")
+    local ViewerApp = require("vnc/app")
+    local Remote = require("vnc/framebuffer")
     local remote = Remote.new(400, 300)
     local sent = { pointer = {}, key = {} }
     local app = ViewerApp:new{
@@ -485,18 +485,18 @@ check("menu_opens_on_swipe_only", function()
     local app, remote, sent = new_app()
 
     -- no tap zone may exist: the top strip must stay available to the remote desktop
-    assert_true(not app:checkRegisterTouchZone("vncviewer_menu_tap"),
+    assert_true(not app:checkRegisterTouchZone("vnc_menu_tap"),
         "there must be no menu tap zone")
-    assert_true(not app:checkRegisterTouchZone("vncviewer_menu_tap_ext"),
+    assert_true(not app:checkRegisterTouchZone("vnc_menu_tap_ext"),
         "there must be no menu tap zone")
-    assert_true(app:checkRegisterTouchZone("vncviewer_menu_swipe"),
+    assert_true(app:checkRegisterTouchZone("vnc_menu_swipe"),
         "the menu swipe zone must be registered")
-    assert_true(app:checkRegisterTouchZone("vncviewer_menu_swipe_ext"),
+    assert_true(app:checkRegisterTouchZone("vnc_menu_swipe_ext"),
         "the extended menu swipe zone must be registered")
 
     local zone = G_defaults:readSetting("DTAP_ZONE_MENU")
     local size = Screen:getSize()
-    local gs_range = app._zones["vncviewer_menu_swipe"].gs_range
+    local gs_range = app._zones["vnc_menu_swipe"].gs_range
     assert_true(math.abs(gs_range.range.w - size.w * zone.w) < 1,
         "the menu swipe zone must cover KOReader's DTAP_ZONE_MENU width")
     assert_true(math.abs(gs_range.range.h - size.h * zone.h) < 1,
@@ -533,9 +533,9 @@ check("server_section_is_in_the_network_menu", function()
     local menu_items = {}
     plugin:addToMainMenu(menu_items)
 
-    assert_true(menu_items.vncviewer == nil or menu_items.vncviewer.text == "VNC viewer",
+    assert_true(menu_items.vnc == nil or menu_items.vnc.text == "VNC viewer",
         "the viewer entry stays")
-    local section = menu_items.vncviewer_server
+    local section = menu_items.vnc_server
     assert_true(section ~= nil, "a VNC server section must be registered")
     assert_true(section.text == "VNC server", "named \"VNC server\", got " .. tostring(section.text))
     assert_true(section.sorting_hint == "network", "it belongs in the Network menu")
@@ -573,7 +573,7 @@ check("settings_file_is_kept_in_shape", function()
     -- There is no schema version and no migration; the store still has to survive a file that a
     -- user edited by hand (or that does not exist yet). `LuaSettings` caches one instance per
     -- path (and flushing on close would overwrite the file), so each case gets its own path.
-    local Settings = require("vncviewer/settings")
+    local Settings = require("vnc/settings")
     local writeToFile = require("util").writeToFile   -- (data, path, force_flush, lua_dofile_ready)
 
     local fresh = data_dir .. "/ui_smoke_settings_fresh.lua"

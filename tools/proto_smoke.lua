@@ -1,14 +1,14 @@
 #!/usr/bin/env luajit
 --[[--
-Standalone test harness for the vncviewer protocol layer.
+Standalone test harness for the vnc protocol layer.
 
 Starts `tools/mock_vnc_server.py` (one instance per case, on an ephemeral port) and drives
-@{vncviewer.protocol} against it over a real socket, plus a few in-memory byte-stream cases.
+@{vnc.protocol} against it over a real socket, plus a few in-memory byte-stream cases.
 
 Run with KOReader's own LuaJIT from the KOReader root:
 
   cd /usr/lib/koreader
-  PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+  PLUGIN=~/.config/koreader/plugins/vnc.koplugin
   LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" \
   LUA_CPATH="./common/?.so;;" \
   ./luajit "$PLUGIN/tools/proto_smoke.lua" --tmp /tmp/vncv_smoke
@@ -28,11 +28,11 @@ local socket = require("socket")
 
 local BB = require("ffi/blitbuffer")
 
-local Des = require("vncviewer/des")
-local Encodings = require("vncviewer/encodings")
-local Keysyms = require("vncviewer/keysyms")
-local PxFmt = require("vncviewer/pxfmt")
-local Protocol = require("vncviewer/protocol")
+local Des = require("vnc/des")
+local Encodings = require("vnc/encodings")
+local Keysyms = require("vnc/keysyms")
+local PxFmt = require("vnc/pxfmt")
+local Protocol = require("vnc/protocol")
 
 local bxor = bit.bxor
 
@@ -174,7 +174,7 @@ end
 -- ---------------------------------------------------------------- driver
 
 --[[--
-Drives @{vncviewer.protocol} against a real socket until `want_updates` updates have been
+Drives @{vnc.protocol} against a real socket until `want_updates` updates have been
 seen, or `body` signals a stop.
 
 `o` fields: name, port, password, encodings, want_updates, body, stop_after_body,
@@ -718,7 +718,7 @@ local function main()
 
     -- 9. A rectangle with an encoding we never advertised is fatal, with the encoding number.
     check("unsupported_encoding", function()
-        local w = require("vncviewer/util").writer()
+        local w = require("vnc/util").writer()
         w:raw("RFB 003.008\n")
         w:u8(1); w:u8(1)                          -- one security type: None
         w:u32(0)                                  -- SecurityResult: OK

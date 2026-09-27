@@ -3,9 +3,9 @@ Low-level helpers for the RFB protocol layer.
 
 Byte reader/writer for the **protocol fields** (everything in RFB is big-endian on the
 wire, with the sole exception of pixel payloads, which follow the negotiated
-@{vncviewer.pxfmt|PIXEL_FORMAT}). Pixel data is never touched by these helpers.
+@{vnc.pxfmt|PIXEL_FORMAT}). Pixel data is never touched by these helpers.
 
-@module vncviewer.util
+@module vnc.util
 ]]
 
 local ffi = require("ffi")

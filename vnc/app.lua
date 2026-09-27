@@ -13,7 +13,7 @@ It is a plain (non-modal) full-screen `InputContainer` flagged `is_always_active
 keeps receiving gestures even while one of its own popups is on top — hence the
 `_input_target()` / `_modal_above()` guards on every canvas gesture.
 
-@module vncviewer.app
+@module vnc.app
 ]]
 
 local bit = require("bit")
@@ -31,17 +31,17 @@ local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 
-local Keyboard = require("vncviewer/keyboard")
-local Keysyms = require("vncviewer/keysyms")
-local Util = require("vncviewer/util")
+local Keyboard = require("vnc/keyboard")
+local Keysyms = require("vnc/keysyms")
+local Util = require("vnc/util")
 
 local Screen = Device.screen
 
 local band = bit.band
 
 local ViewerApp = InputContainer:extend{
-    id = "vncviewer_app",
-    name = "VNCViewerApp",
+    id = "vnc_app",
+    name = "VNCApp",
     covers_fullscreen = true, -- UIManager skips painting the widgets underneath us
     modal = false,            -- the keyboard and our dialogs stack above us normally
     disable_double_tap = true,
@@ -98,16 +98,16 @@ function ViewerApp:init_menu_zones()
 
     self:registerTouchZones({
         {
-            id = "vncviewer_menu_swipe",
+            id = "vnc_menu_swipe",
             ges = "swipe",
             screen_zone = zone_ratios(zone),
             handler = function(ges) return self:onMenuSwipe(ges) end,
         },
         {
-            id = "vncviewer_menu_swipe_ext",
+            id = "vnc_menu_swipe_ext",
             ges = "swipe",
             screen_zone = zone_ratios(zone_ext),
-            overrides = { "vncviewer_menu_swipe" },
+            overrides = { "vnc_menu_swipe" },
             handler = function(ges) return self:onMenuSwipe(ges) end,
         },
     })
@@ -767,7 +767,7 @@ end
 
 function ViewerApp:open_menu()
     if self.menu then return self.menu end
-    self.menu = require("vncviewer/menu").open(self)
+    self.menu = require("vnc/menu").open(self)
     -- The menu is on the window stack now: it owns the screen, so the keyboard gets out of the
     -- way (it is part of the framebuffer view, not of the menu).
     self:evaluate_keyboard()
@@ -808,7 +808,7 @@ function ViewerApp:on_back()
 end
 
 function ViewerApp:leave()
-    logger.dbg("vncviewer: leaving the app, keeping the session")
+    logger.dbg("vnc: leaving the app, keeping the session")
     self.plugin:leave_app()
 end
 

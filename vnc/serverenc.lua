@@ -16,13 +16,13 @@ The pixel format is the client's, per RFC 6143 §7.6.2: channel values are scale
 maxima and placed at its shifts, with the bytes ordered by its big-endian flag. Clients that ask
 for a colour-mapped format get the fixed 3-3-2 map in @{Enc.COLOUR_MAP}.
 
-@module vncviewer.serverenc
+@module vnc.serverenc
 ]]
 
 local BB = require("ffi/blitbuffer")
 local ffi = require("ffi")
-local ZStream = require("vncviewer/zstream")
-local Util = require("vncviewer/util")
+local ZStream = require("vnc/zstream")
+local Util = require("vnc/util")
 local logger = require("logger")
 
 local Enc = {}
@@ -112,7 +112,7 @@ function Enc:set_pixel_format(fmt)
     else
         self.cpixel_bytes = nil
     end
-    logger.dbg("vncviewer: server encoder for", fmt.bits_per_pixel, "bpp,",
+    logger.dbg("vnc: server encoder for", fmt.bits_per_pixel, "bpp,",
         true_colour and "true colour" or "colour mapped")
 end
 
@@ -592,7 +592,7 @@ function Enc:encode_zrle(values, count, w, h)
 
     local compressed, err = self.zstream:deflate(raw:tostring())
     if not compressed then
-        logger.warn("vncviewer: ZRLE compression failed:", err)
+        logger.warn("vnc: ZRLE compression failed:", err)
         return nil
     end
     local out = Util.writer()

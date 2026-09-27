@@ -1,7 +1,7 @@
 --[[--
 RFB 3.8 server state machine, transport agnostic.
 
-The mirror image of @{vncviewer.protocol}: it never touches a socket, runs as a coroutine body and
+The mirror image of @{vnc.protocol}: it never touches a socket, runs as a coroutine body and
 yields whenever it wants bytes - `("need", n)` for input, which the driver satisfies across however
 many poll ticks it takes - and hands its outgoing messages to `io.write(s)` for the driver to
 flush.
@@ -13,11 +13,11 @@ once the screen has actually changed - which is what a real RFB server does.
 
 Normative reference: RFC 6143 (sections 7.1-7.7 and Appendix A).
 
-@module vncviewer.rfbserver
+@module vnc.rfbserver
 ]]
 
-local Des = require("vncviewer/des")
-local Util = require("vncviewer/util")
+local Des = require("vnc/des")
+local Util = require("vnc/util")
 local logger = require("logger")
 
 local Server = {}
@@ -28,7 +28,7 @@ Server.VERSION_STRING = "RFB 003.008\n"
 Server.SEC_NONE = 1
 Server.SEC_VNC_AUTH = 2
 
---- Encodings we can produce (see @{vncviewer.serverenc}). Anything else the client announces is
+--- Encodings we can produce (see @{vnc.serverenc}). Anything else the client announces is
 --- ignored, and such a client falls back to Raw, which every client must support.
 Server.SUPPORTED_ENCODINGS = {
     [0] = true,   -- Raw
@@ -218,7 +218,7 @@ function Server:_vnc_auth()
         out:u32(#reason):raw(reason)
     end
     self:_write(out:tostring())
-    if not ok then logger.warn("vncviewer: server rejected a VNC authentication attempt") end
+    if not ok then logger.warn("vnc: server rejected a VNC authentication attempt") end
     return ok
 end
 
@@ -259,7 +259,7 @@ function Server:_read_pixel_format()
     end
     self.client.pixel_format = fmt
     if fmt.true_colour == 0 then self:_send_colour_map() end
-    logger.dbg("vncviewer: client pixel format", string.format(
+    logger.dbg("vnc: client pixel format", string.format(
         "%dbpp depth %d, shifts %d/%d/%d, maxes %d/%d/%d, true_colour %d, big_endian %d",
         bits, fmt.depth, fmt.red_shift, fmt.green_shift, fmt.blue_shift,
         fmt.red_max, fmt.green_max, fmt.blue_max, fmt.true_colour, fmt.big_endian))
@@ -282,7 +282,7 @@ function Server:_read_encodings()
     end
     if #encodings == 0 then encodings = { 0 } end     -- Raw is mandatory for every client
     self.client.encodings = encodings
-    logger.dbg("vncviewer: client encodings", table.concat(encodings, ","))
+    logger.dbg("vnc: client encodings", table.concat(encodings, ","))
 end
 
 function Server:_handle_update_request()

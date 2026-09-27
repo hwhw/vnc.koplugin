@@ -9,13 +9,13 @@ and flushed by the driver.
 
 Normative reference: RFC 6143 (sections 7.1-7.7 and Appendix A).
 
-@module vncviewer.protocol
+@module vnc.protocol
 ]]
 
-local Des = require("vncviewer/des")
-local Encodings = require("vncviewer/encodings")
-local PxFmt = require("vncviewer/pxfmt")
-local Util = require("vncviewer/util")
+local Des = require("vnc/des")
+local Encodings = require("vnc/encodings")
+local PxFmt = require("vnc/pxfmt")
+local Util = require("vnc/util")
 local logger = require("logger")
 
 local Protocol = {}
@@ -223,7 +223,7 @@ function Protocol:_message_loop()
             r:u8()
             local first, count = r:u16(), r:u16()
             r:bytes(count * 6)
-            logger.dbg("vncviewer: ignoring SetColorMapEntries", first, count)
+            logger.dbg("vnc: ignoring SetColorMapEntries", first, count)
         elseif t == 2 then -- Bell
             self:_fire("on_bell")
         elseif t == 3 then -- ServerCutText

@@ -1,12 +1,12 @@
 --[[--
-vncviewer.koplugin — a VNC (RFB 3.8) client for KOReader.
+vnc.koplugin — a VNC (RFB 3.8) client for KOReader.
 
 Adds one entry to the file-browser main menu ("More tools - VNC viewer") and owns the
 lifecycle of the single viewer app and of the connection sessions. Sessions outlive the app:
 leaving the app only detaches it, so the connection (and the plane) is still there when the
 viewer is reopened.
 
-@module vncviewer.main
+@module vnc.main
 ]]
 
 local _ = require("gettext")
@@ -19,25 +19,25 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 
-local Dialogs = require("vncviewer/dialogs")
-local Session = require("vncviewer/session")
-local Server = require("vncviewer/server")
-local ServerMenu = require("vncviewer/servermenu")
-local Settings = require("vncviewer/settings")
-local ViewerApp = require("vncviewer/app")
+local Dialogs = require("vnc/dialogs")
+local Session = require("vnc/session")
+local Server = require("vnc/server")
+local ServerMenu = require("vnc/servermenu")
+local Settings = require("vnc/settings")
+local ViewerApp = require("vnc/app")
 
-local VNCViewer = WidgetContainer:extend{
-    name = "vncviewer",
+local VNC = WidgetContainer:extend{
+    name = "vnc",
     is_doc_only = false,
     settings_file = nil, -- set in init()
-    settings = nil,      -- @{vncviewer.settings} store
-    sessions = {},       -- profile name -> @{vncviewer.session}
-    app = nil,           -- the (single) live @{vncviewer.app}
+    settings = nil,      -- @{vnc.settings} store
+    sessions = {},       -- profile name -> @{vnc.session}
+    app = nil,           -- the (single) live @{vnc.app}
     connection_list = nil, -- the connection list while it is on screen
 }
 
-function VNCViewer:init()
-    self.settings_file = DataStorage:getSettingsDir() .. "/vncviewer.lua"
+function VNC:init()
+    self.settings_file = DataStorage:getSettingsDir() .. "/vnc.lua"
     self.settings = Settings.open(self.settings_file)
 
     -- The VNC server (serving KOReader's own screen). It is off until the user starts it from
@@ -53,8 +53,8 @@ function VNCViewer:init()
     end
 end
 
-function VNCViewer:addToMainMenu(menu_items)
-    menu_items.vncviewer = {
+function VNC:addToMainMenu(menu_items)
+    menu_items.vnc = {
         text = _("VNC viewer"),
         sorting_hint = "more_tools",
         callback = function() self:show() end,
@@ -62,7 +62,7 @@ function VNCViewer:addToMainMenu(menu_items)
     ServerMenu.register(self, menu_items)
 end
 
-function VNCViewer:onFlushSettings()
+function VNC:onFlushSettings()
     if self.settings then self.settings:flush() end
 end
 
@@ -71,7 +71,7 @@ end
 --- Reports session transitions. Errors are shown even when the app is open, except while a
 --- connect attempt is in flight: that attempt's own callback reports the failure, and saying it
 --- twice would stack two messages on screen.
-function VNCViewer:on_session_state(session, state, err)
+function VNC:on_session_state(session, state, err)
     if state ~= "error" then return end
     if self._pending_connect == session then return end
     local message = tostring(err or _("unknown error"))
@@ -87,7 +87,7 @@ Shows the viewer, reusing the running session when there is one.
 
 --- @tparam[opt] string profile_name connect/re-attach this profile instead of asking
 ]]
-function VNCViewer:show(profile_name)
+function VNC:show(profile_name)
     if self.app then
         UIManager:show(self.app)
         return
@@ -114,7 +114,7 @@ Shows the connection list, replacing one that is already on screen.
 This is what every "go back" in the connection dialogs ends up calling, so it must be safe to
 call at any point (and it never leaves two lists stacked).
 ]]
-function VNCViewer:show_connection_list()
+function VNC:show_connection_list()
     -- Every dialog of ours returns here; a text field among them turned SDL text input off.
     if self.app then
         self.app:reassert_text_input()
@@ -128,14 +128,14 @@ function VNCViewer:show_connection_list()
 end
 
 --- Closes the connection list if it is on screen.
-function VNCViewer:close_connection_list()
+function VNC:close_connection_list()
     local menu = self.connection_list
     self.connection_list = nil
     if menu then UIManager:close(menu) end
 end
 
 --- Opens (or reopens) the viewer app for `session` and attaches it.
-function VNCViewer:_open_app(session)
+function VNC:_open_app(session)
     if not self.app then
         self.app = ViewerApp:new{ plugin = self, session = session }
         UIManager:show(self.app)
@@ -155,7 +155,7 @@ Connects to `name` (or re-attaches an existing connection to it) and opens the v
 ---   its "go back" here, so a failure returns the user to the list instead of dropping them out
 ---   of the plugin)
 ]]
-function VNCViewer:connect_profile(name, on_failure)
+function VNC:connect_profile(name, on_failure)
     local profile = self.settings:get_profile(name)
     if not profile then
         UIManager:show(InfoMessage:new{ text = T(_("No connection named %1."), name), timeout = 3 })
@@ -200,7 +200,7 @@ function VNCViewer:connect_profile(name, on_failure)
 end
 
 --- Drops the connection to `name`, closing the viewer if it showed it.
-function VNCViewer:disconnect_session(name)
+function VNC:disconnect_session(name)
     local session = self.sessions[name]
     if not session then return end
     self.sessions[name] = nil
@@ -208,7 +208,7 @@ function VNCViewer:disconnect_session(name)
     session:disconnect()
 end
 
-function VNCViewer:_close_app_if(session)
+function VNC:_close_app_if(session)
     if self.app and self.app.session == session then
         self.app:restore_rotation()
         UIManager:close(self.app)
@@ -217,7 +217,7 @@ function VNCViewer:_close_app_if(session)
 end
 
 --- Closes the viewer but keeps every connection alive for later pickup.
-function VNCViewer:leave_app()
+function VNC:leave_app()
     if self.app then
         self.app:restore_rotation()
         UIManager:close(self.app)
@@ -230,10 +230,10 @@ end
 
 -- ---------------------------------------------------------------- profiles
 
-function VNCViewer:save_profile(profile, existing_name)
+function VNC:save_profile(profile, existing_name)
     local ok, err = self.settings:save_profile(profile, existing_name)
     if not ok then
-        logger.warn("vncviewer: could not save profile:", err)
+        logger.warn("vnc: could not save profile:", err)
         return false, err
     end
     if existing_name and existing_name ~= profile.name then
@@ -249,7 +249,7 @@ function VNCViewer:save_profile(profile, existing_name)
     return true
 end
 
-function VNCViewer:delete_profile(name)
+function VNC:delete_profile(name)
     if self.sessions[name] then
         self:disconnect_session(name)
     end
@@ -257,4 +257,4 @@ function VNCViewer:delete_profile(name)
     self.settings:flush()
 end
 
-return VNCViewer
+return VNC

@@ -2,11 +2,11 @@
 The remote framebuffer plane and the view transform that maps it onto the screen.
 
 The plane is a `TYPE_BBRGB24` BlitBuffer holding the remote pixels 1:1 (that is the format
-@{vncviewer.pxfmt} negotiates, so decoders write straight into it). The view transform is a
+@{vnc.pxfmt} negotiates, so decoders write straight into it). The view transform is a
 uniform `scale` (screen pixels per remote pixel) plus an offset `view_x, view_y` naming the
 remote coordinate shown at the canvas' top-left corner.
 
-@module vncviewer.framebuffer
+@module vnc.framebuffer
 ]]
 
 local BB = require("ffi/blitbuffer")
@@ -262,7 +262,7 @@ function Remote:draw_to(bb, cx, cy, cw, ch, dither)
         if scaled == src then
             -- scaleBlitBuffer() returns its input untouched when the sizes match; that
             -- cannot happen here (we handled dst == copy above), but never cache a viewport.
-            logger.warn("vncviewer: unexpected no-op scale, drawing without cache")
+            logger.warn("vnc: unexpected no-op scale, drawing without cache")
             scaled = nil
         end
         if scaled then

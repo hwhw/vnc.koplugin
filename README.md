@@ -1,11 +1,13 @@
-# VNC viewer for KOReader
+# VNC for KOReader
 
-Control a remote desktop from KOReader. The plugin adds **VNC viewer** to KOReader's file browser
-menu: connect to a VNC server and the remote screen fills the display, with touch, the on-screen
-keyboard and a physical keyboard driving the remote machine.
+Two halves of one thing. **Control a remote desktop from KOReader**: the plugin adds *VNC viewer* to
+KOReader's file browser menu, and the remote screen fills the display, driven by touch, the
+on-screen keyboard and a physical keyboard. And **share KOReader's own screen**: a small VNC server,
+started from the *Network* menu, lets a computer elsewhere watch and drive the reader — see
+[Sharing this screen (VNC server)](#sharing-this-screen-vnc-server).
 
-Works with ordinary VNC servers — x11vnc, TigerVNC, TightVNC, RealVNC (in compatibility mode) and
-friends — over RFB 3.8, the protocol they all speak.
+Both halves speak RFB 3.8, the protocol ordinary VNC servers and viewers (x11vnc, TigerVNC,
+TightVNC, RealVNC in compatibility mode, Remmina, phone apps, ...) all understand.
 
 Current version: **v0.5**.
 
@@ -29,7 +31,7 @@ Current version: **v0.5**.
 2. Unpack the ZIP.
 3. Move the plugin folder into the `plugins` directory in your KOReader folder (create the
    `plugins` directory if it is not there yet). GitHub names the unpacked folder after the
-   repository and the branch — `vncviewer.koplugin-main` — so rename it to **`vncviewer.koplugin`**
+   repository and the branch — `vnc.koplugin-main` — so rename it to **`vnc.koplugin`**
    while you are at it: KOReader only loads plugin directories whose name ends in `.koplugin`.
 4. Restart KOReader.
 
@@ -107,7 +109,7 @@ reproduced, and the on-screen keyboard, dialogs and rotations are simply part of
 ## Settings
 
 Connection profiles live in a plain Lua file inside KOReader's settings directory,
-`settings/vncviewer.lua`:
+`settings/vnc.lua`:
 
 ```lua
 return {

@@ -11,7 +11,7 @@ address byte, so
 and both map **directly** onto KOReader's `TYPE_BBRGB24` (`ColorRGB24 = {r, g, b}`), with no
 byte swapping anywhere.
 
-@module vncviewer.pxfmt
+@module vnc.pxfmt
 ]]
 
 local ffi = require("ffi")

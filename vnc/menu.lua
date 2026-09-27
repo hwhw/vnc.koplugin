@@ -4,7 +4,7 @@ The in-app menu.
 Built fresh on every open, so the checkmarks and the status row always reflect the live
 session state.
 
-@module vncviewer.menu
+@module vnc.menu
 ]]
 
 local _ = require("gettext")
@@ -15,8 +15,8 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local Menu = require("ui/widget/menu")
 local UIManager = require("ui/uimanager")
 
-local Dialogs = require("vncviewer/dialogs")
-local Keysyms = require("vncviewer/keysyms")
+local Dialogs = require("vnc/dialogs")
+local Keysyms = require("vnc/keysyms")
 
 local Screen = Device.screen
 
@@ -56,7 +56,7 @@ local function rotation_label(mode)
 end
 
 --- Opens the in-app menu for `app`.
---- @tparam table app the @{vncviewer.app} instance
+--- @tparam table app the @{vnc.app} instance
 --- @treturn table the Menu
 function MenuBuilder.open(app)
     local plugin = app.plugin

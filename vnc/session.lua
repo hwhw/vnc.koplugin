@@ -1,19 +1,19 @@
 --[[--
 VNC session: socket transport, Wi-Fi handling, attach/detach and reconnect.
 
-A session owns one connection to one server. It drives @{vncviewer.protocol} from a poll
+A session owns one connection to one server. It drives @{vnc.protocol} from a poll
 task registered with `UIManager:scheduleIn`, so the app can be closed (detached) without
 dropping the connection: while detached the poll task is simply not scheduled, so nothing
 is read, nothing is requested, and at most the single outstanding update request is
 buffered by the kernel until we resume.
 
-@module vncviewer.session
+@module vnc.session
 ]]
 
-local Encodings = require("vncviewer/encodings")
-local Protocol = require("vncviewer/protocol")
-local Remote = require("vncviewer/framebuffer")
-local Util = require("vncviewer/util")
+local Encodings = require("vnc/encodings")
+local Protocol = require("vnc/protocol")
+local Remote = require("vnc/framebuffer")
+local Util = require("vnc/util")
 local logger = require("logger")
 
 local UIManager = require("ui/uimanager")
@@ -48,7 +48,7 @@ Session.WIFI_WAIT_TIMEOUT = 30
 Creates a session. Nothing is opened until @{Session:connect} is called.
 
 --- @tparam table opts
---- @tparam table opts.profile connection profile (see @{vncviewer.settings})
+--- @tparam table opts.profile connection profile (see @{vnc.settings})
 --- @tparam[opt] table opts.plugin the plugin instance (for settings)
 --- @tparam[opt] function opts.on_state `(state, err)` on every transition
 --- @tparam[opt] table opts.network_mgr override the network manager (tests)
@@ -81,10 +81,10 @@ end
 --- @tparam[opt] string err
 function Session:_set_state(state, err)
     self.state, self.err = state, err
-    logger.dbg("vncviewer: session", self.profile and self.profile.name, "->", state, err or "")
+    logger.dbg("vnc: session", self.profile and self.profile.name, "->", state, err or "")
     if self.on_state then
         local ok, e = pcall(self.on_state, state, err)
-        if not ok then logger.warn("vncviewer: on_state handler failed:", e) end
+        if not ok then logger.warn("vnc: on_state handler failed:", e) end
     end
 end
 
@@ -146,7 +146,7 @@ function Session:_finish_connect(ok, err)
     self._connect_cb = nil
     if cb then
         local ok2, e = pcall(cb, ok, err)
-        if not ok2 then logger.warn("vncviewer: connect callback failed:", e) end
+        if not ok2 then logger.warn("vnc: connect callback failed:", e) end
     end
 end
 
@@ -163,7 +163,7 @@ end
 
 function Session:_do_connect()
     local p = self.profile
-    logger.dbg("vncviewer: connecting to", p.host, p.port)
+    logger.dbg("vnc: connecting to", p.host, p.port)
     local socket = require("socket")
     local sock = socket.tcp()
     if not sock then
@@ -196,7 +196,7 @@ function Session:_do_connect()
         get_plane = function() return self_ref.remote and self_ref.remote:get_plane() end,
         callbacks = {
             on_connected = function(name, w, h)
-                logger.info("vncviewer: connected to", name, w, h)
+                logger.info("vnc: connected to", name, w, h)
                 if self_ref.remote then
                     -- reconnect / fresh size: keep the object so the app's reference stays valid
                     self_ref.remote:resize(w, h)
@@ -213,7 +213,7 @@ function Session:_do_connect()
                 if self_ref.remote then self_ref.remote:mark_dirty() end
             end,
             on_desktop_resize = function(w, h)
-                logger.info("vncviewer: remote desktop resized to", w, h)
+                logger.info("vnc: remote desktop resized to", w, h)
                 if self_ref.remote then
                     self_ref.remote:resize(w, h)
                 else
@@ -227,7 +227,7 @@ function Session:_do_connect()
                 if self_ref.app then self_ref.app:on_bell() end
             end,
             on_cut_text = function(text)
-                logger.dbg("vncviewer: server cut text:", text)
+                logger.dbg("vnc: server cut text:", text)
             end,
         },
     }
@@ -417,7 +417,7 @@ end
 --- Restores Wi-Fi if we were the ones who turned it on.
 function Session:_restore_wifi()
     if self.wifi_was_on == false then
-        logger.dbg("vncviewer: turning Wi-Fi back off")
+        logger.dbg("vnc: turning Wi-Fi back off")
         self:_net():turnOffWifi()
     end
     self.wifi_was_on = nil
@@ -426,7 +426,7 @@ end
 --- Fails the session, keeping the app (and the last picture) alive for a reconnect.
 function Session:_fail(err)
     local msg = tostring(err)
-    logger.warn("vncviewer: session failed:", msg)
+    logger.warn("vnc: session failed:", msg)
     self:_teardown_connection()
     self:_restore_wifi()
     self:_set_state("error", msg)

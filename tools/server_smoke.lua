@@ -1,10 +1,10 @@
 #!/usr/bin/env luajit
 --[[--
-Standalone test harness for the vncviewer **server** side: the pixel-format conversion and the
-Raw/RRE/Hextile/ZRLE encoders in @{vncviewer.serverenc}.
+Standalone test harness for the vnc **server** side: the pixel-format conversion and the
+Raw/RRE/Hextile/ZRLE encoders in @{vnc.serverenc}.
 
 Everything here is in-process: each encoding is produced by the server encoder and immediately
-decoded by the (independently written) client decoders in @{vncviewer.encodings}, then compared
+decoded by the (independently written) client decoders in @{vnc.encodings}, then compared
 pixel by pixel against the plane that was encoded. That makes the server's wire format testable
 without a server, a socket or a client - and it is the same contract the client side is tested
 against a real RFB server.
@@ -12,7 +12,7 @@ against a real RFB server.
 Run with KOReader's own LuaJIT from the KOReader root:
 
   cd /usr/lib/koreader
-  PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+  PLUGIN=~/.config/koreader/plugins/vnc.koplugin
   LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" \
   LUA_CPATH="./common/?.so;;" \
   ./luajit "$PLUGIN/tools/server_smoke.lua"
@@ -41,13 +41,13 @@ local ffi = require("ffi")
 
 local BB = require("ffi/blitbuffer")
 
-local Encodings = require("vncviewer/encodings")
-local Protocol = require("vncviewer/protocol")
-local RfbServer = require("vncviewer/rfbserver")
-local ServerEnc = require("vncviewer/serverenc")
+local Encodings = require("vnc/encodings")
+local Protocol = require("vnc/protocol")
+local RfbServer = require("vnc/rfbserver")
+local ServerEnc = require("vnc/serverenc")
 local Screen = Device.screen
 local UIManager = require("ui/uimanager")
-local Util = require("vncviewer/util")
+local Util = require("vnc/util")
 
 -- Unbuffered: a crash in a check must not swallow the reports that came before it.
 io.stdout:setvbuf("no")
@@ -488,7 +488,7 @@ end)
 check("server_serves_the_screen_over_a_socket", function()
     -- The real runtime: listener, poll task, capture hook, encoder - and a client that speaks the
     -- protocol by hand over TCP.
-    local Server = require("vncviewer/server")
+    local Server = require("vnc/server")
     local socket = require("socket")
     require("ffi/linux_input_h")
 
@@ -614,7 +614,7 @@ end)
 check("server_injects_client_input", function()
     -- A PointerEvent must become a KOReader gesture at the right position: that is what lets a
     -- remote VNC client tap, drag and long-press KOReader itself.
-    local Server = require("vncviewer/server")
+    local Server = require("vnc/server")
     local server = Server.new{ settings = { ip = "127.0.0.1", port = 5900, password = "" } }
 
     local seen = {}

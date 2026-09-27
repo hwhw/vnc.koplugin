@@ -6,7 +6,7 @@ listens (IP address, port) and whether it asks for a password. The layout follow
 HTTP inspector plugin, which is the established precedent for a plugin that opens a port (its menu
 structure, its status line, its port dialog and its Kindle firewall hole).
 
-@module vncviewer.servermenu
+@module vnc.servermenu
 ]]
 
 local Device = require("device")
@@ -72,7 +72,7 @@ function ServerMenu.register(plugin, menu_items)
         end
     end
 
-    menu_items.vncviewer_server = {
+    menu_items.vnc_server = {
         text = _("VNC server"),
         sorting_hint = "network",
         -- The section itself carries the state, the submenu the controls.

@@ -8,7 +8,7 @@ for obvious correctness over speed.
 
 The algorithm is the standard FIPS PUB 46-3 DES (see RFC 6143 §7.2.2).
 
-@module vncviewer.des
+@module vnc.des
 ]]
 
 local bit = require("bit")

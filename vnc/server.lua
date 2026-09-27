@@ -1,5 +1,5 @@
 --[[--
-The VNC server: a LuaSocket listener, one @{vncviewer.rfbserver} per connected client, the
+The VNC server: a LuaSocket listener, one @{vnc.rfbserver} per connected client, the
 screen capture that feeds them and the input injection that drives KOReader from their events.
 
 Everything runs from a `UIManager:scheduleIn` poll task, so the server never blocks the UI
@@ -12,7 +12,7 @@ Input from clients is injected at the level KOReader's own device backends use: 
 device's own `event_map`, and typed text as `TextInput` events. That keeps this device independent
 - no backend (SDL, Kindle, Kobo, ...) is special-cased.
 
-@module vncviewer.server
+@module vnc.server
 ]]
 
 local bit = require("bit")
@@ -26,10 +26,10 @@ local Screen = Device.screen
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 
-local Keysyms = require("vncviewer/keysyms")
-local RfbServer = require("vncviewer/rfbserver")
-local ServerEnc = require("vncviewer/serverenc")
-local Util = require("vncviewer/util")
+local Keysyms = require("vnc/keysyms")
+local RfbServer = require("vnc/rfbserver")
+local ServerEnc = require("vnc/serverenc")
+local Util = require("vnc/util")
 
 -- Linux input constants (EV_*/ABS_MT_*/SYN_REPORT), the same ones the device backends use.
 require("ffi/linux_input_h")
@@ -52,7 +52,7 @@ Server.READ_CHUNK = 65536
 Creates a server (it does not listen until @{Server:start} is called).
 
 --- @tparam table opts
---- @tparam table opts.settings the `server` sub-table of @{vncviewer.settings} (ip, port, password)
+--- @tparam table opts.settings the `server` sub-table of @{vnc.settings} (ip, port, password)
 --- @tparam[opt] string opts.name desktop name announced to clients
 --- @tparam[opt] function opts.on_status called when the running state or the client count changes
 --- @treturn Server
@@ -137,7 +137,7 @@ function Server:start()
         listener:close()
         self.last_error = string.format("cannot bind %s:%d: %s",
             self.settings.ip, self.settings.port, tostring(err))
-        logger.warn("vncviewer: server", self.last_error)
+        logger.warn("vnc: server", self.last_error)
         return false, self.last_error
     end
     ok, err = listener:listen(Server.MAX_CLIENTS)
@@ -157,7 +157,7 @@ function Server:start()
     local sw, sh = self:_screen_size()
     self._screen_at = { sw, sh }
     UIManager:scheduleIn(Server.POLL_INTERVAL, self._poll_task)
-    logger.info("vncviewer: VNC server listening on", self.settings.ip .. ":" .. self.settings.port)
+    logger.info("vnc: VNC server listening on", self.settings.ip .. ":" .. self.settings.port)
     self:_notify_status()
     return true
 end
@@ -179,7 +179,7 @@ function Server:stop()
         self.listener = nil
     end
     self:_firewall("remove")
-    logger.info("vncviewer: VNC server stopped")
+    logger.info("vnc: VNC server stopped")
     self:_notify_status()
 end
 
@@ -210,7 +210,7 @@ function Server:_unhook_refresh()
     if UIManager._refresh == self._refresh_hook then
         UIManager._refresh = self._orig_refresh
     else
-        logger.warn("vncviewer: UIManager._refresh was wrapped by somebody else; leaving it alone")
+        logger.warn("vnc: UIManager._refresh was wrapped by somebody else; leaving it alone")
     end
     self._orig_refresh = nil
 end
@@ -293,12 +293,12 @@ function Server:_accept()
         local sock, err = self.listener:accept()
         if not sock then
             if err ~= "timeout" then
-                logger.warn("vncviewer: accept failed:", tostring(err))
+                logger.warn("vnc: accept failed:", tostring(err))
             end
             return
         end
         if self:client_count() >= Server.MAX_CLIENTS then
-            logger.warn("vncviewer: refusing a client, already serving", Server.MAX_CLIENTS)
+            logger.warn("vnc: refusing a client, already serving", Server.MAX_CLIENTS)
             sock:close()
         else
             self:_adopt_client(sock)
@@ -343,7 +343,7 @@ function Server:_adopt_client(sock)
     local key = tostring(sock)
     client.key = key
     self.clients[key] = client
-    logger.info("vncviewer: client connected")
+    logger.info("vnc: client connected")
     self:_client_step(client)
 end
 
@@ -359,7 +359,7 @@ function Server:_drop_client(client, why)
         client.enc = nil
     end
     if client.key then self.clients[client.key] = nil end
-    logger.info("vncviewer: client disconnected:", why or "connection closed")
+    logger.info("vnc: client disconnected:", why or "connection closed")
     self:_notify_status()
 end
 
@@ -435,7 +435,7 @@ function Server:_service_client(client)
             break
         else
             if err ~= "closed" then
-                logger.warn("vncviewer: client read error:", tostring(err))
+                logger.warn("vnc: client read error:", tostring(err))
             end
             self:_drop_client(client, "closed")
             return
@@ -598,12 +598,12 @@ function Server:_on_key(client, keysym, down)
 
     local name = Keysyms.name_for_keysym(keysym)
     if not name then
-        logger.dbg("vncviewer: unmapped keysym from client:", keysym)
+        logger.dbg("vnc: unmapped keysym from client:", keysym)
         return
     end
     local code = self:_keycode_for(name)
     if not code then
-        logger.dbg("vncviewer: this device has no key named", name)
+        logger.dbg("vnc: this device has no key named", name)
         return
     end
     self:_inject({ key_ev(code, down and 1 or 0) })
@@ -626,7 +626,7 @@ end
 
 --- ClientCutText: put it where KOReader's own clipboard lives, if it has one.
 function Server:_on_cut_text(client, text)
-    logger.dbg("vncviewer: client cut text", #text, "bytes")
+    logger.dbg("vnc: client cut text", #text, "bytes")
     if Device.setClipboardText then
         Device:setClipboardText(text)
     end

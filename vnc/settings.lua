@@ -1,14 +1,14 @@
 --[[--
-Settings store for the vncviewer plugin.
+Settings store for the vnc plugin.
 
 Thin wrapper over @{luasettings|LuaSettings}, holding connection profiles and global
-application settings in `~/.config/koreader/settings/vncviewer.lua`.
+application settings in `~/.config/koreader/settings/vnc.lua`.
 
 There is no schema version and no migration: there is no released file format to stay compatible
 with. The file is just kept in shape instead - missing keys get their defaults, unknown keys are
 dropped, and profiles that cannot be used are dropped - so a hand-edited file still loads.
 
-@module vncviewer.settings
+@module vnc.settings
 ]]
 
 local LuaSettings = require("luasettings")
@@ -34,7 +34,7 @@ Settings.DEFAULTS = {
     enable_tight = false,            -- opt-in Tight encoding (not in RFC 6143; see NOTES.txt)
 }
 
---- VNC server defaults (the `server` sub-table). See @{vncviewer.server}.
+--- VNC server defaults (the `server` sub-table). See @{vnc.server}.
 Settings.SERVER_DEFAULTS = {
     ip = "0.0.0.0",                  -- bind address; 0.0.0.0 serves every interface
     port = 5900,
@@ -100,7 +100,7 @@ function Settings:normalise()
 
     for key in pairs(data) do
         if not known_data_key[key] then
-            logger.dbg("vncviewer: dropping unknown settings key", key)
+            logger.dbg("vnc: dropping unknown settings key", key)
             data[key] = nil
         end
     end
@@ -113,7 +113,7 @@ function Settings:normalise()
         end
         for name in pairs(section) do
             if defaults[name] == nil then
-                logger.dbg("vncviewer: dropping unknown", key, "key", name)
+                logger.dbg("vnc: dropping unknown", key, "key", name)
                 section[name] = nil
             end
         end
@@ -132,7 +132,7 @@ function Settings:normalise()
         if c then
             cleaned[#cleaned + 1] = c
         else
-            logger.dbg("vncviewer: dropping an unusable connection profile")
+            logger.dbg("vnc: dropping an unusable connection profile")
         end
     end
     data.profiles = cleaned

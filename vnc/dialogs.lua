@@ -7,7 +7,7 @@ back to whatever opened it, and a failed connection returns to the list instead 
 the user out of the plugin. `Menu`, `ButtonDialog` and the editor's own `id = "close"` button
 (which `InputDialog:onCloseDialog` invokes for the Back key) all funnel into those callbacks.
 
-@module vncviewer.dialogs
+@module vnc.dialogs
 ]]
 
 local _ = require("gettext")

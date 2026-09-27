@@ -2,7 +2,7 @@
 The on-screen keyboard, wired to the RFB KeyEvent stream.
 
 `VirtualKeyboard` never type-checks its `inputbox`: it just calls 12 methods on it, so a
-stub that forwards those calls to @{vncviewer.session} is all the glue that is needed.
+stub that forwards those calls to @{vnc.session} is all the glue that is needed.
 
 Layouts that ship an IME (`zh`, `zh_CN`, `ja`, `ko_KR`, `vi`) export `wrapInputBox()`,
 which is written for `InputText`: it proxies methods our stub does not have and buffers
@@ -10,11 +10,11 @@ typed characters into IME candidates. For the lifetime of this keyboard we there
 the layout to `en` (restoring the user's choice in @{Keyboard.restore_layout}), so that a
 tap always sends exactly the character on the key.
 
-@module vncviewer.keyboard
+@module vnc.keyboard
 ]]
 
-local Keysyms = require("vncviewer/keysyms")
-local Util = require("vncviewer/util")
+local Keysyms = require("vnc/keysyms")
+local Util = require("vnc/util")
 
 local Keyboard = {}
 
@@ -102,7 +102,7 @@ end
 --[[--
 Creates the on-screen keyboard.
 
---- @tparam table session the @{vncviewer.session} to send key events to
+--- @tparam table session the @{vnc.session} to send key events to
 --- @tparam function on_height_changed called when the keyboard height changes
 --- @treturn table a ready-to-show VirtualKeyboard (`UIManager:show(vk)`)
 ]]

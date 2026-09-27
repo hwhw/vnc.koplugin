@@ -9,7 +9,7 @@ cdef the streaming `z_stream` API here and keep one stream per RFB zlib stream i
 `ZStream.new()` makes an inflating stream, `ZStream.new_deflate(level)` a deflating one; both
 survive the whole connection and neither ends the stream on a flush.
 
-@module vncviewer.zstream
+@module vnc.zstream
 ]]
 
 local ffi = require("ffi")

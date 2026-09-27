@@ -1,4 +1,4 @@
-NOTES.txt -- vncviewer.koplugin internals, tests and open ends
+NOTES.txt -- vnc.koplugin internals, tests and open ends
 ==============================================================
 
 This file is for people reading or changing the code. The README is for users.
@@ -7,9 +7,10 @@ This file is for people reading or changing the code. The README is for users.
 WHAT THIS IS
 ------------
 
-An out-of-tree KOReader plugin: a VNC (RFB 3.8) client that renders a remote desktop through
-KOReader's BlitBuffer abstraction. It is pure Lua + LuaJIT FFI; there is no build step, no C
-component, and nothing to compile.
+An out-of-tree KOReader plugin with both halves of VNC (RFB 3.8): a **client** that renders a
+remote desktop through KOReader's BlitBuffer abstraction, and a **server** that serves KOReader's own
+screen to any VNC client. Pure Lua + LuaJIT FFI: no build step, no C component, nothing to compile.
+The directory is `vnc.koplugin` and its Lua modules live in `vnc/`.
 
 
 CODE STRUCTURE
@@ -19,41 +20,41 @@ main.lua                  Plugin entry point. Owns the settings store, registers
                           file-browser menu entry, keeps the session registry (one Session per
                           profile) and the app lifecycle.
 
-vncviewer/protocol.lua    RFB 3.8 state machine: version/security handshake, ClientInit,
+vnc/protocol.lua    RFB 3.8 state machine: version/security handshake, ClientInit,
                           ServerInit, SetPixelFormat, SetEncodings, the server message loop, and
                           the client input messages. Transport agnostic - it never touches a
                           socket.
-vncviewer/encodings.lua   Rectangle decoders: Raw, CopyRect, RRE, Hextile, TRLE, ZRLE, Tight and
+vnc/encodings.lua   Rectangle decoders: Raw, CopyRect, RRE, Hextile, TRLE, ZRLE, Tight and
                           the DesktopSize pseudo-encoding.
-vncviewer/zstream.lua     Stateful zlib inflate (one stream per RFB zlib stream) - KOReader's
+vnc/zstream.lua     Stateful zlib inflate (one stream per RFB zlib stream) - KOReader's
                           ffi/zlib.lua only offers one-shot uncompress().
-vncviewer/des.lua         DES-ECB in FFI, used by VNC Authentication.
-vncviewer/pxfmt.lua       The client pixel format we negotiate, plus the pixel write helpers.
-vncviewer/util.lua        Byte reader/writer for protocol fields, rect unions, UTF-8 splitting.
-vncviewer/keysyms.lua     KOReader key names / characters -> X11 keysyms.
-vncviewer/session.lua     The transport driver: LuaSocket TCP, Wi-Fi, the poll task, tx/rx
+vnc/des.lua         DES-ECB in FFI, used by VNC Authentication.
+vnc/pxfmt.lua       The client pixel format we negotiate, plus the pixel write helpers.
+vnc/util.lua        Byte reader/writer for protocol fields, rect unions, UTF-8 splitting.
+vnc/keysyms.lua     KOReader key names / characters -> X11 keysyms.
+vnc/session.lua     The transport driver: LuaSocket TCP, Wi-Fi, the poll task, tx/rx
                           buffering, attach/detach, reconnect, dirty-rect plumbing.
-vncviewer/framebuffer.lua The remote plane (a TYPE_BBRGB24 BlitBuffer) and the view transform
+vnc/framebuffer.lua The remote plane (a TYPE_BBRGB24 BlitBuffer) and the view transform
                           (fit / zoom / pan / draw).
-vncviewer/app.lua         The full-screen viewer widget: canvas, gestures, on-screen keyboard,
+vnc/app.lua         The full-screen viewer widget: canvas, gestures, on-screen keyboard,
                           menu wiring, remote input.
-vncviewer/menu.lua        The in-app menu.
-vncviewer/dialogs.lua     Connection list, per-connection actions, profile editor.
-vncviewer/keyboard.lua    KOReader's VirtualKeyboard wired to RFB key events via a stub inputbox.
-vncviewer/settings.lua    LuaSettings wrapper: profiles + global settings + the server section.
+vnc/menu.lua        The in-app menu.
+vnc/dialogs.lua     Connection list, per-connection actions, profile editor.
+vnc/keyboard.lua    KOReader's VirtualKeyboard wired to RFB key events via a stub inputbox.
+vnc/settings.lua    LuaSettings wrapper: profiles + global settings + the server section.
 
 The server half (the plugin can also serve KOReader's own screen):
-vncviewer/rfbserver.lua   RFB 3.8 *server* state machine, transport agnostic. The mirror of
+vnc/rfbserver.lua   RFB 3.8 *server* state machine, transport agnostic. The mirror of
                           protocol.lua: coroutine, ("need", n) yields, plus an ("idle") yield
                           when a client asks for an update while nothing has changed (so the
                           request is held instead of answered with an empty update, which would
                           make the client ask again at once and busy-loop).
-vncviewer/serverenc.lua   Server-side encoders (Raw, RRE, Hextile, ZRLE) and the conversion from
+vnc/serverenc.lua   Server-side encoders (Raw, RRE, Hextile, ZRLE) and the conversion from
                           whatever BlitBuffer type the screen is to whatever pixel format a
                           client asks for.
-vncviewer/server.lua      The runtime: LuaSocket listener, one protocol instance per client, the
+vnc/server.lua      The runtime: LuaSocket listener, one protocol instance per client, the
                           poll task, screen capture, dirty rectangles and input injection.
-vncviewer/servermenu.lua  The "VNC server" section of KOReader's Network menu.
+vnc/servermenu.lua  The "VNC server" section of KOReader's Network menu.
 
 tools/mock_vnc_server.py  Test fixture: an RFB 3.8 server in Python (all encodings, both security
                           types, deterministic patterns, logs every client message).
@@ -85,7 +86,7 @@ the resynchronisation and the way updates pushed while detached are absorbed. On
 closes the socket and restores Wi-Fi, and only Wi-Fi that the plugin turned on is turned off.
 
 Settings. There is no schema version and no migration - the plugin has no released file format to
-be compatible with. vncviewer/settings.lua:normalise() just keeps the file in shape on load:
+be compatible with. vnc/settings.lua:normalise() just keeps the file in shape on load:
 missing global settings get their defaults, unknown keys are dropped, profiles without a usable
 name are dropped. Never add migration code "just in case" before a format has actually shipped.
 
@@ -169,7 +170,7 @@ TESTS
 Protocol layer (needs python3 with the standard library, libcrypto with the legacy provider for the
 mock's DES, and KOReader's own LuaJIT):
 
-    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    PLUGIN=~/.config/koreader/plugins/vnc.koplugin
     cd /usr/lib/koreader && \
       LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" \
       LUA_CPATH="./common/?.so;;" \
@@ -181,11 +182,11 @@ encoding list as they hit the wire, None/VNC security (including a wrong passwor
 decoded pixel-exactly, ZRLE stream continuity across many rectangles, DesktopSize, the exact bytes
 of pointer/key/cut-text messages, and the fatal path for an encoding we never advertised. The mock
 verifies VNC Authentication with OpenSSL's DES (through ctypes), i.e. with an implementation
-independent of vncviewer/des.lua.
+independent of vnc/des.lua.
 
 UI plumbing (headless, no KOReader process, no server):
 
-    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    PLUGIN=~/.config/koreader/plugins/vnc.koplugin
     cd /usr/lib/koreader && \
       KO_HOME=/tmp/vncv_ui_home \
       LUA_PATH="$PLUGIN/?.lua;;" LUA_CPATH="./common/?.so;;" \
@@ -202,7 +203,7 @@ hand-edited or empty file. `KO_HOME` is needed because KOReader's widget cache l
 
 Server half (headless):
 
-    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    PLUGIN=~/.config/koreader/plugins/vnc.koplugin
     cd /usr/lib/koreader && \
       KO_HOME=/tmp/vncv_server_home \
       LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" LUA_CPATH="./common/?.so;;" \
@@ -217,14 +218,14 @@ KOReader gesture.
 Live end-to-end (GUI): run the mock, run KOReader, drive the plugin through KOReader's HTTP
 inspector (port 8989, httpinspector.autostart = true):
 
-    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    PLUGIN=~/.config/koreader/plugins/vnc.koplugin
     python3 "$PLUGIN/tools/mock_vnc_server.py" --port 5900 --encoding zrle --pattern quadrants \
         --log /tmp/mock.log &
     koreader &                      # or: env KO_HOME=/tmp/ko_home ./reader.lua
     sleep 20
-    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/connect_profile/local/'
-    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/app/send_pointer/300/200/1'
-    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/app/send_key/65293/1'   # 0xFF0D down
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vnc/connect_profile/local/'
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vnc/app/send_pointer/300/200/1'
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vnc/app/send_key/65293/1'   # 0xFF0D down
     grep -E 'INPUT (PointerEvent|KeyEvent)' /tmp/mock.log
     curl -s -o /tmp/screen.png 'http://127.0.0.1:8989/koreader/device/screen/bb'
 
