@@ -450,15 +450,22 @@ function Server:_message_loop()
             local text = r:bytes(len)
             if self.on_cut_text then self.on_cut_text(text, self.client) end
         elseif msg == Server.CLIENT_FENCE then
-            -- Fence: a synchronisation/ping message. Reply when the client asks for it.
-            r:u8()                                      -- padding
+            -- Fence: a synchronisation/ping message. ClientFence and ServerFence are framed
+            -- identically: type, *three* padding bytes, u32 flags, u8 length, payload (RFC 6143
+            -- §7.5.4 / rfbproto.rst) - nine bytes before any payload. Reading or writing one
+            -- padding byte instead leaves two bytes of the client's fence in the stream, which are
+            -- then read as the next message type: a SetPixelFormat that swallows the 19 bytes
+            -- after them - the client's FramebufferUpdateRequest among them - and then errors on a
+            -- bogus pixel format, which drops the connection. The viewer keeps the frame it has and
+            -- never gets another, while its input looks fine.
+            r:bytes(3)                                  -- padding
             local flags = r:u32()
             local len = r:u8()
             if len > 0 then r:bytes(len) end
             if bit.band(flags, 0x80000000) ~= 0 then
                 local out = Util.writer()
                 out:u8(Server.CLIENT_FENCE)
-                out:u8(0)
+                out:raw("\0\0\0")                       -- padding
                 out:u32(flags)
                 out:u8(0)
                 self:_write(out:tostring())

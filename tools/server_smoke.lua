@@ -833,7 +833,7 @@ check("server_serves_a_second_incremental_update", function()
             -- Messages a real viewer sends that RFC 6143 does not define. A server that closes
             -- the connection on one of them looks like a viewer whose input stops working as soon
             -- as it is resized or its clipboard changes.
-            cli:send(string.char(248, 0) .. string.char(0x80, 0, 0, 1) .. string.char(0))  -- Fence, reply requested
+            cli:send(string.char(248) .. "\0\0\0" .. string.char(0x80, 0, 0, 1) .. string.char(0))  -- Fence, reply requested (9 bytes)
             cli:send(string.char(251, 0) .. string.char(0, 200, 0, 150) .. string.char(1, 0) ..
                 string.char(0, 0, 0, 1) ..                         -- screen id
                 string.char(0, 0) .. string.char(0, 0) .. string.char(0, 200) .. string.char(0, 150) ..
@@ -847,7 +847,7 @@ check("server_serves_a_second_incremental_update", function()
             assert_true(stale == "\0\0\0\0",
                 "the held request must have been answered with an empty update, got byte "
                 .. tostring(stale:byte(1)))
-            local fence = recv_exact(cli, 7, server)
+            local fence = recv_exact(cli, 9, server)      -- type + 3 padding + flags + length
             assert_true(fence:byte(1) == 248, "a Fence request must be answered, got " .. fence:byte(1))
             -- Enabling Continuous Updates is not answered: from here on the server pushes what
             -- changes inside the region named (see
@@ -1358,6 +1358,90 @@ check("server_serves_a_client_that_asks_for_more_than_the_screen", function()
         print(string.format("   [clamp] 65535x65535 -> %d,%d %dx%d of a %dx%d screen; the client"
             .. " stayed connected and got its change",
             rects[1].x, rects[1].y, rects[1].w, rects[1].h, sw, sh))
+        plane:free()
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("server_survives_a_conforming_fence_before_a_request", function()
+    -- ClientFence is type + three padding bytes + u32 flags + u8 length (nine bytes with an empty
+    -- payload), and ServerFence is framed identically (RFC 6143 §7.5.4 / rfbproto.rst). Framed with
+    -- one padding byte, the client's two leftover zeros are read as the next message type - a
+    -- SetPixelFormat - which swallows the 19 bytes that follow (the client's
+    -- FramebufferUpdateRequest among them) and then errors on the bogus pixel format, which drops
+    -- the connection: a viewer that fences, as real viewers do, keeps the first frame it was given
+    -- and never gets another, while its input looks fine.
+    local Server = require("vnc/server")
+
+    local server, port
+    for candidate = 5921, 5929 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local socket = require("socket")
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+        -- A conforming fence asking for a reply, immediately followed by the request for the
+        -- change that was just recorded.
+        cli:send(string.char(248) .. "\0\0\0" ..
+            string.char(0x80, 0, 0, 1) .. string.char(0))          -- reply requested, no payload
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        cli:send(client.request(true, 0, 0, sw, sh))
+
+        -- Everything the server sends for that: the nine-byte ServerFence, then a
+        -- FramebufferUpdate. Read leniently (nothing may be lost to a short read) so a reply that
+        -- is too short fails on the assertions below with a useful message. A fence framed with
+        -- one padding byte leaves the client's request swallowed, so nothing follows the reply and
+        -- the second assertion is the one that fires.
+        local got = ""
+        local deadline = socket.gettime() + 5
+        while #got < 25 and socket.gettime() < deadline do
+            got = got .. drain_socket(cli, 0.3, server)
+        end
+        -- The first assertion is the one a fence framed with one padding byte fails: the two
+        -- leftover bytes become a SetPixelFormat, the request behind the fence is swallowed, and
+        -- nothing at all is ever sent for it (the connection is then dropped on the bogus pixel
+        -- format).
+        assert_true(#got > 9,
+            string.format("the request after a conforming fence was never answered (the server sent"
+                .. " %d byte(s) for the fence and the request behind it)", #got))
+        assert_true(got:byte(1) == 248,
+            "the fence must be answered, got message " .. tostring(got:byte(1)))
+
+        -- The reply is exactly nine bytes, so the update starts right behind them and must parse:
+        -- a seven-byte reply would shift this by two and read no rectangles at all.
+        local update = got:sub(10)
+        local nrects = update:byte(3) * 256 + update:byte(4)
+        assert_true(nrects >= 1,
+            "the bytes after the fence reply must be a FramebufferUpdate with the change"
+            .. " (a reply shorter than nine bytes shifts the client's whole stream)")
+        local rx = update:byte(5) * 256 + update:byte(6)
+        local ry = update:byte(7) * 256 + update:byte(8)
+        local rw = update:byte(9) * 256 + update:byte(10)
+        local rh = update:byte(11) * 256 + update:byte(12)
+        assert_true(rx == 8 and ry == 8 and rw == 32 and rh == 24,
+            string.format("the answer must carry the change 8,8 32x24, got %d,%d %dx%d",
+                rx, ry, rw, rh))
+
+        print(string.format("   [fence] the 9-byte fence reply was followed by the answer to the"
+            .. " request behind it (%d rect(s), %d,%d %dx%d)", nrects, rx, ry, rw, rh))
         plane:free()
         cli:close()
     end)
