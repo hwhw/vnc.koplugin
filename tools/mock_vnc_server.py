@@ -579,7 +579,10 @@ class Connection:
         r, _, _ = select.select([self.sock], [], [], 0.02)
         if not r:
             return b""
-        return self.sock.recv(65536)
+        data = self.sock.recv(65536)
+        if not data:
+            raise EOFError("client closed")
+        return data
 
 
 class MockServer:
