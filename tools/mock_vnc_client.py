@@ -16,7 +16,7 @@ usage: mock_vnc_client.py [--host 127.0.0.1] [--port 5900] [--security none|vnc]
                           [--encodings LIST] [--bpp N] [--depth N] [--red-shift N]
                           [--green-shift N] [--blue-shift N] [--red-max N] [--green-max N]
                           [--blue-max N] [--true-colour 0|1] [--requests N]
-                          [--linger SECONDS] [--probe X,Y] [--frame FILE.png]
+                          [--continuous-updates] [--linger SECONDS] [--probe X,Y] [--frame FILE.png]
                           [--expect-pattern NAME|none] [--expect-width W] [--expect-height H]
                           [--pointer X,Y:MASK] [--key KEYSYM:DOWN] [--cuttext TEXT]
                           [--log FILE] [--timeout SECONDS]
@@ -31,8 +31,16 @@ format, so the server's SetColorMapEntries is exercised and applied to the decod
 --pointer/--key/--cuttext actions are sent --linger seconds after the first decoded
 FramebufferUpdate, 0.3s apart, and then the client exits 0. The last stdout line is always a
 single JSON object: {"ok", "error", "width", "height", "encoding", "bpp", "updates", "rects",
-"pixel_sha256", "probes", "frame_png"}. Exit status is 0 when ok, 1 otherwise (also on
-timeout), with the error also on stderr.
+"pixel_sha256", "probes", "frame_png", "continuous_updates", "pushed_updates"}. Exit status is
+0 when ok, 1 otherwise (also on timeout), with the error also on stderr.
+
+--continuous-updates switches the client to the Continuous Updates extension: right after the
+first decoded update it sends EnableContinuousUpdates (client message 150) for the whole
+framebuffer and then asks for nothing at all, so every later FramebufferUpdate has to be
+pushed by the server (a screen change on the server side is what produces one). It stays
+connected until at least one such pushed update arrives, and fails - exit 1 - if none does
+within --linger (+ --timeout), i.e. if the server ignores the extension. The updates this
+client was answered are counted in "updates"; the pushed ones in "pushed_updates".
 
 Not implemented: TLS/VeNCrypt/SASL security types, and Tight's PNG sub-encoding (the plugin
 never advertises TurboVNC's PNG pseudo-encoding, so a conforming server never sends it).
@@ -379,6 +387,8 @@ class MockClient:
 
         self.updates = 0
         self.rects = 0
+        self.pushed_updates = 0
+        self.continuous = False
         self.lossy_rects = []
         self.needs_resync = False
         self.error = None
@@ -454,6 +464,11 @@ class MockClient:
         if now >= self.hard_end:
             raise LingerDone()
         if now >= self.linger_end and self.pending == 0:
+            if self.args.continuous_updates and not self.pushed_updates:
+                # No request outstanding, so the only thing that can still produce an update is
+                # the server pushing one: wait for it (up to hard_end) instead of declaring
+                # success on a client that has simply been sitting there.
+                return
             raise LingerDone()
 
     def _u8(self):
@@ -630,6 +645,19 @@ class MockClient:
         self._send(struct.pack(">B3xI", 6, len(data)) + data)
         log("CLIENT ClientCutText len=%d" % len(data))
 
+    def send_enable_continuous_updates(self, enable, x=None, y=None, w=None, h=None):
+        """EnableContinuousUpdates (150). With enable set the server has to push instead of
+        being asked, so no FramebufferUpdateRequest follows; with it cleared the server must
+        acknowledge with EndOfContinuousUpdates and go back to answering requests."""
+        if x is None:
+            x, y = 0, 0
+        if w is None:
+            w, h = self.fb.w, self.fb.h
+        self._send(struct.pack(">BBHHHH", 150, 1 if enable else 0, x, y, w, h))
+        self.continuous = bool(enable)
+        log("CLIENT EnableContinuousUpdates enable=%d x=%d y=%d w=%d h=%d"
+            % (1 if enable else 0, x, y, w, h))
+
     # ------------------------------------------------------------ queued input
 
     def _pump_actions(self, now):
@@ -661,6 +689,11 @@ class MockClient:
             log("SERVER Bell")
         elif t == 3:
             self._handle_cut_text()
+        elif t == 150:
+            # EndOfContinuousUpdates: the server will not push any more, so asking again is the
+            # only way to get an update. One byte, the type alone.
+            self.continuous = False
+            log("SERVER EndOfContinuousUpdates")
         else:
             raise ProtocolError("unknown server message %d" % t)
 
@@ -676,6 +709,10 @@ class MockClient:
             self._decode_rect(x, y, w, h, enc)
             self.rects += 1
         self.updates += 1
+        if self.pending == 0:
+            # Nothing of ours is outstanding: the server sent this on its own.
+            self.pushed_updates += 1
+            log("SERVER FramebufferUpdate pushed (no request outstanding)")
         self.pending = max(0, self.pending - 1)
         self._after_update()
 
@@ -686,11 +723,20 @@ class MockClient:
             self.linger_end = now + max(0.0, self.args.linger)
             self.hard_end = self.linger_end + max(5.0, self.args.timeout)
             self.next_action = now
+            if self.args.continuous_updates:
+                # The extension's client side, as a viewer does it: once the framebuffer size is
+                # known, ask to be kept up to date without asking (and never ask again).
+                self.send_enable_continuous_updates(True)
         if self.needs_resync:
             # The framebuffer was reallocated by DesktopSize: resynchronise non-incrementally.
             self.needs_resync = False
             self._request_update(0)
-        elif self.updates <= self.args.requests:
+            if self.args.continuous_updates:
+                # ... and re-ask for the new geometry: a viewer follows a resize with a fresh
+                # EnableContinuousUpdates (the old region is the old size).
+                self.send_enable_continuous_updates(True)
+        elif self.updates <= self.args.requests and not self.args.continuous_updates:
+            # With the extension on there is nothing to ask for: the server pushes.
             self._request_update(1)
 
     def _handle_colormap(self):
@@ -1112,6 +1158,11 @@ class MockClient:
             self._fail("framebuffer width is %d, expected %d" % (self.fb.w, args.expect_width))
         if args.expect_height is not None and self.fb.h != args.expect_height:
             self._fail("framebuffer height is %d, expected %d" % (self.fb.h, args.expect_height))
+        if args.continuous_updates and not self.pushed_updates:
+            # The whole point of the extension: with no request outstanding, an update can only
+            # come from the server pushing it.
+            self._fail("continuous updates: no FramebufferUpdate was pushed (the server kept "
+                       "answering requests only), but none was asked for either")
         if args.expect_pattern and args.expect_pattern != "none":
             self._check_pattern(args.expect_pattern)
 
@@ -1174,6 +1225,8 @@ class MockClient:
             "bpp": self.pf.bpp,
             "updates": self.updates,
             "rects": self.rects,
+            "continuous_updates": bool(self.args.continuous_updates),
+            "pushed_updates": self.pushed_updates,
             "pixel_sha256": self.fb.sha256(),
             "probes": probes,
             "frame_png": self.args.frame,
@@ -1253,6 +1306,10 @@ def build_parser():
                          "--bpp 8, 1 otherwise")
     ap.add_argument("--requests", type=int, default=0,
                     help="incremental FramebufferUpdateRequests after the initial one")
+    ap.add_argument("--continuous-updates", action="store_true",
+                    help="enable Continuous Updates (client message 150) after the first update "
+                         "and send no further FramebufferUpdateRequests, so later updates can "
+                         "only arrive pushed; fails if none does")
     ap.add_argument("--linger", type=float, default=2.0,
                     help="seconds to stay connected after the first decoded update")
     ap.add_argument("--probe", action="append", default=[], metavar="X,Y")

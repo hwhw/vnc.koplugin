@@ -521,8 +521,16 @@ function Server:_service_client(client)
         end
     end
     self:_client_step(client)
+    self:_flush_client(client)
+end
 
-    -- write
+--- Writes out whatever the protocol has queued for `client`. Kept apart from
+--- @{Server:_service_client} so that a Continuous Updates push, recorded after the state machine
+--- has run (c.f., @{Server:_push_continuous}), reaches the socket in the same tick rather than
+--- waiting for the next poll.
+function Server:_flush_client(client)
+    if client.dropped or not client.sock then return end
+    local sock = client.sock
     while client.tx_len > 0 and not client.dropped do
         local chunk = client.tx[1]
         local sent, err, last = sock:send(chunk, 1)
@@ -547,6 +555,47 @@ function Server:_service_client(client)
             return
         end
     end
+end
+
+--[[--
+Pushes what changed inside the region a client asked to be kept up to date without asking
+(`EnableContinuousUpdates`, client message 150): such a client has no request outstanding, so a
+recorded change has to be sent to it unprompted.
+
+Called once per poll tick for every client that enabled the extension, *after* its own messages
+have been serviced: a request it did send is answered first, and both paths advance the same
+`sent_gen`, so the same change never goes out twice.
+
+The region test is the per-tick cost guard - the poll runs at @{Server.POLL_INTERVAL} (100 Hz), so
+an idle client must not pay for a scan of the recorded rectangles, and a client whose region does
+not contain the change must not pay for an encode (nor get an empty update it did not ask for).
+`sent_gen` alone answers the common case (nothing recorded at all since this client was served);
+otherwise the recorded rectangles are tested against the region, which is exactly what the request
+path's @{Server:_get_rects} would do - just before the expensive part.
+]]
+function Server:_push_continuous(client)
+    local state = client.server.client
+    local region = state.continuous
+    if not region then return end
+    if not state.pending_desktop and state.sent_gen and state.sent_gen >= self._gen then
+        -- Nothing has been recorded since this client was last served, so nothing can be inside
+        -- its region: the generation counter is the whole answer.
+        return
+    end
+    if state.sent_gen ~= nil and not state.pending_desktop then
+        local inside = false
+        for _, d in ipairs(self._dirty) do
+            if d.gen > state.sent_gen and Util.intersect_rect(d, region) then
+                inside = true
+                break
+            end
+        end
+        if not inside then return end
+    end
+    -- A client that has been sent nothing yet is given the whole region here (Server:_get_rects
+    -- answers from the region itself), so enabling before the first request - which viewers do -
+    -- still gets a full frame.
+    client.server:push_update(region)
 end
 
 function Server:_poll()
@@ -575,6 +624,14 @@ function Server:_poll()
         if not ok then
             logger.err("vnc: servicing a client failed:", tostring(err))
             self:_drop_client(client, tostring(err))
+        end
+        -- Continuous Updates: what a client asked to be kept up to date without asking has to be
+        -- pushed to it, and flushed here so it leaves in this tick. Deliberately after the
+        -- client's own messages have been serviced: a request it did send is answered first, and
+        -- the two paths share `sent_gen`, so the same change never goes out twice.
+        if not client.dropped then
+            self:_push_continuous(client)
+            self:_flush_client(client)
         end
         -- A press whose client has not released or moved yet is a long press once a full hold
         -- interval has passed; that is decided here, on the poll, because while the contact is

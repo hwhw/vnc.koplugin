@@ -612,6 +612,66 @@ check("server_serves_the_screen_over_a_socket", function()
     if not ok then error(err, 0) end
 end)
 
+--- Reads exactly `n` bytes from a test socket, pumping `server` while it waits.
+---
+--- Unlike the `pump_and_read` closures used elsewhere in this file, this one *keeps* what a
+--- short read did return (LuaSocket hands those bytes back only in its third value): a reader
+--- that drops them silently swallows a message it did not expect in full and shifts every later
+--- read by that many bytes, which turns "the server sent something unexpected" into "some later
+--- assertion reads the wrong bytes". Use this when a check asserts on the exact bytes a message
+--- carries, or on nothing being sent at all.
+---
+--- The socket timeout is lowered for the wait: the server parses one *byte* of a client message
+--- per poll (`want = min(pending - rx_len, READ_CHUNK)`), so a ten-byte client message needs about
+--- ten polls before anything can come back, and at the 0.2 s timeout the other readers use that is
+--- already two seconds of waiting.
+--- @treturn string exactly `n` bytes
+local function recv_exact(cli, n, server)
+    local socket = require("socket")
+    local parts, got = {}, 0
+    local deadline = socket.gettime() + 10
+    local timeout = cli:gettimeout()
+    cli:settimeout(0.05)
+    while got < n do
+        server:_poll()
+        local data, err, partial = cli:receive(n - got)
+        data = data or partial
+        if data and #data > 0 then
+            parts[#parts + 1] = data
+            got = got + #data
+        end
+        if err and err ~= "timeout" then
+            cli:settimeout(timeout)
+            error("socket error: " .. tostring(err), 0)
+        end
+        assert_true(socket.gettime() <= deadline,
+            string.format("short read: %d of %d bytes arrived", got, n))
+    end
+    cli:settimeout(timeout)
+    return table.concat(parts)
+end
+
+--- Everything the server sends within `seconds`, pumped while waiting; "" when it sends nothing.
+--- A short read is kept, so a message that is already halfway in is not lost (which is what makes
+--- this usable as "nothing arrived" evidence), and the socket timeout is lowered for the same
+--- reason as in @{recv_exact}: the poll is what makes the server produce anything at all.
+local function drain_socket(cli, seconds, server)
+    local socket = require("socket")
+    local parts = {}
+    local timeout = cli:gettimeout()
+    cli:settimeout(0.05)
+    local deadline = socket.gettime() + seconds
+    while socket.gettime() < deadline do
+        server:_poll()
+        local data, err, partial = cli:receive(4096)
+        data = data or partial
+        if data and #data > 0 then parts[#parts + 1] = data end
+        if err and err ~= "timeout" then break end
+    end
+    cli:settimeout(timeout)
+    return table.concat(parts)
+end
+
 check("server_serves_a_second_incremental_update", function()
     -- The first (non-incremental) update is easy; what matters afterwards is that a *change* to
     -- the screen reaches a client that has asked again incrementally.
@@ -780,11 +840,28 @@ check("server_serves_a_second_incremental_update", function()
                 string.char(0, 0, 0, 1))                           -- flags
             cli:send(string.char(150, 1) .. string.char(0, 0, 0, 0, 0, 200, 0, 150))
             cli:send(string.char(6, 0, 0, 0) .. string.char(0, 0, 0, 2) .. "hi")
-            local fence = pump_and_read(6)
+            -- The request that was held a moment ago was answered with an empty update, which is
+            -- still in the socket (nothing has read it): take it out first, exactly, rather than
+            -- let a short read swallow it and shift the reads below.
+            local stale = recv_exact(cli, 4, server)
+            assert_true(stale == "\0\0\0\0",
+                "the held request must have been answered with an empty update, got byte "
+                .. tostring(stale:byte(1)))
+            local fence = recv_exact(cli, 7, server)
             assert_true(fence:byte(1) == 248, "a Fence request must be answered, got " .. fence:byte(1))
-            local declined = pump_and_read(2)
-            assert_true(declined:byte(1) == 150,
-                "continuous updates must be declined, got " .. declined:byte(1))
+            -- Enabling Continuous Updates is not answered: from here on the server pushes what
+            -- changes inside the region named (see
+            -- server_pushes_a_change_to_a_client_that_enabled_continuous_updates), so the Fence
+            -- reply must be the last thing on the wire.
+            assert_true(#drain_socket(cli, 0.2, server) == 0,
+                "enabling continuous updates must not be answered")
+            -- The rest of this check is about the request/response path, so give the extension up
+            -- again; the disable is acknowledged with the one-byte EndOfContinuousUpdates.
+            cli:send(string.char(150, 0) .. string.char(0, 0, 0, 0, 0, 200, 0, 150))
+            local eocu = recv_exact(cli, 1, server)
+            assert_true(eocu == string.char(150),
+                "disabling continuous updates must be answered with EndOfContinuousUpdates, got byte "
+                .. tostring(eocu:byte(1)))
 
             -- ... and the session must still take input afterwards
             injected = {}
@@ -1078,6 +1155,148 @@ check("server_keeps_a_change_a_client_did_not_ask_about", function()
         assert_true(r > 200 and g > 200 and b > 200, "and its pixels must arrive")
         plane:free()
         cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", function()
+    -- Continuous Updates (client message 150, the community extension gtk-vnc/GNOME Connections
+    -- speaks): a viewer that enables it stops asking for the region it named and waits for the
+    -- server to push what changes there. A server that only ever *answers* requests shows such a
+    -- viewer its first frame and then nothing, however much the screen changes and however well
+    -- its input works - the reported "TigerVNC works, the other viewer shows one frame" shape.
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5901, 5909 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        local function region(x, y, w, h)
+            return string.char(math.floor(x / 256), x % 256, math.floor(y / 256), y % 256) ..
+                string.char(math.floor(w / 256), w % 256, math.floor(h / 256), h % 256)
+        end
+        local function enable_continuous(enable, x, y, w, h)
+            return string.char(150, enable and 1 or 0) .. region(x, y, w, h)
+        end
+
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        -- the first (asked-for) full update, so the client has a frame to extend
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        local r0, g0, b0 = get(plane, 16, 16)
+        assert_true(r0 < 60 and g0 < 60 and b0 < 60, "the screen starts black")
+
+        -- EnableContinuousUpdates(enable = 1, the whole screen): from here on this client asks
+        -- for nothing at all.
+        cli:send(enable_continuous(true, 0, 0, sw, sh))
+        local enabled = false
+        for _ = 1, 100 do
+            server:_poll()
+            enabled = false
+            for _, record in pairs(server.clients) do
+                if record.server.client.continuous then enabled = true end
+            end
+            if enabled then break end
+            socket.sleep(0.01)
+        end
+        assert_true(enabled,
+            "the server must record the region a client asked to be kept up to date")
+
+        -- ... and it must not be answered: there is nothing to answer, the client relies on the
+        -- pushes now (an answer here is exactly the message that tells a viewer to go back to
+        -- asking).
+        local ack = drain_socket(cli, 0.3, server)
+        assert_true(#ack == 0,
+            "enabling continuous updates must not be answered, got " .. #ack .. " byte(s)")
+
+        -- An idle client whose region did not change gets nothing at all: no stream of empty
+        -- updates, which is what a push on every poll tick would amount to.
+        local idle = drain_socket(cli, 0.3, server)
+        assert_true(#idle == 0,
+            "an idle client must not be sent empty updates, got " .. #idle .. " byte(s)")
+
+        -- The screen changes: with nothing outstanding, this can only arrive pushed.
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        local pushed = client.read_update(plane)
+        assert_true(pushed >= 1,
+            "a change must be pushed to a client that enabled continuous updates without a request")
+        local r1, g1, b1 = get(plane, 16, 16)
+        assert_true(r1 > 200 and g1 > 200 and b1 > 200, "and the changed pixels must come through")
+
+        -- ... but asking for it again must not repeat it: the push advanced the same `sent_gen`
+        -- the request path reads, so the answer is an empty update.
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local repeated = client.read_update(plane)
+        assert_true(repeated == 0,
+            "a change a push already delivered must not be answered again, got "
+            .. repeated .. " rect(s)")
+
+        -- A client that switches the extension off is back on the request/response path: the
+        -- disable is acknowledged (one byte, EndOfContinuousUpdates) ...
+        cli:send(enable_continuous(false, 0, 0, sw, sh))
+        local eocu = recv_exact(cli, 1, server)
+        assert_true(eocu == string.char(150),
+            "disabling continuous updates must be answered with EndOfContinuousUpdates, got byte "
+            .. tostring(eocu:byte(1)))
+        -- ... and a later change is not pushed to it.
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        local not_pushed = drain_socket(cli, 0.3, server)
+        assert_true(#not_pushed == 0,
+            "a client that disabled continuous updates must not be pushed to, got "
+            .. #not_pushed .. " byte(s)")
+
+        -- ... while asking gets it exactly once.
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local answered = client.read_update(plane)
+        assert_true(answered >= 1, "a client that asks must be answered with the change")
+        local r2, g2, b2 = get(plane, 68, 68)
+        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and its pixels must arrive")
+        local twice = drain_socket(cli, 0.3, server)
+        assert_true(#twice == 0,
+            "the change must go out exactly once, got " .. #twice .. " more byte(s)")
+
+        -- The message may also be sent before the first request: such a client has been sent
+        -- nothing yet, so it is given the region itself (the same fullness rule the request path
+        -- uses), not an empty update.
+        local early = connect_client(server, port, set_encodings_wire())
+        local early_plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+        early.sock:send(enable_continuous(true, 0, 0, 64, 64))
+        local early_rects = early.read_update(early_plane)
+        assert_true(early_rects >= 1,
+            "a client that enables continuous updates before its first request must be given"
+            .. " the region")
+        local r3, g3, b3 = get(early_plane, 16, 16)
+        local r4, g4, b4 = get(early_plane, 32, 32)
+        assert_true(r3 > 200 and g3 > 200 and b3 > 200 and r4 < 60 and g4 < 60 and b4 < 60,
+            "and the region must carry the screen it was given")
+
+        print(string.format("   [cu] pushed %d rect(s) with nothing outstanding (16,16 now"
+            .. " %d,%d,%d); enable and idle polls sent %d byte(s); the request after the push was"
+            .. " answered with %d rect(s); the disable with %d byte(s); enabling before the first"
+            .. " request was given %d rect(s)", pushed, r1, g1, b1, #ack + #idle, repeated,
+            #eocu, early_rects))
+
+        plane:free()
+        early_plane:free()
+        cli:close()
+        early.sock:close()
     end)
 
     server:stop()

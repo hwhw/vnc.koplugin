@@ -96,6 +96,10 @@ function Server.new(opts)
             encodings = { 0 },         -- in the client's own preference order
             desktop_size_supported = false,
             last_rect_supported = false,
+            -- Continuous Updates (client message 150): the region this client asked to be kept up
+            -- to date *without* asking, or nil while it is on the request/response path. The
+            -- driver (@{vnc.server}) reads it and pushes what changed inside it.
+            continuous = nil,
             -- Input state. Owned, and kept up to date, by the `on_pointer` callback - the message
             -- loop passes a PointerEvent through untouched so the callback can see the button mask
             -- *change* (c.f., the msg == 5 branch in _message_loop, and Server:_on_pointer).
@@ -374,6 +378,27 @@ function Server:_send_update(rects)
     end
 end
 
+--[[--
+Pushes the changes recorded for `region` to a client that is keeping that region up to date
+*without* asking - what `EnableContinuousUpdates` (client message 150) asks for. Such a client has
+no outstanding request to answer, so the update has to be sent unprompted; it is encoded through
+exactly the request path's @{Server:_collect_rects} and @{Server:_send_update}, so the client's
+pixel format and encodings are honoured identically however it asked.
+
+Nothing goes out when nothing was recorded for that region, which is what lets the driver call
+this on every poll tick (the poll runs at 100 Hz; see @{vnc.server}'s Server:_push_continuous,
+which also keeps the scan off the ticks that cannot have anything to send).
+
+--- @tparam table region `{x, y, w, h}` the client asked to be kept up to date
+--- @treturn number how many rectangles went out (0: nothing was sent)
+]]
+function Server:push_update(region)
+    local rects = self:_collect_rects(region.x, region.y, region.w, region.h, false)
+    if #rects == 0 then return 0 end
+    self:_send_update(rects)
+    return #rects
+end
+
 function Server:_message_loop()
     local r = self.reader
     while true do
@@ -432,16 +457,23 @@ function Server:_message_loop()
                 "vnc: client asked for a %dx%d desktop (%d screen(s)); this server follows the device screen",
                 width, height, screens))
         elseif msg == Server.CLIENT_ENABLE_CONTINUOUS_UPDATES then
+            -- Continuous Updates: while this is on, the client stops asking for the region it
+            -- named and expects the server to push what changes inside it - the driver does that
+            -- from its poll, reading `client.continuous` (c.f., Server:_push_continuous in
+            -- vnc/server.lua). Enabling is *not* answered (the client now relies on the pushes);
+            -- disabling is, and rfbproto.rst is explicit that the server "must also immediately
+            -- send out a EndOfContinuousUpdates message" - that message is the type alone, one
+            -- byte, the way TigerVNC writes it (a client that read more would wait here forever).
             local enable = r:u8() ~= 0
-            r:u16() r:u16() r:u16() r:u16()             -- region
+            local x, y, w, h = r:u16(), r:u16(), r:u16(), r:u16()
             if enable then
-                -- We hold an update request until something changes, which is close enough; say so
-                -- so the client does not sit waiting for updates it will not get.
-                local out = Util.writer()
-                out:u8(Server.CLIENT_ENABLE_CONTINUOUS_UPDATES)
-                out:u8(0)
-                self:_write(out:tostring())
-                logger.info("vnc: client asked for continuous updates; declining")
+                self.client.continuous = { x = x, y = y, w = w, h = h }
+                logger.info(string.format(
+                    "vnc: client enabled continuous updates for %d,%d %dx%d", x, y, w, h))
+            else
+                self.client.continuous = nil
+                self:_write(string.char(Server.CLIENT_ENABLE_CONTINUOUS_UPDATES))
+                logger.info("vnc: client disabled continuous updates")
             end
         else
             error(string.format("unknown client message %d", msg), 0)
