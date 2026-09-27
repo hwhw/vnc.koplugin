@@ -1,11 +1,17 @@
 --[[--
 The full-screen viewer widget.
 
-Owns the toolbar, the canvas (through @{vncviewer.framebuffer}), the gesture mapping to RFB
-pointer events, the on-screen keyboard and the in-app menu. It is a plain (non-modal)
-full-screen `InputContainer` flagged `is_always_active`, so that it keeps receiving gestures
-even while one of its own popups is on top — hence the `_input_target()` / `_modal_above()`
-guards on every canvas gesture.
+The remote framebuffer owns the whole screen; the on-screen keyboard is drawn *over* it
+(KOReader stacks it above us), so showing the keyboard never rescales the view — pan it if part
+of the remote desktop ends up behind the keyboard. The menu is reached the way KOReader's file
+manager and reader reach theirs: a tap, or a swipe down, in KOReader's own menu zone at the top
+of the screen, honouring the global `activate_menu` preference. Rotations and screen resizes go
+through KOReader's generic `SetRotationMode` / `ScreenResize` events, so that the keyboard is
+re-laid out for the new dimensions as well.
+
+It is a plain (non-modal) full-screen `InputContainer` flagged `is_always_active`, so that it
+keeps receiving gestures even while one of its own popups is on top — hence the
+`_input_target()` / `_modal_above()` guards on every canvas gesture.
 
 @module vncviewer.app
 ]]
@@ -13,11 +19,12 @@ guards on every canvas gesture.
 local bit = require("bit")
 local _ = require("gettext")
 
+local BD = require("ui/bidi")
 local BB = require("ffi/blitbuffer")
 local Device = require("device")
+local Event = require("ui/event")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
-local ButtonTable = require("ui/widget/buttontable")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local Notification = require("ui/widget/notification")
@@ -42,8 +49,6 @@ local ViewerApp = InputContainer:extend{
     dimen = nil,              -- set in init()
 }
 
-ViewerApp.FALLBACK_BAR_HEIGHT = 40
-
 -- ---------------------------------------------------------------- init
 
 function ViewerApp:init()
@@ -56,38 +61,83 @@ function ViewerApp:init()
     self._drag_active = nil
     self._last_pinch_factor = nil
     self._zoom_start_span = nil
+    self._vk_screen = self:_screen_signature()
 
-    self:init_toolbar()
+    self:init_menu_zones()
     self:init_gestures()
     self:_reflow()
 end
 
---[[--
-(re)Builds the toolbar.
-`ButtonTable` computes every button's width from the screen width *at construction time*, so a
-rotation (which swaps the logical screen dimensions) needs a fresh table, otherwise the row
-stays as wide as the previous orientation and gets clipped.
-]]
-function ViewerApp:init_toolbar()
-    self._toolbar_width = Screen:getWidth()
-    self.top_bar = ButtonTable:new{
-        width = self._toolbar_width,
-        buttons = { {
-            { text = _("Menu"), callback = function() self:open_menu() end },
-            { text = _("Keyboard"), callback = function() self:toggle_keyboard() end },
-            { text = _("Rotate"), callback = function() self:rotate(1) end },
-            { text = _("Fit"), callback = function() self:zoom_to("fit") end },
-        } },
-    }
-    -- Let WidgetContainer:propagateEvent reach the buttons (we paint them ourselves).
-    self[1] = self.top_bar
+function ViewerApp:_screen_signature()
+    local size = Screen:getSize()
+    return string.format("%dx%d", size.w, size.h)
 end
 
---- Rebuilds the toolbar when the screen width changed (rotation, resize).
-function ViewerApp:_refresh_toolbar()
-    if self._toolbar_width ~= Screen:getWidth() then
-        self:init_toolbar()
+-- ---------------------------------------------------------------- menu activation
+
+--[[--
+Registers KOReader's own "show the menu" zones (the ones the file manager and reader use):
+a tap in `DTAP_ZONE_MENU`, or a swipe down there, opens our menu, according to the global
+`activate_menu` preference ("swipe_tap" by default). Nothing is permanently on screen for it.
+]]
+function ViewerApp:init_menu_zones()
+    if not Device:isTouchDevice() then return end
+    local function zone_ratios(geom)
+        return { ratio_x = geom.x, ratio_y = geom.y, ratio_w = geom.w, ratio_h = geom.h }
     end
+    local zone = G_defaults:readSetting("DTAP_ZONE_MENU") or { x = 0, y = 0, w = 1, h = 1 / 8 }
+    local zone_ext = G_defaults:readSetting("DTAP_ZONE_MENU_EXT")
+        or { x = 1 / 4, y = 0, w = 1 / 2, h = 1 / 5 }
+
+    self:registerTouchZones({
+        {
+            id = "vncviewer_menu_tap",
+            ges = "tap",
+            screen_zone = zone_ratios(zone),
+            handler = function(ges) return self:onMenuTap(ges) end,
+        },
+        {
+            id = "vncviewer_menu_tap_ext",
+            ges = "tap",
+            screen_zone = zone_ratios(zone_ext),
+            overrides = { "vncviewer_menu_tap" },
+            handler = function(ges) return self:onMenuTap(ges) end,
+        },
+        {
+            id = "vncviewer_menu_swipe",
+            ges = "swipe",
+            screen_zone = zone_ratios(zone),
+            handler = function(ges) return self:onMenuSwipe(ges) end,
+        },
+        {
+            id = "vncviewer_menu_swipe_ext",
+            ges = "swipe",
+            screen_zone = zone_ratios(zone_ext),
+            overrides = { "vncviewer_menu_swipe" },
+            handler = function(ges) return self:onMenuSwipe(ges) end,
+        },
+    })
+end
+
+--- @treturn string the `activate_menu` preference ("tap" | "swipe" | "swipe_tap")
+function ViewerApp:_activate_menu()
+    return G_reader_settings:readSetting("activate_menu") or "swipe_tap"
+end
+
+--- A tap in the menu zone opens the menu (unless the menu should only open on swipes), and
+--- otherwise falls through to the canvas, which sends it to the remote.
+function ViewerApp:onMenuTap(ges)
+    if self.menu or self:_activate_menu() == "swipe" then return nil end
+    self:open_menu()
+    return true
+end
+
+--- A swipe down in the menu zone opens the menu (unless it should only open on taps).
+function ViewerApp:onMenuSwipe(ges)
+    if self.menu or self:_activate_menu() == "tap" then return nil end
+    if BD.flipDirectionIfMirroredUILayout(ges.direction) ~= "south" then return nil end
+    self:open_menu()
+    return true
 end
 
 function ViewerApp:init_gestures()
@@ -128,34 +178,60 @@ function ViewerApp:getSize()
     return self.dimen
 end
 
-function ViewerApp:_bar_height()
-    local container = self.top_bar and self.top_bar[1]
-    local size = container and container:getSize()
-    if size and size.h and size.h > 0 then return size.h end
-    return Screen:scaleBySize(self.FALLBACK_BAR_HEIGHT)
-end
-
+--- The canvas is the whole widget: the remote framebuffer gets the full screen, and the
+--- on-screen keyboard is drawn over it rather than shrinking it.
 function ViewerApp:_layout(x, y)
     x, y = x or 0, y or 0
     local size = self.dimen
-    local bar_h = self:_bar_height()
-    local kbd_h = (self.vk_visible and self.vk and self.vk:getSize().h) or 0
-    return Geom:new{
-        x = x,
-        y = y + bar_h,
-        w = size.w,
-        h = math.max(1, size.h - bar_h - kbd_h),
-    }
+    return Geom:new{ x = x, y = y, w = size.w, h = size.h }
 end
 
 --- Recomputes the canvas and re-fits the view when the zoom mode asks for it.
 function ViewerApp:_reflow()
     self.dimen = Screen:getSize()
-    self:_refresh_toolbar()
     self.canvas = self:_layout()
     if self.remote and self.settings.zoom_mode == "fit" then
         self.remote:fit_view(self.canvas.w, self.canvas.h)
     end
+end
+
+--[[--
+Re-initialises the on-screen keyboard when the screen dimensions changed.
+
+`VirtualKeyboard` derives its key sizes from `Screen:getWidth()` and builds a bottom-anchored
+`BottomContainer` sized `Screen:getSize()` - both *at construction time*. Without this, a
+rotation would leave the keyboard laid out (and positioned) for the previous orientation.
+]]
+function ViewerApp:_refresh_keyboard()
+    if not self.vk then return end
+    local signature = self:_screen_signature()
+    if signature == self._vk_screen then return end
+    self.vk:init()
+    self._vk_screen = signature
+    UIManager:setDirty(self.vk, "ui")
+end
+
+--[[--
+KOReader's generic screen-size change notification (also broadcast by the device backends).
+]]
+function ViewerApp:onScreenResize(dimen)
+    if dimen then self.dimen = dimen end
+    self:_reflow()
+    self:_refresh_keyboard()
+    self:updateTouchZonesOnScreenResize(self.dimen)
+    return false
+end
+
+--[[--
+KOReader's generic rotation entry point
+(`UIManager:broadcastEvent(Event:new("SetRotationMode", mode))`).
+]]
+function ViewerApp:onSetRotationMode(mode)
+    if mode == nil or mode == Screen:getRotationMode() then return nil end
+    Screen:setRotationMode(mode)
+    self:onScreenResize(Screen:getSize())
+    UIManager:onRotation()
+    return true
 end
 
 function ViewerApp:canvas_geom()
@@ -169,7 +245,6 @@ end
 function ViewerApp:paintTo(bb, x, y)
     local size = self:getSize()
     bb:paintRect(x, y, size.w, size.h, BB.COLOR_BLACK)
-    self.top_bar:paintTo(bb, x, y)
     self.canvas = self:_layout(x, y)
 
     -- Read once per paint: Screen.bb is replaced on rotation/resize.
@@ -437,7 +512,8 @@ function ViewerApp:set_keyboard_visible(want)
     else
         self.vk:hideKeyboard()
     end
-    self:_reflow()
+    -- The canvas does not change: the keyboard overlaps the framebuffer, so the view (and its
+    -- scale) stays put and the user pans if something important ends up behind the keyboard.
     UIManager:setDirty(self, "ui")
 end
 
@@ -455,8 +531,9 @@ function ViewerApp:_sync_keyboard_later()
     UIManager:nextTick(function() self:_sync_keyboard() end)
 end
 
+--- The keyboard reports a new height (e.g. after a layout switch). It repaints itself; we
+--- repaint the part of the canvas it used to cover.
 function ViewerApp:on_keyboard_height_changed()
-    self:_reflow()
     UIManager:setDirty(self, "ui")
 end
 
@@ -477,36 +554,26 @@ function ViewerApp:rotate(delta)
     self:set_rotation_mode(band(Screen:getRotationMode() + delta, 3))
 end
 
---- Switches the screen orientation and re-lays out.
+--- Asks for a new rotation mode, through KOReader's generic API, so that every widget
+--- (including the on-screen keyboard, which we re-init in `onSetRotationMode`) follows.
 function ViewerApp:set_rotation_mode(mode)
-    if mode == Screen:getRotationMode() then return end
-    Screen:setRotationMode(mode)
-    self:_reflow()
-    self:updateTouchZonesOnScreenResize(self.dimen)
-    UIManager:onRotation()
+    if mode == nil or mode == Screen:getRotationMode() then return end
+    UIManager:broadcastEvent(Event:new("SetRotationMode", mode))
 end
 
 --- Applies the session's default orientation, remembering the previous mode.
 function ViewerApp:apply_default_orientation(default_mode)
     self.prev_rotation = self.prev_rotation or Screen:getRotationMode()
     if default_mode == nil then default_mode = self.settings.orientation end
-    if default_mode == nil then return end
-    if default_mode ~= Screen:getRotationMode() then
-        Screen:setRotationMode(default_mode)
-        self:_reflow()
-        UIManager:onRotation()
-    end
+    self:set_rotation_mode(default_mode)
 end
 
 --- Restores the rotation mode that was active before we were shown.
 function ViewerApp:restore_rotation()
     if self.prev_rotation == nil then return end
-    if Screen:getRotationMode() ~= self.prev_rotation then
-        Screen:setRotationMode(self.prev_rotation)
-        self:_reflow()
-        UIManager:onRotation()
-    end
+    local mode = self.prev_rotation
     self.prev_rotation = nil
+    self:set_rotation_mode(mode)
 end
 
 -- ---------------------------------------------------------------- menu / lifecycle

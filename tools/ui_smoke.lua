@@ -256,11 +256,12 @@ check("failed_connect_returns_to_list", function()
     assert_true(count(is_list) == 1, "no stacked lists: " .. stack_desc())
 end)
 
-check("toolbar_reflows_on_rotation", function()
-    local Settings = require("vncviewer/settings")
+-- ---------------------------------------------------------------- a real viewer widget
+
+--- Builds a shown viewer app with a fake session (no network involved).
+local function new_app()
     local ViewerApp = require("vncviewer/app")
     local Remote = require("vncviewer/framebuffer")
-
     local remote = Remote.new(400, 300)
     local app = ViewerApp:new{
         plugin = {
@@ -275,48 +276,107 @@ check("toolbar_reflows_on_rotation", function()
             send_key = function() end,
             get_state = function() return "connected" end,
             get_error = function() return nil end,
-            get_profile = function() return { name = "t" } end,
+            get_profile = function() return { name = "test" } end,
         },
     }
+    UIManager:show(app)
+    return app, remote
+end
 
-    local function row_size()
-        -- ButtonTable's container is a VerticalGroup; the button row is its widest child
-        local container = app.top_bar[1]
-        local best
-        for _, child in ipairs(container) do
-            local size = child:getSize()
-            if size and size.w > 0 and (not best or size.w > best.w) then best = size end
-        end
-        return best
+check("canvas_covers_the_screen", function()
+    local app, remote = new_app()
+    local size = Screen:getSize()
+    assert_true(app.canvas.x == 0 and app.canvas.y == 0,
+        string.format("the canvas must start at the top left, got %s", tostring(app.canvas)))
+    assert_true(app.canvas.w == size.w and app.canvas.h == size.h,
+        string.format("the canvas (%dx%d) must cover the whole screen (%dx%d)",
+            app.canvas.w, app.canvas.h, size.w, size.h))
+    assert_true(app.top_bar == nil, "there is no permanent toolbar any more")
+
+    -- and it follows a rotation
+    local before = { w = app.canvas.w, h = app.canvas.h }
+    app:set_rotation_mode((Screen:getRotationMode() + 1) % 4)
+    size = Screen:getSize()
+    assert_true(app.canvas.w == size.w and app.canvas.h == size.h,
+        string.format("after rotation the canvas (%dx%d) must cover the screen (%dx%d)",
+            app.canvas.w, app.canvas.h, size.w, size.h))
+    assert_true(app.canvas.w ~= before.w or app.canvas.h ~= before.h,
+        "the canvas must be re-laid out for the new orientation")
+    assert_true(remote.scale > 0, "the view must still be usable")
+    app:set_rotation_mode(Screen:getRotationMode())
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keyboard_overlaps_without_rescaling", function()
+    local app, remote = new_app()
+    local canvas = { w = app.canvas.w, h = app.canvas.h }
+    local scale = remote.scale
+    local view = { x = remote.view_x, y = remote.view_y }
+
+    app:set_keyboard_visible(true)
+    assert_true(app.vk_visible, "the keyboard must be visible")
+    assert_true(app.vk:getSize().h > 0, "the keyboard must have a height")
+    assert_true(app.canvas.w == canvas.w and app.canvas.h == canvas.h,
+        "showing the keyboard must not change the canvas")
+    assert_true(math.abs(remote.scale - scale) < 1e-9,
+        string.format("showing the keyboard must not rescale the view (%s -> %s)", scale, remote.scale))
+    assert_true(math.abs(remote.view_x - view.x) < 1e-9 and math.abs(remote.view_y - view.y) < 1e-9,
+        "showing the keyboard must not move the view")
+
+    app:set_keyboard_visible(false)
+    assert_true(not app.vk_visible, "the keyboard must hide again")
+    assert_true(math.abs(remote.scale - scale) < 1e-9, "hiding it must not rescale either")
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keyboard_follows_rotation", function()
+    local app, remote = new_app()
+    app:set_keyboard_visible(true)
+    assert_true(app.vk_visible, "the keyboard must be visible")
+
+    -- VirtualKeyboard anchors itself in a BottomContainer sized Screen:getSize() at init time,
+    -- and sizes its keys from Screen:getWidth(): both must have been refreshed.
+    local container = app.vk[1].dimen
+    local size = Screen:getSize()
+    assert_true(container.w == size.w and container.h == size.h,
+        string.format("the keyboard container (%dx%d) must match the screen (%dx%d)",
+            container.w, container.h, size.w, size.h))
+    local width_before = app.vk:getSize().w
+
+    app:set_rotation_mode((Screen:getRotationMode() + 1) % 4)
+    size = Screen:getSize()
+    container = app.vk[1].dimen
+    assert_true(container.w == size.w and container.h == size.h,
+        string.format("after rotation the keyboard container (%dx%d) must match the screen (%dx%d)",
+            container.w, container.h, size.w, size.h))
+    assert_true(app.vk:getSize().w ~= width_before,
+        "the keyboard must be laid out for the new screen width")
+    assert_true(app.vk_visible, "the keyboard must stay visible across a rotation")
+
+    app:set_rotation_mode(Screen:getRotationMode())
+    app:set_keyboard_visible(false)
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("menu_zones_registered", function()
+    local app, remote = new_app()
+    local zone = G_defaults:readSetting("DTAP_ZONE_MENU")
+    local size = Screen:getSize()
+    for _, id in ipairs({ "vncviewer_menu_tap", "vncviewer_menu_swipe",
+                          "vncviewer_menu_tap_ext", "vncviewer_menu_swipe_ext" }) do
+        assert_true(app:checkRegisterTouchZone(id), "touch zone " .. id .. " must be registered")
     end
-
-    -- A ButtonTable sizes its buttons from the screen width at construction time, so after a
-    -- rotation the row must have been rebuilt to the *new* width (it used to keep the old one
-    -- and get clipped).
-    local function expect_matches_screen(tag)
-        local size = Screen:getSize()
-        local row = row_size()
-        assert_true(row.w <= size.w,
-            string.format("%s: the toolbar (%d) must fit the screen (%d)", tag, row.w, size.w))
-        assert_true(math.abs(row.w - size.w) <= 8,
-            string.format("%s: the toolbar (%d) must match the screen width (%d)", tag, row.w, size.w))
-        return row.w
-    end
-
-    local mode = Screen:getRotationMode()
-    local first_w = expect_matches_screen("first orientation")
-
-    app:set_rotation_mode((mode + 1) % 4)
-    local rotated_w = expect_matches_screen("rotated")
-    local rotated = Screen:getSize()
-    assert_true(math.abs(rotated_w - rotated.w) < math.abs(first_w - rotated.w),
-        "the toolbar must be rebuilt for the new screen width, not keep the old one")
-    assert_true(rotated.w ~= rotated.h, "the rotation must have swapped the logical dimensions")
-
-    app:set_rotation_mode(mode)
-    local back_w = expect_matches_screen("back")
-    assert_true(back_w == first_w, "rotating back must restore the original toolbar")
-
+    local gs_range = app._zones["vncviewer_menu_tap"].gs_range
+    assert_true(math.abs(gs_range.range.w - size.w * zone.w) < 1,
+        "the menu tap zone must cover KOReader's DTAP_ZONE_MENU width")
+    assert_true(math.abs(gs_range.range.h - size.h * zone.h) < 1,
+        "the menu tap zone must cover KOReader's DTAP_ZONE_MENU height")
+    -- the zone does not swallow the canvas: a tap below it is still a remote click
+    local ac = { x = 0, y = math.floor(size.h * 0.5), w = 1, h = 1 }
+    assert_true(gs_range.range:contains(ac) == false, "the menu zone must stay out of the canvas")
     app:onCloseWidget()
     remote:free()
 end)

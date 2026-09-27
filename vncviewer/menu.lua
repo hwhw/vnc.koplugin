@@ -166,6 +166,10 @@ function MenuBuilder.open(app)
         mandatory = rotation_label(Screen:getRotationMode()),
     }
     item_table[#item_table + 1] = {
+        text = _("Rotate screen"),
+        callback = action(function() app:rotate(1) end),
+    }
+    item_table[#item_table + 1] = {
         text = _("Use current orientation as default"),
         callback = action(function()
             settings.orientation = Screen:getRotationMode()

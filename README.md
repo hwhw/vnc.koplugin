@@ -23,11 +23,16 @@ Connection profiles and global settings live in
 
 ## Using the viewer
 
-Tap *More tools* → *VNC viewer* to get the connection list (or "New connection…" to add one).
-Pick a connection to connect; the toolbar at the top has **Menu**, **Keyboard**, **Rotate** and
-**Fit**.
+Tap *More tools* → *VNC viewer* to get the connection list (or "New connection…" to add one),
+then pick a connection.
 
-Gestures on the canvas (below the toolbar):
+The remote framebuffer owns the **whole screen** — there is no permanent toolbar. The menu is
+opened the way KOReader's file manager and reader open theirs: **tap, or swipe down, in
+KOReader's own menu zone** at the top of the screen (the same `DTAP_ZONE_MENU` area, honouring
+the global *activate menu on* preference, so with "swipe only" taps there still go to the remote
+desktop).
+
+Gestures on the canvas:
 
 | Gesture | Effect |
 | --- | --- |
@@ -39,18 +44,24 @@ Gestures on the canvas (below the toolbar):
 | two-finger rotate | change the screen orientation |
 | swipe up from the bottom | show the on-screen keyboard |
 | swipe down | hide it again |
+| tap / swipe down in the top menu zone | open the in-app menu |
 
-The toolbar is rebuilt whenever the logical screen size changes, so rotating the device (or the
-view) re-lays out the buttons instead of leaving them cut off at the previous orientation's width.
+The on-screen keyboard is drawn **over** the framebuffer: showing or hiding it never rescales or
+moves the view. Pan (two-finger drag) if part of the remote desktop ends up behind the keyboard —
+if the zoomed view already fits in the space above the keyboard, nothing is hidden at all. The keyboard is
+re-laid out from the current screen dimensions whenever they change, so it fits after a rotation
+just like everything else (rotations and screen resizes go through KOReader's generic
+`SetRotationMode` / `ScreenResize` events).
 
 A physical keyboard is forwarded too: printable characters via `TextInput`, and the named keys
 (Backspace, Tab, arrows, Home/End, Page Up/Down, F1-F12, modifiers, …) as X11 keysyms. `Back`
 leaves the viewer without dropping the connection.
 
-The in-app menu offers: the connection list, a status line, zoom presets, a
-"keyboard always visible" toggle, show/hide keyboard, the four screen orientations, "use current
-orientation as default", the keys the on-screen keyboard does not have (Enter/Tab/Esc/Delete),
-**Disconnect** (with confirmation) and **Leave (keep connection)**. When the connection has just
+The in-app menu offers everything the viewer can do: the connection list, a status line, zoom
+presets (**Fit framebuffer** included), a "keyboard always visible" toggle, show/hide keyboard,
+**Rotate screen** and the four screen orientations, "use current orientation as default", the
+keys the on-screen keyboard does not have (Enter/Tab/Esc/Delete), **Disconnect** (with
+confirmation) and **Leave (keep connection)**. When the connection has just
 gone down, the menu leads with **Reconnect to <name>**.
 
 Every menu and dialog has a way back, and it always returns to where you came from: the
@@ -176,7 +187,9 @@ cd /usr/lib/koreader && \
 It checks that every menu and dialog has a way back that returns to the previous surface with no
 dialog left behind (cancel and save in the editor, Back in the per-connection dialog, cancelled
 and confirmed deletes), that a failed connection returns to the connection list with exactly one
-dismissable message, and that the toolbar is rebuilt to the new screen width after a rotation.
+dismissable message, that the canvas covers the whole screen and follows a rotation, that showing
+the keyboard neither rescales nor moves the view, that the keyboard is re-laid out for the new
+screen dimensions after a rotation, and that KOReader's menu tap/swipe zones are registered.
 
 ### Live end-to-end
 
@@ -243,7 +256,12 @@ when it is off, restores it on disconnect, and never touches a Wi-Fi it did not 
 
 - **Multi-touch gestures cannot be synthesised** on the SDL3 build (no `ydotool`/`wtype`), so the
   gesture *handlers* are unit-tested but the gesture *detector* wiring (pinch/spread/rotate/
-  two-finger drag/swipe) has to be exercised by hand on a touch device.
+  two-finger drag/swipe) has to be exercised by hand on a touch device. The same applies to a
+  real tap in the menu zone.
+- **The top menu zone is reserved**: with the default `swipe_tap` activation, taps in KOReader's
+  `DTAP_ZONE_MENU` (the top eighth of the screen) open the menu instead of clicking the remote
+  desktop, exactly as they do in the file manager. Sweep that region mentally or switch
+  *activate menu on* to "swipe only" if you need those pixels.
 - **Tight is off by default** and untested against a real server (see above).
 - **Wi-Fi**: on the SDL *Desktop* device (which is what `koreader` selects when `KO_MULTIUSER` is
   set) KOReader reports Wi-Fi as permanently on, so no Wi-Fi toggling happens there. The fake
