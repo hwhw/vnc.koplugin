@@ -24,6 +24,7 @@ local Device = require("device")
 local Event = require("ui/event")
 local Screen = Device.screen
 local UIManager = require("ui/uimanager")
+local time = require("ui/time")
 local logger = require("logger")
 
 local Keysyms = require("vnc/keysyms")
@@ -601,6 +602,34 @@ end
 -- ---------------------------------------------------------------- client input
 
 --[[--
+The timestamp an injected event has to carry: the clock the device stamps its *own* events with.
+
+`GestureDetector` probes that clock from a real event (`clock_id`), and `Input:setTimeout` computes
+a timer's deadline from the event that arms it: for a monotonic device that is `origin + delay`.
+An origin on another clock - which `os.time()`, i.e. CLOCK_REALTIME in whole seconds, always was -
+therefore arms a timer that is due decades away. While such a timer is pending,
+`Input:waitEvent` never gives control back to `UIManager` (it keeps polling for the timer, which
+cannot expire), so the scheduled poll task stops: no client input is injected, no update is sent,
+and nothing is logged until a *local* event wakes the loop - which then wedges again, because the
+timer that cannot expire is still armed. CLOCK_MONOTONIC is both what Linux input devices report
+and what KOReader's own synthetic events use (c.f., ffi/SDL3.lua's genEmuEvent), so it is the
+fallback for a device whose event clock the detector has not probed yet.
+]]
+local function event_time()
+    local detector = Device.input and Device.input.gesture_detector
+    local clock = detector and detector:getClockSource()
+    local fts
+    if clock == C.CLOCK_REALTIME then
+        fts = time.realtime_coarse()
+    elseif clock == C.CLOCK_BOOTTIME then
+        fts = time.boottime()
+    else
+        fts = time.monotonic_coarse()
+    end
+    return time.split_s_us(fts)
+end
+
+--[[--
 Feeds Linux-input style events to KOReader and dispatches whatever gestures come out.
 
 This is the seam KOReader's own device backends use (`EV_ABS` for positions, a `SYN_REPORT` to
@@ -611,8 +640,10 @@ function Server:_inject(evs)
     local input = Device.input
     if not input then return end
     local handled = {}
+    -- One timestamp for the whole frame, like the kernel's SYN_REPORT carries for the real ones.
+    local sec, usec = event_time()
     for _, ev in ipairs(evs) do
-        ev.time = { sec = os.time(), usec = 0 }
+        ev.time = { sec = sec, usec = usec }
         if input.eventAdjustHook then input:eventAdjustHook(ev) end
         if ev.type == C.EV_KEY then
             local one = input:handleKeyBoardEv(ev)

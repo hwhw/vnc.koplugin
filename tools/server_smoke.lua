@@ -839,8 +839,14 @@ end
 --- `encodings_wire` (a whole SetEncodings message). Returns the socket plus `request()` (builds a
 --- FramebufferUpdateRequest) and `read_update(plane)`, which reads one FramebufferUpdate, decodes
 --- every rectangle into `plane` and returns the rectangle count and their headers.
-local function connect_client(server, port, encodings_wire)
+---
+--- `pump` (optional) is how the server is advanced while a read is pending: the default services
+--- the sockets directly. A check that has to prove the *UI loop* is what keeps a session alive
+--- passes a function that drives `UIManager:handleInput()` instead, so nothing but the scheduled
+--- poll task ever touches the server.
+local function connect_client(server, port, encodings_wire, pump)
     local socket = require("socket")
+    local step = pump or function() server:_poll() end
     local cli = assert(socket.tcp())
     cli:settimeout(0.2)
     assert(cli:connect("127.0.0.1", port))
@@ -851,7 +857,7 @@ local function connect_client(server, port, encodings_wire)
             data, e = cli:receive(n)
             if data then return data end
             if e ~= "timeout" then break end
-            server:_poll()
+            step()
             socket.sleep(0.01)
         end
         assert_true(data ~= nil, string.format("short read of %d: %s", n, tostring(e)))
@@ -1304,6 +1310,217 @@ check("server_injects_client_input", function()
         assert_true(got_text, "a printable keysym must arrive as TextInput, got " .. tostring(handler))
     end)
     UIManager.handleInputEvent = original
+    if not ok then error(err, 0) end
+end)
+
+check("server_stays_live_after_a_client_pointer_press", function()
+    -- The reported wedge, end to end: a client connects, takes the first full frame, and the
+    -- moment its first PointerEvent (mouse down) is injected the session dies - no client input is
+    -- injected any more, no frames go out - until somebody presses a key on the *local* device,
+    -- after which it wedges again.
+    --
+    -- The press arms a hold timer, and `Input:setTimeout` arms it at `origin + delay`, where
+    -- `origin` is the timestamp of the event that armed it, in the clock `GestureDetector` probed
+    -- from the device's *own* events (`clock_id`) - CLOCK_MONOTONIC on every backend KOReader has
+    -- today. The server used to stamp injected events with `os.time()`, i.e. CLOCK_REALTIME in
+    -- whole seconds, so that timer's deadline landed ~56 years in the future. `Input:waitEvent`
+    -- cannot give control back to UIManager while such a timer is pending: it keeps polling for a
+    -- timer that cannot expire. The scheduled poll task therefore stops running - the client is
+    -- never read and never written again - and only a *local* input event makes `waitForEvent`
+    -- return, which is the "unclogs when a key is pressed locally" of the report; the timer is
+    -- still armed at that point, which is why it wedges again right after.
+    --
+    -- This check drives the *real* UI loop and lets nobody else service the server, so it sees
+    -- exactly that: with the button still held, a client key must still reach a widget and a
+    -- recorded screen change must still reach the client, and the same must hold after the release.
+    local Server = require("vnc/server")
+    local socket = require("socket")
+    local time = require("ui/time")
+    require("ffi/linux_input_h")        -- EV_*/ABS_MT_*/BTN_TOUCH/SYN_REPORT (and ETIME)
+    local C = ffi.C
+
+    local server, port
+    for candidate = 5981, 5989 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local Input = Device.input
+    local real_wait = Input.input.waitForEvent
+    -- A headless local input device: every wait just reports a timeout after a short sleep, so the
+    -- loop can be driven by hand. A wait that never gives control back to UIManager is what the
+    -- wedge looks like from the inside, so each step is budgeted - the longest wait that is
+    -- legitimate here is the hold timer KOReader itself arms on a press (0.5s).
+    local WEDGE_BUDGET = time.s(3)
+    local step_deadline
+    local function wedged()
+        local timer = Input.timer_callbacks[1]
+        local detail = ""
+        if timer then
+            local ahead = time.to_s(timer.deadline - time.now())
+            if ahead > 1 then
+                detail = string.format(
+                    " (a timer armed from the injected event is due in %.0f s: the timestamp on the"
+                    .. " injected event is not in the device's event clock)", ahead)
+            end
+        end
+        return "the UI loop is stuck inside Input:waitEvent" .. detail
+    end
+    Input.input.waitForEvent = function()
+        if step_deadline and time.now() > step_deadline then error(wedged(), 0) end
+        socket.sleep(0.002)
+        return false, C.ETIME
+    end
+
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local keys = 0
+    local widget = InputContainer:new{
+        dimen = Screen:getSize(),
+        key_events = { KeyPress = { { "Down" } } },
+    }
+    function widget:onKeyPress() keys = keys + 1 return true end
+    UIManager:show(widget)
+
+    -- Witness that the client's press is really delivered (a gesture at its coordinates reaching
+    -- the UI), so the liveness assertions below cannot pass by the press simply being dropped.
+    local gestures = {}
+    local real_handle_input_event = UIManager.handleInputEvent
+    UIManager.handleInputEvent = function(mgr, ev)
+        if ev.handler == "onGesture" and ev.args and ev.args[1] and ev.args[1].pos then
+            gestures[#gestures + 1] = ev.args[1]
+        end
+        return real_handle_input_event(mgr, ev)
+    end
+
+    --- One iteration of the real loop, the way UIManager:run drives it.
+    local function ui_step()
+        step_deadline = time.now() + WEDGE_BUDGET
+        local ok, err = pcall(UIManager.handleInput, UIManager)
+        if not ok then error(err, 0) end
+    end
+
+    --- Drives the loop for up to `seconds`, stopping early once `until_fn` says so.
+    local function pump_ui(seconds, until_fn)
+        local deadline = time.now() + time.s(seconds)
+        while time.now() < deadline do
+            ui_step()
+            if until_fn and until_fn() then return true end
+        end
+        return not until_fn or until_fn()
+    end
+
+    --- Events for the local (device) side, stamped and routed the way a backend's are:
+    --- ffi/SDL3.lua's genEmuEvent uses CLOCK_MONOTONIC_COARSE ("synthetic ones in the same timescale
+    --- as the UI"). A tap like this is what the user performs on KOReader's own menu before the
+    --- server ever sees a client, and it is what makes GestureDetector probe the device's clock.
+    local function local_ev(ev_type, code, value)
+        local sec, usec = time.split_s_us(time.monotonic_coarse())
+        return { type = ev_type, code = code, value = value, time = { sec = sec, usec = usec } }
+    end
+    local function local_frame(evs)
+        for _, ev in ipairs(evs) do
+            if ev.type == C.EV_KEY then
+                Input:handleKeyBoardEv(ev)
+            else
+                Input:handleTouchEv(ev)
+            end
+        end
+    end
+    local function local_tap(x, y)
+        local_frame({
+            local_ev(C.EV_ABS, C.ABS_MT_SLOT, 0),
+            local_ev(C.EV_ABS, C.ABS_MT_TRACKING_ID, 1),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_X, x),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_Y, y),
+            local_ev(C.EV_KEY, C.BTN_TOUCH, 1),
+            local_ev(C.EV_SYN, C.SYN_REPORT, 0),
+        })
+        local_frame({
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_X, x),
+            local_ev(C.EV_ABS, C.ABS_MT_POSITION_Y, y),
+            local_ev(C.EV_ABS, C.ABS_MT_SLOT, 0),
+            local_ev(C.EV_ABS, C.ABS_MT_TRACKING_ID, -1),
+            local_ev(C.EV_KEY, C.BTN_TOUCH, 0),
+            local_ev(C.EV_SYN, C.SYN_REPORT, 0),
+        })
+    end
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        -- From here on only the UI loop's own poll task services the server.
+        local client = connect_client(server, port, set_encodings_wire(), ui_step)
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        -- The device's own tap, which puts its event clock on record. Start from a blank slate (a
+        -- device freshly booted, or one that just came back from suspend) so the clock this check
+        -- depends on does not come from whatever an earlier check happened to inject.
+        Input:resetState()
+        local_tap(300, 300)
+        assert_true(Input.gesture_detector:getClockSource() == C.CLOCK_MONOTONIC,
+            "this check needs the device's events to be stamped like KOReader's own are")
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+        local function pointer(mask, x, y)
+            return string.char(5, mask, math.floor(x / 256), x % 256, math.floor(y / 256), y % 256)
+        end
+        local key_down = string.char(4, 1, 0, 0, 0, 0, 0xFF, 0x54)   -- KeyEvent, keysym Down
+
+        -- The press stays unreleased, which is the user's stuck state ...
+        cli:send(pointer(1, 343, 36))
+
+        -- ... and it is really delivered: a gesture at the client's coordinates reached the UI
+        -- (the press itself, not only the liveness checks below, must come through).
+        assert_true(pump_ui(1, function()
+                for _, ges in ipairs(gestures) do
+                    if ges.pos.x == 343 and ges.pos.y == 36 then return true end
+                end
+                return false
+            end),
+            "the client's press must reach KOReader as a gesture at the position it asked for")
+
+        -- (a) a key from the client must still reach the widget with the button held
+        local before = keys
+        cli:send(key_down)
+        assert_true(pump_ui(2, function() return keys > before end),
+            "a client key must still be delivered while the client's button is held down")
+
+        -- (b) a recorded change must still reach the client
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        cli:send(client.request(true, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1,
+            "a screen change must still be sent while the client's button is held down")
+        local r, g, b = get(plane, 16, 16)
+        assert_true(r > 200 and g > 200 and b > 200, "and the changed pixels must come through")
+
+        -- The release lifts the contact and clears the hold timer: still live
+        before = keys
+        cli:send(pointer(0, 343, 36))
+        cli:send(key_down)
+        assert_true(pump_ui(2, function() return keys > before end),
+            "a client key must still be delivered after the release")
+
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        cli:send(client.request(true, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "and a change must still be sent after the release")
+
+        plane:free()
+        cli:close()
+    end)
+
+    Input.input.waitForEvent = real_wait
+    UIManager.handleInputEvent = real_handle_input_event
+    UIManager:close(widget)
+    server:stop()
     if not ok then error(err, 0) end
 end)
 
