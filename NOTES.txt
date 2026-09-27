@@ -1,0 +1,209 @@
+NOTES.txt -- vncviewer.koplugin internals, tests and open ends
+==============================================================
+
+This file is for people reading or changing the code. The README is for users.
+
+
+WHAT THIS IS
+------------
+
+An out-of-tree KOReader plugin: a VNC (RFB 3.8) client that renders a remote desktop through
+KOReader's BlitBuffer abstraction. It is pure Lua + LuaJIT FFI; there is no build step, no C
+component, and nothing to compile.
+
+
+CODE STRUCTURE
+--------------
+
+main.lua                  Plugin entry point. Owns the settings store, registers the single
+                          file-browser menu entry, keeps the session registry (one Session per
+                          profile) and the app lifecycle.
+
+vncviewer/protocol.lua    RFB 3.8 state machine: version/security handshake, ClientInit,
+                          ServerInit, SetPixelFormat, SetEncodings, the server message loop, and
+                          the client input messages. Transport agnostic - it never touches a
+                          socket.
+vncviewer/encodings.lua   Rectangle decoders: Raw, CopyRect, RRE, Hextile, TRLE, ZRLE, Tight and
+                          the DesktopSize pseudo-encoding.
+vncviewer/zstream.lua     Stateful zlib inflate (one stream per RFB zlib stream) - KOReader's
+                          ffi/zlib.lua only offers one-shot uncompress().
+vncviewer/des.lua         DES-ECB in FFI, used by VNC Authentication.
+vncviewer/pxfmt.lua       The client pixel format we negotiate, plus the pixel write helpers.
+vncviewer/util.lua        Byte reader/writer for protocol fields, rect unions, UTF-8 splitting.
+vncviewer/keysyms.lua     KOReader key names / characters -> X11 keysyms.
+vncviewer/session.lua     The transport driver: LuaSocket TCP, Wi-Fi, the poll task, tx/rx
+                          buffering, attach/detach, reconnect, dirty-rect plumbing.
+vncviewer/framebuffer.lua The remote plane (a TYPE_BBRGB24 BlitBuffer) and the view transform
+                          (fit / zoom / pan / draw).
+vncviewer/app.lua         The full-screen viewer widget: canvas, gestures, on-screen keyboard,
+                          menu wiring, remote input.
+vncviewer/menu.lua        The in-app menu.
+vncviewer/dialogs.lua     Connection list, per-connection actions, profile editor.
+vncviewer/keyboard.lua    KOReader's VirtualKeyboard wired to RFB key events via a stub inputbox.
+vncviewer/settings.lua    LuaSettings wrapper: profiles + global settings.
+
+tools/mock_vnc_server.py  Test fixture: an RFB 3.8 server in Python (all encodings, both security
+                          types, deterministic patterns, logs every client message).
+tools/proto_smoke.lua     Headless protocol tests (drives the real protocol stack over TCP).
+tools/ui_smoke.lua        Headless UI tests (real plugin, dialogs and viewer widget, no KOReader
+                          process, no server).
+tools/tight_jpeg.b64      The fixed 32x32 JPEG the mock serves for its Tight JPEG rectangle.
+
+
+DESIGN NOTES WORTH KNOWING
+--------------------------
+
+Protocol concurrency. protocol.lua runs as a coroutine whose transport yields ("need", n) when it
+wants bytes; Session is the driver and resumes it once exactly n bytes have arrived. Everything is
+therefore single-threaded and there is no blocking read anywhere. The session runs from a
+UIManager:scheduleIn poll task with a per-tick byte budget and a per-tick CPU budget (30 ms), so a
+large frame cannot block the UI. Exactly one FramebufferUpdateRequest is outstanding at any time,
+which is what bounds memory while the viewer is closed but attached.
+
+Detach/attach. Leaving the viewer detaches (unschedules the poll, stops reading, keeps the socket
+and the plane). Re-attaching sends a non-incremental request for the whole screen, which is both
+the resynchronisation and the way updates pushed while detached are absorbed. Only Disconnect
+closes the socket and restores Wi-Fi, and only Wi-Fi that the plugin turned on is turned off.
+
+Settings. There is no schema version and no migration - the plugin has no released file format to
+be compatible with. vncviewer/settings.lua:normalise() just keeps the file in shape on load:
+missing global settings get their defaults, unknown keys are dropped, profiles without a usable
+name are dropped. Never add migration code "just in case" before a format has actually shipped.
+
+Taps always click the remote. The plugin ignores KOReader's "activate menu on tap" preference and
+opens the menu on a swipe down in KOReader's menu zone instead; under "tap only" the menu would be
+unreachable, and intercepting taps would put a dead spot on the remote desktop. See
+ViewerApp:init_menu_zones().
+
+Physical keyboard. Printable characters arrive as TextInput events, not as key events, and
+SDL 3 only delivers those after Device:startTextInput() ("Text input events are not received by
+default", SDL_keyboard.h). KOReader's own callers are its text fields, so the viewer calls
+Device:startTextInput() while it is shown (ViewerApp:_ensure_text_input), re-asserts it after one
+of its own dialogs (an InputText pairs startTextInput with stopTextInput) and calls
+Device:stopTextInput() when it closes. Named keys go out as X11 keysyms; only the Menu key is kept
+back (it toggles the in-app menu), and Back leaves the viewer only on devices without a keyboard.
+
+Keyboard placement and zoom. The canvas (ViewerApp:_layout) is the whole widget, except when the
+whole remote screen at the current zoom fits in the space the visible on-screen keyboard leaves -
+then the canvas is that space, so the view is placed above the keyboard rather than behind it. The
+zoom is never changed by that; only the placement. "Fit (with keyboard)" is the mode that fits the
+space the keyboard leaves (and therefore follows the keyboard); "Fit screen" fills the screen and
+fixed ratios are absolute. Remote:set_canvas() keeps the view's own idea of its space in step,
+which matters because set_scale()/zoom_at() clamp and centre against it.
+
+The on-screen keyboard yields to popups. KOReader stacks a non-modal Menu *below* the modal
+VirtualKeyboard, so the keyboard would cover a menu's lower half; ViewerApp:evaluate_keyboard()
+therefore only shows it while the framebuffer view owns the screen. Popups the plugin opens notify
+the viewer directly. Anything else cannot be noticed by repainting - UIManager:_repaint starts at
+the topmost full-screen widget, so a widget appearing *above* the viewer never repaints it - hence
+the 250 ms re-check (_watch_keyboard_state). That is also why a toast (a Bell notification) is
+explicitly flagged `toast = true`: it is allowed to share the screen with the keyboard.
+
+Platform. Nothing in the plugin is SDL specific: the only input-platform calls are
+Device:startTextInput/stopTextInput, and Device:isTouchDevice()/hasKeyboard() are asked rather than
+assumed. The single external interface in the whole plugin is zlib: zstream.lua declares z_stream
+and inflate*/deflate* and loads the library with ffi.loadlib("z", 1) - the exact call core's
+ffi/zlib.lua makes, so the monolibtic redirects (Android, iOS) apply. It deliberately declares only
+what ffi/zlib_h.lua does not (that one has compressBound/compress2/crc32/uncompress). DES is
+hand-rolled FFI, so there is no libcrypto/OpenSSL dependency, and LuaSocket is used for raw TCP
+only (no TLS, so LuaSec is not needed).
+
+KOReader internals relied on (could change under us): UIManager._window_stack (for "is a popup
+above us"), UIManager:scheduleIn/unschedule/nextTick/setDirty, VirtualKeyboard's inputbox protocol
+and its showKeyboard/hideKeyboard/setVisibility, Screen:getSize/setRotationMode, the
+SetRotationMode/ScreenResize events, DataStorage/LuaSettings, and NetworkMgr. Tools and gestures
+use the documented InputContainer APIs (registerTouchZones/updateTouchZonesOnScreenResize,
+ges_events with function ranges so they follow rotation without re-registration).
+
+On e-ink the widget colour type may be BB8: the plane is always RGB24, cross-format blits go
+through BlitBuffer, and the grey path uses ditherblitFrom when Screen.sw_dithering is on.
+
+
+TESTS
+-----
+
+Protocol layer (needs python3 with the standard library, libcrypto with the legacy provider for the
+mock's DES, and KOReader's own LuaJIT):
+
+    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    cd /usr/lib/koreader && \
+      LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" \
+      LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/proto_smoke.lua" --tmp /tmp/vncv_smoke
+
+It starts one mock_vnc_server.py per case on an ephemeral port and drives the real protocol stack
+over a real socket: DES against FIPS vectors, the VNC-auth bit reversal, the pixel format and
+encoding list as they hit the wire, None/VNC security (including a wrong password), every encoding
+decoded pixel-exactly, ZRLE stream continuity across many rectangles, DesktopSize, the exact bytes
+of pointer/key/cut-text messages, and the fatal path for an encoding we never advertised. The mock
+verifies VNC Authentication with OpenSSL's DES (through ctypes), i.e. with an implementation
+independent of vncviewer/des.lua.
+
+UI plumbing (headless, no KOReader process, no server):
+
+    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    cd /usr/lib/koreader && \
+      KO_HOME=/tmp/vncv_ui_home \
+      LUA_PATH="$PLUGIN/?.lua;;" LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/ui_smoke.lua"
+
+It builds the real plugin, its dialogs and a real viewer widget against KOReader's widget stack and
+checks the flows that are hard to reach by hand: every menu/dialog returns to where it came from,
+a failed connection returns to the connection list with exactly one dismissable message, the
+canvas follows rotations, the keyboard neither rescales nor moves a view that does not fit above
+it, the fitted zoom modes and the keyboard-aware placement behave, the keyboard yields to popups,
+platform text input is enabled exactly while the viewer is shown, typed text and physical keys
+reach the remote (through KOReader's own SDL event handler), and the settings store survives a
+hand-edited or empty file. `KO_HOME` is needed because KOReader's widget cache lives under it.
+
+Live end-to-end (GUI): run the mock, run KOReader, drive the plugin through KOReader's HTTP
+inspector (port 8989, httpinspector.autostart = true):
+
+    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    python3 "$PLUGIN/tools/mock_vnc_server.py" --port 5900 --encoding zrle --pattern quadrants \
+        --log /tmp/mock.log &
+    koreader &                      # or: env KO_HOME=/tmp/ko_home ./reader.lua
+    sleep 20
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/connect_profile/local/'
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/app/send_pointer/300/200/1'
+    curl -s 'http://127.0.0.1:8989/koreader/ui/vncviewer/app/send_key/65293/1'   # 0xFF0D down
+    grep -E 'INPUT (PointerEvent|KeyEvent)' /tmp/mock.log
+    curl -s -o /tmp/screen.png 'http://127.0.0.1:8989/koreader/device/screen/bb'
+
+Inspector grammar: a trailing "/" calls a method (arguments are simple values - a string "0" stays
+a string, so booleans are awkward), no slash reads a field, and BlitBuffers come back as PNG. It
+only reaches objects reachable from the file manager, so it can drive the connection list and the
+viewer widget (open_menu/close_menu/zoom_to/set_keyboard_visible/onKbdHide/send_pointer/send_key)
+but not the dialogs those open; those flows are covered by ui_smoke.lua. Screenshots are the
+evidence for anything visual: the mock's patterns are deterministic, so pixel probes of
+device/screen/bb can assert placement and rendering exactly.
+
+
+WHAT HAS BEEN VERIFIED, AND WHAT HAS NOT
+----------------------------------------
+
+Verified on a desktop with the SDL Emulator device, against tools/mock_vnc_server.py:
+all seven encodings rendering in the live GUI; pointer, key and text input reaching the server;
+the on-screen keyboard overlapping without rescaling, following rotations, yielding to menus and
+dialogs, and a view that fits being placed above it; the zoom modes (fit screen / fit with
+keyboard / fixed ratios) including their menu labels; detach/keep-alive/reconnect; the Wi-Fi
+auto-connect/restore semantics; the grey-screen (BB8) dithering path; and the connection dialogs'
+back-flows.
+
+Not verified, and where to look first if something is wrong:
+
+- The gesture *detector*: multi-touch gestures (pinch/spread/rotate/two-finger drag) cannot be
+  synthesised on this box (no ydotool/wtype, /dev/uinput is not writable, no bare X server, and
+  Xwayland ignores XTest keys for an unfocused window), so the handlers are tested but the wiring
+  from real fingers is not. Same for a real tap in the menu zone.
+- Tight compression: exercised against the mock only. It is not RFC 6143 and servers differ in how
+  they read its control byte (0x0A is "uncompressed" in libvncclient, "PNG" in TurboVNC/noVNC);
+  the implementation follows libvncclient, cross-checked against noVNC. Flip the
+  ["enable_tight"] default only after a real server has been verified.
+- Real e-ink hardware: the BB8/rotation/NetworkMgr paths exist and are exercised in their emulated
+  forms only.
+- Suspend: while KOReader is suspended the poll task simply does not run and the single
+  outstanding update request is buffered by the kernel. If a connection turns out to die across
+  suspend, re-requesting a full update on resume is the fix - not implemented.
+- TLS/VeNCrypt/SASL servers, and security types other than None/VNC Authentication: unsupported by
+  design (the handshake reports them as unsupported).

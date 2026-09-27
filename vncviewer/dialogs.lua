@@ -207,10 +207,6 @@ function Dialogs.edit_profile(plugin, profile, opts)
                 input_type = "number",
             },
             {
-                text = profile and profile.username or "",
-                hint = _("User name (optional)"),
-            },
-            {
                 text = profile and profile.password or "",
                 hint = _("Password (optional)"),
                 text_type = "password",
@@ -232,8 +228,7 @@ function Dialogs.edit_profile(plugin, profile, opts)
                     local name = trim(fields[1])
                     local host = trim(fields[2])
                     local port_text = trim(fields[3])
-                    local username = fields[4] or ""
-                    local password = fields[5] or ""
+                    local password = fields[4] or ""
 
                     if name == "" then
                         return report(_("Please give the connection a name."))
@@ -254,7 +249,6 @@ function Dialogs.edit_profile(plugin, profile, opts)
                         name = name,
                         host = host,
                         port = math.floor(port),
-                        username = username,
                         password = password,
                     }, profile and profile.name or nil)
                     finish(true)

@@ -528,6 +528,48 @@ check("menu_opens_on_swipe_only", function()
     remote:free()
 end)
 
+check("settings_file_is_kept_in_shape", function()
+    -- There is no schema version and no migration; the store still has to survive a file that a
+    -- user edited by hand (or that does not exist yet). `LuaSettings` caches one instance per
+    -- path (and flushing on close would overwrite the file), so each case gets its own path.
+    local Settings = require("vncviewer/settings")
+    local writeToFile = require("util").writeToFile   -- (data, path, force_flush, lua_dofile_ready)
+
+    local fresh = data_dir .. "/ui_smoke_settings_fresh.lua"
+    local s = Settings.open(fresh)
+    assert_true(s.data.settings.zoom_mode == "fit", "a fresh install gets the defaults")
+    assert_true(type(s.data.profiles) == "table" and #s.data.profiles == 0, "and no profiles")
+
+    local junk = data_dir .. "/ui_smoke_settings_junk.lua"
+    -- (`lua_dofile_ready` makes writeToFile add the `return`, so the content is the table itself)
+    writeToFile([==[
+-- hand-edited, with junk in it
+{
+    ["settings"] = { ["zoom_mode"] = "fit_with_keyboard", ["bogus"] = 1 },
+    ["profiles"] = {
+        { ["name"] = "ok", ["host"] = "h", ["port"] = 5901, ["password"] = "p" },
+        { ["host"] = "no name" },
+        "not a table",
+    },
+    ["settings_version"] = 1,
+}
+]==], junk, true, true)
+    s = Settings.open(junk)
+    assert_true(s.data.settings.zoom_mode == "fit_with_keyboard", "the settings that are there survive")
+    assert_true(s.data.settings.bogus == nil, "unknown settings are dropped")
+    assert_true(s.data.settings_version == nil, "so are unknown top-level keys")
+    assert_true(#s.data.profiles == 1, "only the usable profiles are kept")
+    local profile = s.data.profiles[1]
+    assert_true(profile.name == "ok" and profile.host == "h" and profile.port == 5901
+        and profile.password == "p", "and they keep their fields")
+
+    local empty = data_dir .. "/ui_smoke_settings_empty.lua"
+    writeToFile("{}\n", empty, true, true)
+    s = Settings.open(empty)
+    assert_true(s.data.settings.zoom_mode == "fit" and #s.data.profiles == 0,
+        "an empty file is filled in rather than breaking the viewer")
+end)
+
 check("keyboard_yields_to_popups", function()
     -- The keyboard belongs to the framebuffer view: a menu or dialog above it takes it out of the
     -- way, and it comes back when that popup is gone.

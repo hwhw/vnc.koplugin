@@ -36,10 +36,6 @@ local VNCViewer = WidgetContainer:extend{
 function VNCViewer:init()
     self.settings_file = DataStorage:getSettingsDir() .. "/vncviewer.lua"
     self.settings = Settings.open(self.settings_file)
-    if self.settings.migrated then
-        logger.info("vncviewer: upgrading the settings file", self.settings_file)
-        self.settings:flush()
-    end
 
     -- File manager only (we have nothing to show inside a document).
     if self.ui and self.ui.menu and not self.ui.document then

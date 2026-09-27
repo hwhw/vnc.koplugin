@@ -1,11 +1,12 @@
 --[[--
-Versioned settings store for the vncviewer plugin.
+Settings store for the vncviewer plugin.
 
 Thin wrapper over @{luasettings|LuaSettings}, holding connection profiles and global
 application settings in `~/.config/koreader/settings/vncviewer.lua`.
 
-The on-disk table is versioned with `settings_version`; @{Settings:migrate} fills in
-missing keys and coerces wrong types, so an older or hand-edited file keeps working.
+There is no schema version and no migration: there is no released file format to stay compatible
+with. The file is just kept in shape instead - missing keys get their defaults, unknown keys are
+dropped, and profiles that cannot be used are dropped - so a hand-edited file still loads.
 
 @module vncviewer.settings
 ]]
@@ -16,18 +17,21 @@ local logger = require("logger")
 local Settings = {}
 Settings.__index = Settings
 
---- Current on-disk schema version. Bump when the shape of `data` changes.
-Settings.SETTINGS_VERSION = 1
+--- Profile field names.
+Settings.PROFILE_FIELDS = { "name", "host", "port", "password" }
 
---- Profile field names, in the order they are written to disk.
-Settings.PROFILE_FIELDS = { "name", "host", "port", "username", "password" }
+--- The only top-level keys of the file.
+Settings.DATA_KEYS = { "profiles", "settings" }
+
+local known_data_key = {}
+for _, key in ipairs(Settings.DATA_KEYS) do known_data_key[key] = true end
 
 --- Global settings defaults (the `settings` sub-table).
 Settings.DEFAULTS = {
     orientation = 0,                 -- Screen.DEVICE_ROTATED_UPRIGHT, used as the app default
     keyboard_always_visible = false,
     zoom_mode = "fit",               -- "fit", "fit_with_keyboard", or a numeric scale factor
-    enable_tight = false,            -- opt-in Tight encoding (not in RFC 6143; see README)
+    enable_tight = false,            -- opt-in Tight encoding (not in RFC 6143; see NOTES.txt)
 }
 
 --- Opens (and returns) the settings store at `path`.
@@ -35,12 +39,8 @@ Settings.DEFAULTS = {
 --- @treturn table settings object with fields `ls` (LuaSettings) and `data` (raw table)
 function Settings.open(path)
     local ls = LuaSettings:open(path)
-    local self = setmetatable({}, Settings)
-    self.ls = ls
-    self.data = ls.data
-    --- Normalise whatever was on disk before anybody reads it. The caller persists the
-    --- result (see `migrated`) so an upgraded file is written back once.
-    self.migrated = Settings.migrate(self.data)
+    local self = setmetatable({ ls = ls, data = ls.data }, Settings)
+    self:normalise()
     return self
 end
 
@@ -75,93 +75,51 @@ local function clean_profile(p)
         name = name,
         host = type(p.host) == "string" and p.host or "",
         port = port,
-        username = type(p.username) == "string" and p.username or "",
         password = type(p.password) == "string" and p.password or "",
     }
 end
 
---- Idempotent migration of a raw settings table, in place.
----
---- Fills missing keys from @{Settings.DEFAULTS}, coerces types, drops unknown profile
---- fields and renumbers the profile array without holes. Never raises.
---- @param data table
---- @treturn boolean whether anything was changed
-function Settings.migrate(data)
-    if type(data) ~= "table" then return false end
-    local changed = false
+--[[--
+Keeps a raw settings table in shape, in place.
 
-    local v = tonumber(data.settings_version) or 0
-    if v ~= Settings.SETTINGS_VERSION then changed = true end
-
-    if v < 1 then
-        -- Initial schema: nothing to convert, the version stamp is enough.
+Fills in missing global settings, drops settings and profiles that are not usable, and closes
+holes in the profile array. Never raises, so a broken file cannot keep the plugin from loading.
+]]
+function Settings:normalise()
+    if type(self.data) ~= "table" then
+        self.data = {}
     end
+    local data = self.data
 
-    -- Global settings sub-table.
-    if type(data.settings) ~= "table" then
-        data.settings = {}
-        changed = true
-    end
-    for key, default in pairs(Settings.DEFAULTS) do
-        if data.settings[key] == nil then
-            data.settings[key] = default
-            changed = true
-        else
-            local coerced = coerce_like(data.settings[key], default)
-            if coerced ~= data.settings[key] then
-                data.settings[key] = coerced
-                changed = true
-            end
+    for key in pairs(data) do
+        if not known_data_key[key] then
+            logger.dbg("vncviewer: dropping unknown settings key", key)
+            data[key] = nil
         end
+    end
+
+    if type(data.settings) ~= "table" then data.settings = {} end
+    for key, default in pairs(Settings.DEFAULTS) do
+        data.settings[key] = coerce_like(data.settings[key], default)
     end
     for key in pairs(data.settings) do
         if Settings.DEFAULTS[key] == nil then
             logger.dbg("vncviewer: dropping unknown setting", key)
             data.settings[key] = nil
-            changed = true
         end
     end
 
-    -- Connection profiles: clean, drop unusable entries, close array holes.
-    if type(data.profiles) ~= "table" then
-        data.profiles = {}
-        changed = true
-    else
-        local cleaned = {}
-        for _, p in ipairs(data.profiles) do
-            local c = clean_profile(p)
-            if c then
-                cleaned[#cleaned + 1] = c
-            else
-                changed = true
-            end
+    if type(data.profiles) ~= "table" then data.profiles = {} end
+    local cleaned = {}
+    for _, p in ipairs(data.profiles) do
+        local c = clean_profile(p)
+        if c then
+            cleaned[#cleaned + 1] = c
+        else
+            logger.dbg("vncviewer: dropping an unusable connection profile")
         end
-        -- Detect value changes (field drops/coercions) that ipairs count alone misses.
-        local known = {}
-        for _, f in ipairs(Settings.PROFILE_FIELDS) do known[f] = true end
-        local same = #cleaned == #data.profiles
-        for i = 1, #cleaned do
-            if not same then break end
-            local o = data.profiles[i]
-            for _, f in ipairs(Settings.PROFILE_FIELDS) do
-                if o[f] ~= cleaned[i][f] then same = false break end
-            end
-            if same then
-                for k in pairs(o) do
-                    if not known[k] then same = false break end
-                end
-            end
-        end
-        data.profiles = cleaned
-        if not same then changed = true end
     end
-
-    if tonumber(data.settings_version) ~= Settings.SETTINGS_VERSION then
-        data.settings_version = Settings.SETTINGS_VERSION
-        changed = true
-    end
-
-    return changed
+    data.profiles = cleaned
 end
 
 --- @treturn table array of connection profiles
@@ -180,7 +138,7 @@ end
 
 --- Adds or updates a profile, keyed by name.
 ---
---- @param p table profile (`name`, `host`, `port`, `username`, `password`)
+--- @param p table profile (`name`, `host`, `port`, `password`)
 --- @param existing_name string|nil name to replace; when nil, `p.name` must be unused
 --- @treturn boolean, string|nil true on success, else false and an error message
 function Settings:save_profile(p, existing_name)
@@ -222,8 +180,7 @@ function Settings:save_profile(p, existing_name)
     end
 
     local cleaned = clean_profile({
-        name = name, host = p.host, port = port,
-        username = p.username, password = p.password,
+        name = name, host = p.host, port = port, password = p.password,
     })
     if idx then
         profiles[idx] = cleaned
