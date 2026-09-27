@@ -460,6 +460,13 @@ end
 
 function Server:_adopt_client(sock)
     sock:settimeout(Server.IO_TIMEOUT)
+    -- Latency, not throughput: a reply leaves as several small writes (the update header, then each
+    -- rectangle's header and its payload), and with Nagle in the way the second and later of them
+    -- wait for the first one to be acknowledged - on a link with delayed ACKs that is tens of
+    -- milliseconds added to every update, every empty answer and every fence reply, for a message
+    -- that is a few dozen bytes anyway. A viewer turns it off for the same reason, and so does the
+    -- client half of this plugin (@{vnc.session}'s connect).
+    sock:setoption("tcp-nodelay", true)
     local client = {
         sock = sock,
         rx = {},                 -- incoming byte chunks, joined lazily
