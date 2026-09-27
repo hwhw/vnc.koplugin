@@ -27,13 +27,22 @@ Session.__index = Session
 
 -- Seconds between poll ticks while attached.
 Session.POLL_INTERVAL = 0.05
--- Hard caps so a single tick can never monopolise the UI thread.
-Session.MAX_BYTES_PER_TICK = 262144
-Session.MAX_STEPS_PER_TICK = 200
+-- Caps so a single tick can never monopolise the UI thread. The CPU budget is the one that
+-- matters: decoding is step-heavy (Hextile yields once per tiny read), so counting protocol
+-- steps, rather than time, throttled a first frame down to a few thousand steps/second and
+-- made it appear many seconds late.
+Session.MAX_BYTES_PER_TICK = 1048576
+Session.MAX_CPU_PER_TICK = 0.03
+-- Belt and braces: a pathological peer must not spin forever inside one tick.
+Session.MAX_STEPS_PER_TICK = 1000000
 -- Wall-clock budget for the synchronous part of a handshake, and the socket timeout used
 -- while it runs.
 Session.HANDSHAKE_TIMEOUT = 20
 Session.HANDSHAKE_SOCKET_TIMEOUT = 5
+-- Turning Wi-Fi on is asynchronous, and NetworkMgr can be left with a pending attempt of its
+-- own (it then just reports EBUSY and never calls us back). Never leave the user staring at a
+-- "connecting" that cannot finish.
+Session.WIFI_WAIT_TIMEOUT = 30
 
 --[[--
 Creates a session. Nothing is opened until @{Session:connect} is called.
@@ -124,7 +133,9 @@ function Session:connect(callback)
         if status == false then
             self.wifi_was_on = nil
             self:_fail("could not turn on Wi-Fi")
+            return
         end
+        self:_watch_wifi()
         return
     end
     self:_do_connect()
@@ -137,6 +148,17 @@ function Session:_finish_connect(ok, err)
         local ok2, e = pcall(cb, ok, err)
         if not ok2 then logger.warn("vncviewer: connect callback failed:", e) end
     end
+end
+
+--- Fails the attempt if the asynchronous Wi-Fi path never calls us back.
+function Session:_watch_wifi()
+    self._attempt = (self._attempt or 0) + 1
+    local attempt = self._attempt
+    UIManager:scheduleIn(Session.WIFI_WAIT_TIMEOUT, function()
+        if self._attempt == attempt and self.state == "connecting" then
+            self:_fail(string.format("timed out after %ds waiting for Wi-Fi", Session.WIFI_WAIT_TIMEOUT))
+        end
+    end)
 end
 
 function Session:_do_connect()
@@ -286,6 +308,7 @@ function Session:_pump(stop_connected)
     end
 
     local budget = Session.MAX_BYTES_PER_TICK
+    local cpu_deadline = os.clock() + Session.MAX_CPU_PER_TICK
     local steps = Session.MAX_STEPS_PER_TICK
     while steps > 0 do
         steps = steps - 1
@@ -332,7 +355,7 @@ function Session:_pump(stop_connected)
                 return "error"
             end
         end
-        if budget <= 0 then return "again" end
+        if budget <= 0 or os.clock() >= cpu_deadline then return "again" end
     end
     return "again"
 end

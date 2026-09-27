@@ -200,7 +200,10 @@ function MenuBuilder.open(app)
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
-        close_callback = function() app:_sync_keyboard_later() end,
+        close_callback = function()
+            app.menu = nil
+            app:_sync_keyboard_later()
+        end,
     }
     UIManager:show(menu)
     return menu

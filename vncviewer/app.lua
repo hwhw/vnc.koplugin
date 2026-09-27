@@ -192,6 +192,8 @@ function ViewerApp:on_bell()
 end
 
 function ViewerApp:onCloseWidget()
+    -- never leave our own menu orphaned on the window stack
+    self:close_menu()
     if self.vk then
         if self.vk:isVisible() then UIManager:close(self.vk) end
         self.vk_visible = false
@@ -495,7 +497,18 @@ end
 -- ---------------------------------------------------------------- menu / lifecycle
 
 function ViewerApp:open_menu()
-    require("vncviewer/menu").open(self)
+    if self.menu then return self.menu end
+    self.menu = require("vncviewer/menu").open(self)
+    return self.menu
+end
+
+--- Closes the in-app menu when it is open.
+function ViewerApp:close_menu()
+    if self.menu then
+        local menu = self.menu
+        self.menu = nil
+        UIManager:close(menu)
+    end
 end
 
 function ViewerApp:disconnect_session()
