@@ -271,6 +271,10 @@ end
 function ViewerApp:onCloseWidget()
     -- never leave our own menu orphaned on the window stack
     self:close_menu()
+    if self._text_input_asserted then
+        self._text_input_asserted = false
+        Device:stopTextInput()
+    end
     if self.vk then
         if self.vk:isVisible() then UIManager:close(self.vk) end
         self.vk_visible = false
@@ -442,6 +446,34 @@ end
 -- ---------------------------------------------------------------- physical keyboard
 
 --[[--
+Makes sure the platform delivers *text*, not just key events.
+
+SDL 3 only sends `SDL_EVENT_TEXT_INPUT` after `SDL_StartTextInput()` ("Text input events are not
+received by default", c.f. SDL_keyboard.h), and KOReader calls it from `InputText`/`InputDialog`
+only, i.e. never while this viewer is up. Without this, typing on a hardware keyboard would
+produce key events we deliberately ignore (the characters belong to the text input stream) and
+nothing would reach the remote at all.
+]]
+function ViewerApp:_ensure_text_input()
+    if self._text_input_asserted then return end
+    self._text_input_asserted = true
+    Device:startTextInput()
+end
+
+--[[--
+Re-asserts text input after one of our own popups closed: the connection editor (and any other
+KOReader text field) pairs `startTextInput` with `stopTextInput`, and would leave it off.
+]]
+function ViewerApp:reassert_text_input()
+    self._text_input_asserted = false
+    self:_ensure_text_input()
+end
+
+function ViewerApp:onShow()
+    self:_ensure_text_input()
+end
+
+--[[--
 True for the one key we keep for ourselves: KOReader's `Menu` key opens (and closes) our menu,
 which is also how a keyboard-only device reaches it. Everything else is forwarded to the remote
 desktop — including Escape/Back, which is what a VNC client is expected to do; leaving the
@@ -458,6 +490,7 @@ function ViewerApp:_back_leaves(key)
 end
 
 function ViewerApp:onKeyPress(key)
+    self:_ensure_text_input()
     if self:_is_menu_key(key) then
         self:toggle_menu()
         return true
@@ -551,6 +584,7 @@ end
 --- forcing the setting off here would close it again right away.
 function ViewerApp:_sync_keyboard_later()
     UIManager:nextTick(function()
+        self:reassert_text_input()
         if self.settings.keyboard_always_visible then
             self:set_keyboard_visible(true)
         end

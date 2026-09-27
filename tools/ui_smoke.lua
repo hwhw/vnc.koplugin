@@ -468,6 +468,57 @@ check("menu_keyboard_items_work", function()
     remote:free()
 end)
 
+check("text_input_reaches_the_remote", function()
+    -- SDL 3 only delivers SDL_EVENT_TEXT_INPUT after SDL_StartTextInput() ("not received by
+    -- default"), and KOReader's input widgets are the only core callers of it. The viewer must
+    -- therefore enable it itself, or typing on a hardware keyboard reaches nobody.
+    local started, stopped = 0, 0
+    local original_start, original_stop = Device.startTextInput, Device.stopTextInput
+    Device.startTextInput = function() started = started + 1 end
+    Device.stopTextInput = function() stopped = stopped + 1 end
+
+    local ok, err = pcall(function()
+        local app, remote, sent = new_app()
+        assert_true(started == 1, "showing the viewer must enable platform text input")
+        assert_true(stopped == 0, "and must not disable it")
+
+        -- What SDL 3's backend does afterwards: the device's SDL event handler turns
+        -- SDL_EVENT_TEXT_INPUT into a TextInput event for the widget stack.
+        local SDL_EVENT_TEXT_INPUT = 0x303
+        Device.input:handleSdlEv({ code = SDL_EVENT_TEXT_INPUT, value = "hi" })
+        assert_true(#sent.key == 4, "typing must reach the remote, got " .. #sent.key .. " key events")
+        assert_true(sent.key[1].keysym == 0x68 and sent.key[1].down == true, "h down")
+        assert_true(sent.key[2].keysym == 0x68 and sent.key[2].down == false, "h up")
+        assert_true(sent.key[3].keysym == 0x69 and sent.key[4].keysym == 0x69, "i down/up")
+
+        -- the second character set: a real keypress must not re-enable it over and over
+        Device.input:handleSdlEv({ code = SDL_EVENT_TEXT_INPUT, value = "A" })
+        assert_true(started == 1, "text input must be asserted once, not per key")
+        sent.key = {}
+        app:onKeyPress(require("device/key"):new("Left", {}))
+        assert_true(started == 1, "and a key event must not re-assert it either")
+        assert_true(#sent.key == 1, "while still forwarding the key")
+
+        -- one of our own dialogs (a text field) turns it off: we must get it back
+        Device.stopTextInput()                      -- as InputText:onCloseWidget would
+        assert_true(stopped == 1, "the simulated dialog turned text input off")
+        app:reassert_text_input()
+        assert_true(started == 2, "a closed dialog must lead to a re-assert")
+
+        sent.key = {}
+        Device.input:handleSdlEv({ code = SDL_EVENT_TEXT_INPUT, value = "ok" })
+        assert_true(#sent.key == 4, "and typing must work again")
+
+        -- closing the viewer hands text input back
+        app:onCloseWidget()
+        assert_true(stopped == 2, "closing the viewer must disable platform text input again")
+        remote:free()
+    end)
+
+    Device.startTextInput, Device.stopTextInput = original_start, original_stop
+    if not ok then error(err) end
+end)
+
 check("keys_forward_to_the_remote", function()
     local Key = require("device/key")
     local app, remote, sent = new_app()
