@@ -1303,6 +1303,69 @@ check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", func
     if not ok then error(err, 0) end
 end)
 
+check("server_serves_a_client_that_asks_for_more_than_the_screen", function()
+    -- Viewers exist that send 65535x65535 to mean "the whole screen". The requested region (and
+    -- the region a continuous-updates client names) has to be clamped to the framebuffer before
+    -- anything sizes buffers from it: handed on unclamped, it reaches the encoder, which allocates
+    -- four bytes per pixel for the rectangle it is given, so 65535x65535 asks for tens of
+    -- gigabytes - the connection dies, and with it the only frame the client had. That is a
+    -- perfectly good "the first frame arrived and then nothing ever did" for a viewer that asks
+    -- for its region that way.
+    local Server = require("vnc/server")
+
+    local server, port
+    for candidate = 5921, 5929 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        -- A non-incremental request for far more than the screen must be answered with the screen,
+        -- not with the rectangle as asked for.
+        cli:send(client.request(false, 0, 0, 0xFFFF, 0xFFFF))
+        local nrects, rects = client.read_update(plane)
+        assert_true(nrects >= 1, "a 65535x65535 request must be answered with the screen")
+        assert_true(rects[1].x == 0 and rects[1].y == 0 and rects[1].w == sw and rects[1].h == sh,
+            string.format("an oversized request must be clamped to the screen, got %d,%d %dx%d of %dx%d",
+                rects[1].x, rects[1].y, rects[1].w, rects[1].h, sw, sh))
+        local r0, g0, b0 = get(plane, 16, 16)
+        assert_true(r0 < 60 and g0 < 60 and b0 < 60, "and the screen it does have must be in it")
+
+        -- ... and the client must still be connected, serving the changes it asks about.
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        cli:send(client.request(true, 0, 0, 0xFFFF, 0xFFFF))
+        assert_true(client.read_update(plane) >= 1,
+            "an oversized incremental request must still be served the change")
+        local r1, g1, b1 = get(plane, 16, 16)
+        assert_true(r1 > 200 and g1 > 200 and b1 > 200, "and its pixels must arrive")
+
+        -- A region that starts outside the screen is read as the whole screen, not as an error.
+        cli:send(client.request(false, 65000, 65000, 0xFFFF, 0xFFFF))
+        local far = client.read_update(plane)
+        assert_true(far >= 1, "a request aimed outside the screen must be answered with the screen")
+
+        print(string.format("   [clamp] 65535x65535 -> %d,%d %dx%d of a %dx%d screen; the client"
+            .. " stayed connected and got its change",
+            rects[1].x, rects[1].y, rects[1].w, rects[1].h, sw, sh))
+        plane:free()
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
 check("server_survives_a_wrap_of_the_refresh_chain", function()
     -- Another plugin may wrap UIManager._refresh after us. A stop then cannot take our hook out of
     -- the chain, and a later start must neither chain our hook to itself (that recurses until the

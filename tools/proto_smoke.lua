@@ -39,8 +39,10 @@ local Protocol = require("vnc/protocol")
 local bxor = bit.bxor
 
 local TMP = "/tmp/vncv_smoke"
-for _, a in ipairs(arg or {}) do
-    local v = a:match("^%-%-tmp=(.+)$")
+for i, a in ipairs(arg or {}) do
+    -- Both spellings: `--tmp=<path>` and `--tmp <path>` (the documented command uses the latter,
+    -- which an `=`-only parser silently ignored, leaving the mock's logs in the built-in path).
+    local v = a:match("^%-%-tmp=(.+)$") or (a == "--tmp" and (arg or {})[i + 1] or nil)
     if v then TMP = v end
 end
 local tools_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]*$") or "."

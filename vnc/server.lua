@@ -282,6 +282,21 @@ end
 --- past it would drop it for good - the client would be told "nothing new" forever while the
 --- screen kept changing.
 function Server:_get_rects(client, region, full)
+    -- A client may ask for more than the framebuffer - some viewers send 65535x65535 to mean "the
+    -- whole screen" - and the region a continuous-updates client names arrives the same way.
+    -- Clamp it here, where both paths meet: handed on unclamped, the region reaches the encoder,
+    -- which sizes its buffers from the rectangle it is given (four bytes per pixel), so a
+    -- 65535x65535 request asks for tens of gigabytes and takes the connection - and the frame the
+    -- client already had - down with it. A region that starts outside the screen is read as the
+    -- whole screen, which is what such a client means.
+    local sw, sh = self:_screen_size()
+    local x = math.max(0, math.min(region.x, sw))
+    local y = math.max(0, math.min(region.y, sh))
+    if x >= sw or y >= sh then
+        region = { x = 0, y = 0, w = sw, h = sh }
+    else
+        region = { x = x, y = y, w = math.min(region.w, sw - x), h = math.min(region.h, sh - y) }
+    end
     local out = {}
     local sent = client.sent_gen
     -- A client that has been sent nothing yet (or has fallen behind the eviction window) needs a

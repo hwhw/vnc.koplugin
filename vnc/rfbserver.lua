@@ -50,6 +50,21 @@ Server.CLIENT_ENABLE_CONTINUOUS_UPDATES = 150
 Server.CLIENT_FENCE = 248
 Server.CLIENT_SET_DESKTOP_SIZE = 251
 
+--- Names for the client messages this server reads (RFC 6143's five, plus the community ones
+--- above), for the per-message debug log in @{Server:_message_loop}: a viewer that stops getting
+--- updates is debugged from the *sequence* of messages it sends, which is otherwise invisible.
+local CLIENT_MESSAGE_NAMES = {
+    [0] = "SetPixelFormat",
+    [2] = "SetEncodings",
+    [3] = "FramebufferUpdateRequest",
+    [4] = "KeyEvent",
+    [5] = "PointerEvent",
+    [6] = "ClientCutText",
+    [Server.CLIENT_ENABLE_CONTINUOUS_UPDATES] = "EnableContinuousUpdates",
+    [Server.CLIENT_FENCE] = "Fence",
+    [Server.CLIENT_SET_DESKTOP_SIZE] = "SetDesktopSize",
+}
+
 --[[--
 Creates the server side of one client connection.
 
@@ -363,6 +378,7 @@ function Server:_send_update(rects)
     header:u8(0)
     header:u16(#encoded)
     self:_write(header:tostring())
+    logger.dbg(string.format("vnc: sending FramebufferUpdate with %d rectangle(s)", #encoded))
 
     -- Each rectangle's header is followed immediately by its data (RFC 6143 §7.6.1); writing all
     -- headers first would misalign everything after the first rectangle's payload.
@@ -375,6 +391,8 @@ function Server:_send_update(rects)
         rh:u32(e.encoding)         -- u32() wraps, so pseudo-encodings stay signed on the wire
         self:_write(rh:tostring())
         if e.payload then self:_write(e.payload) end
+        logger.dbg(string.format("vnc:   rect %d,%d %dx%d encoding %d",
+            e.rect.x, e.rect.y, e.rect.w, e.rect.h, e.encoding))
     end
 end
 
@@ -403,6 +421,10 @@ function Server:_message_loop()
     local r = self.reader
     while true do
         local msg = r:u8()
+        -- The sequence of messages a viewer sends is the only way to see, from this side, why a
+        -- viewer that got its first frame stopped asking for the next one.
+        logger.dbg(string.format("vnc: client message %d (%s)", msg,
+            CLIENT_MESSAGE_NAMES[msg] or "unknown"))
         if msg == 0 then
             self:_read_pixel_format()
         elseif msg == 2 then
