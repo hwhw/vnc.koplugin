@@ -40,7 +40,20 @@ vncviewer/app.lua         The full-screen viewer widget: canvas, gestures, on-sc
 vncviewer/menu.lua        The in-app menu.
 vncviewer/dialogs.lua     Connection list, per-connection actions, profile editor.
 vncviewer/keyboard.lua    KOReader's VirtualKeyboard wired to RFB key events via a stub inputbox.
-vncviewer/settings.lua    LuaSettings wrapper: profiles + global settings.
+vncviewer/settings.lua    LuaSettings wrapper: profiles + global settings + the server section.
+
+The server half (the plugin can also serve KOReader's own screen):
+vncviewer/rfbserver.lua   RFB 3.8 *server* state machine, transport agnostic. The mirror of
+                          protocol.lua: coroutine, ("need", n) yields, plus an ("idle") yield
+                          when a client asks for an update while nothing has changed (so the
+                          request is held instead of answered with an empty update, which would
+                          make the client ask again at once and busy-loop).
+vncviewer/serverenc.lua   Server-side encoders (Raw, RRE, Hextile, ZRLE) and the conversion from
+                          whatever BlitBuffer type the screen is to whatever pixel format a
+                          client asks for.
+vncviewer/server.lua      The runtime: LuaSocket listener, one protocol instance per client, the
+                          poll task, screen capture, dirty rectangles and input injection.
+vncviewer/servermenu.lua  The "VNC server" section of KOReader's Network menu.
 
 tools/mock_vnc_server.py  Test fixture: an RFB 3.8 server in Python (all encodings, both security
                           types, deterministic patterns, logs every client message).
@@ -48,6 +61,12 @@ tools/proto_smoke.lua     Headless protocol tests (drives the real protocol stac
 tools/ui_smoke.lua        Headless UI tests (real plugin, dialogs and viewer widget, no KOReader
                           process, no server).
 tools/tight_jpeg.b64      The fixed 32x32 JPEG the mock serves for its Tight JPEG rectangle.
+tools/mock_vnc_client.py  An independent Python RFB 3.8 *client* fixture (decodes every encoding
+                          itself, can send input) - used to validate the server half against
+                          something that is not our own code.
+tools/server_smoke.lua    Headless tests for the server: pixel formats, encoders against our own
+                          decoders, the protocol against our own client, the real socket path and
+                          input injection.
 
 
 DESIGN NOTES WORTH KNOWING
@@ -108,6 +127,31 @@ what ffi/zlib_h.lua does not (that one has compressBound/compress2/crc32/uncompr
 hand-rolled FFI, so there is no libcrypto/OpenSSL dependency, and LuaSocket is used for raw TCP
 only (no TLS, so LuaSec is not needed).
 
+Serving KOReader's screen. Two hooks make this cheap: the listener and per-client coroutines run
+from a UIManager:scheduleIn poll task (the same discipline as the client's socket), and dirty
+rectangles come from wrapping UIManager._refresh - the one place where a frame is complete, hence
+tear-free. Only rectangles are recorded there; encoding happens in the poll task, so a repaint
+never pays for a client's bandwidth. Rectangles carry a generation and each client remembers the
+one it was served with, so a client that lagged behind the eviction window is simply given a full
+frame instead of a partial one. A screen-size change (rotation) sends every client a DesktopSize
+rectangle (-223) and then a full update.
+
+Client input is injected at the level KOReader's own device backends use: EV_ABS/EV_SYN events
+into Device.input:handleTouchEv for pointer events (press/release becomes a tap, a tap-and-move a
+drag; there is no multi-touch in VNC), EV_KEY through the device's own event_map for named keys
+(so the keysym -> KOReader key name mapping is device independent), and TextInput events for typed
+text. VNC Authentication reuses des.lua and mirrors the client's construction exactly.
+
+Two LuaSocket traps this hit, worth remembering: receive(n) only returns once it has all n bytes,
+so a non-blocking receive of a large chunk always "times out" with the data still in the kernel
+(read exactly the bytes the protocol owes, and give the socket a short positive timeout instead of
+zero), and a send on a zero-timeout socket can be dropped silently. Also: FFI arrays are 0-based
+while the encoders index pixels 1..count, so the pixel-value array is allocated one slot larger.
+
+The server is off by default; it is started from the Network menu, and the menu carries the only
+UI it has. Its Kindle firewall hole follows httpinspector.koplugin (there is no sshd plugin in this
+KOReader to follow).
+
 KOReader internals relied on (could change under us): UIManager._window_stack (for "is a popup
 above us"), UIManager:scheduleIn/unschedule/nextTick/setDirty, VirtualKeyboard's inputbox protocol
 and its showKeyboard/hideKeyboard/setVisibility, Screen:getSize/setRotationMode, the
@@ -156,6 +200,20 @@ platform text input is enabled exactly while the viewer is shown, typed text and
 reach the remote (through KOReader's own SDL event handler), and the settings store survives a
 hand-edited or empty file. `KO_HOME` is needed because KOReader's widget cache lives under it.
 
+Server half (headless):
+
+    PLUGIN=~/.config/koreader/plugins/vncviewer.koplugin
+    cd /usr/lib/koreader && \
+      KO_HOME=/tmp/vncv_server_home \
+      LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/server_smoke.lua"
+
+It checks the pixel-format packing byte for byte, then round-trips every encoder through the
+client's own decoders, then drives the server protocol against the client protocol in process
+(including both VNC Authentication outcomes), then the real runtime over a TCP socket (listener,
+poll task, capture hook, encode, decode, pixels), and finally that a client PointerEvent becomes a
+KOReader gesture.
+
 Live end-to-end (GUI): run the mock, run KOReader, drive the plugin through KOReader's HTTP
 inspector (port 8989, httpinspector.autostart = true):
 
@@ -181,6 +239,12 @@ device/screen/bb can assert placement and rendering exactly.
 
 WHAT HAS BEEN VERIFIED, AND WHAT HAS NOT
 ----------------------------------------
+
+Server side, verified live: the server started from the plugin's own API served KOReader's real
+1920x1014 screen to tools/mock_vnc_client.py (an independent decoder) as one ZRLE update, and
+stopped cleanly. In-process, the same frames are decoded by the plugin's own client protocol and
+compared pixel by pixel. Not verified against a third-party VNC viewer (none is installed here)
+and not on real e-ink hardware.
 
 Verified on a desktop with the SDL Emulator device, against tools/mock_vnc_server.py:
 all seven encodings rendering in the live GUI; pointer, key and text input reaching the server;

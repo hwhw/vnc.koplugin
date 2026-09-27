@@ -77,6 +77,33 @@ fits the whole remote screen into the space the keyboard leaves, and follows the
 Wi-Fi up, so reopening the viewer is instant. **Disconnect** closes the connection and restores
 Wi-Fi if the plugin turned it on.
 
+## Sharing this screen (VNC server)
+
+The plugin can also serve the other way round: KOReader's own screen as a VNC desktop, so a
+computer elsewhere can watch what your reader is showing and drive it with its mouse and keyboard.
+
+It is **off by default and never starts on its own**. Turn it on in KOReader's *Network* menu:
+**VNC server** — the entry is checked while it runs and opens a submenu with
+
+- **Start/Stop VNC server**,
+- a status line (the address it listens on, and how many clients are connected),
+- **IP address** — `0.0.0.0` (the default) serves every interface, `127.0.0.1` only this device,
+- **Port** — 5900 by default,
+- **Password** — clients must then authenticate (VNC Authentication); leave it empty and anybody
+  who can reach the port gets in.
+
+On Kindles the plugin opens the port in the device's firewall while it runs (the same thing
+KOReader's own HTTP inspector does) and closes it again when you stop the server.
+
+Connect with any VNC viewer — `x11vnc`'s viewer, TigerVNC, Remmina, a phone app — to
+`<reader-ip>:5900`. You see KOReader's screen; clicking, dragging and typing act on the reader.
+Everything KOReader can do is therefore remote-controllable, so treat the password as important and
+prefer a tunnel (SSH, WireGuard) if the network is not yours. **The server is only reachable while
+it is started**, and KOReader must be running.
+
+What a client sees is KOReader's logical screen: the e-ink panel's own flash/ghosting is not
+reproduced, and the on-screen keyboard, dialogs and rotations are simply part of the picture.
+
 ## Settings
 
 Connection profiles live in a plain Lua file inside KOReader's settings directory,
@@ -93,6 +120,11 @@ return {
         ["zoom_mode"] = "fit",             -- "fit", "fit_with_keyboard" or 0.25 .. 4
         ["enable_tight"] = false,          -- opt-in Tight encoding, see below
     },
+    ["server"] = {                         -- the VNC server (Network menu); 0.0.0.0 = any interface
+        ["ip"] = "0.0.0.0",
+        ["port"] = 5900,
+        ["password"] = "",                 -- empty = no authentication at all
+    },
 }
 ```
 
@@ -107,7 +139,7 @@ loaded, so a broken file does not keep the plugin from starting.
 ## Server compatibility
 
 - RFB 3.8 with security type *None* or *VNC Authentication* (password). No TLS/VeNCrypt/SASL, so
-  servers that require those cannot be used.
+  servers that require those cannot be used — as a client *and* as the server above.
 - Encodings: ZRLE, TRLE, Hextile, RRE, CopyRect and Raw — all of RFC 6143 — plus DesktopSize
   (servers that resize their desktop are followed automatically).
 - **Tight** compression is implemented but **off by default**: it is not part of RFC 6143 and

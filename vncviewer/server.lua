@@ -39,6 +39,11 @@ local Server = {}
 Server.__index = Server
 
 Server.POLL_INTERVAL = 0.05          -- seconds between socket services
+-- Client sockets use a short *blocking* timeout rather than a non-blocking zero one: LuaSocket's
+-- receive(n) demands all n bytes and returns nil (with "timeout") even when some of them are
+-- already waiting, so a zero timeout would never read anything. Reads only happen while the
+-- protocol actually owes bytes, so an idle client costs nothing.
+Server.IO_TIMEOUT = 0.05
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
@@ -302,7 +307,7 @@ function Server:_accept()
 end
 
 function Server:_adopt_client(sock)
-    sock:settimeout(0)
+    sock:settimeout(Server.IO_TIMEOUT)
     local client = {
         sock = sock,
         rx = {},                 -- incoming byte chunks, joined lazily
@@ -411,11 +416,18 @@ function Server:_service_client(client)
     if client.dropped then return end
     local sock = client.sock
 
-    -- read (bounded per tick)
+    -- Read (bounded per tick). Ask for exactly what the protocol still owes: LuaSocket's
+    -- receive(n) only returns once it has all n bytes, so asking for a full chunk would stall
+    -- on any message smaller than that.
     local budget = 4
     while budget > 0 and (not client.pending or client.rx_len < client.pending) do
         budget = budget - 1
-        local data, err = sock:receive(Server.READ_CHUNK)
+        local want = Server.READ_CHUNK
+        if client.pending then
+            want = math.min(client.pending - client.rx_len, Server.READ_CHUNK)
+        end
+        if want <= 0 then break end
+        local data, err = sock:receive(want)
         if data and #data > 0 then
             client.rx[#client.rx + 1] = data
             client.rx_len = client.rx_len + #data

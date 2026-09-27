@@ -321,20 +321,33 @@ function Server:_collect_rects(x, y, w, h, full)
 end
 
 function Server:_send_update(rects)
+    -- Encode first: the rectangle headers carry the encoding each rectangle actually ended up
+    -- with, and the encoder decides that (it may fall back to Raw, for instance).
+    local encoded = {}
+    for i, rect in ipairs(rects) do
+        local encoding = rect.encoding or 0
+        local payload
+        if encoding ~= Server.PSEUDO_DESKTOP_SIZE and encoding ~= Server.PSEUDO_LAST_RECT then
+            encoding, payload = self.encode(self.client, rect)
+        end
+        encoded[i] = { rect = rect, encoding = encoding, payload = payload }
+    end
+
     local header = Util.writer()
-    header:u8(0):u8(0):u16(#rects)
-    for _, rect in ipairs(rects) do
-        header:u16(rect.x):u16(rect.y):u16(rect.w):u16(rect.h)
-        header:u32(rect.encoding or 0)      -- u32() wraps, so pseudo-encodings stay signed on the wire
+    header:u8(0)
+    header:u8(0)
+    header:u16(#encoded)
+    for _, e in ipairs(encoded) do
+        header:u16(e.rect.x)
+        header:u16(e.rect.y)
+        header:u16(e.rect.w)
+        header:u16(e.rect.h)
+        header:u32(e.encoding)     -- u32() wraps, so pseudo-encodings stay signed on the wire
     end
     self:_write(header:tostring())
 
-    for _, rect in ipairs(rects) do
-        local encoding = rect.encoding or 0
-        if encoding ~= Server.PSEUDO_DESKTOP_SIZE and encoding ~= Server.PSEUDO_LAST_RECT then
-            local _, payload = self.encode(self.client, rect)
-            self:_write(payload)
-        end
+    for _, e in ipairs(encoded) do
+        if e.payload then self:_write(e.payload) end
     end
 end
 

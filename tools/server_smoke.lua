@@ -521,7 +521,9 @@ check("server_serves_the_screen_over_a_socket", function()
                 socket.sleep(0.02)
             end
         end
-        cli:settimeout(0)
+        -- A small positive timeout: non-blocking sends on a fresh socket can be dropped
+        -- silently, and expect() below treats "timeout" as "pump the server and retry".
+        cli:settimeout(0.2)
         local function expect(n)
             local deadline = os.time() + 5
             local data, e
@@ -532,7 +534,7 @@ check("server_serves_the_screen_over_a_socket", function()
                 server:_poll()
                 socket.sleep(0.01)
             end
-            assert_true(data ~= nil, "short read: " .. tostring(e))
+            assert_true(data ~= nil, string.format("short read of %d bytes: %s", n, tostring(e)))
             return data
         end
 
@@ -546,12 +548,14 @@ check("server_serves_the_screen_over_a_socket", function()
         -- 3.8 answers the security choice even for None (RFC 6143 7.1.2)
         local result = expect(4)
         assert_true(result == "\0\0\0\0", "SecurityResult must be 0 (ok)")
-        pump_server(10)
-        local init = expect(24)
+        cli:send(string.char(1))                   -- ClientInit, shared
+        pump_server(4)
+        local init = expect(20)                  -- width, height, 16-byte PIXEL_FORMAT
         local sw = init:byte(1) * 256 + init:byte(2)
         local sh = init:byte(3) * 256 + init:byte(4)
         assert_true(sw == bb:getWidth() and sh == bb:getHeight(),
             string.format("ServerInit geometry %dx%d", sw, sh))
+        assert_true(init:byte(5) == 32 and init:byte(6) == 24, "32bpp/depth 24 by default")
         local name_len = expect(4)
         expect(name_len:byte(1) * 16777216 + name_len:byte(2) * 65536 + name_len:byte(3) * 256 + name_len:byte(4))
 
