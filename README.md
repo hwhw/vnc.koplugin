@@ -55,7 +55,13 @@ re-laid out from the current screen dimensions whenever they change, so it fits 
 just like everything else (rotations and screen resizes go through KOReader's generic
 `SetRotationMode` / `ScreenResize` events).
 
-A physical keyboard is forwarded to the remote, exactly as you would expect from a VNC client:
+A physical keyboard is forwarded to the remote, exactly as you would expect from a VNC client.
+While the viewer is on screen it calls `Device:startTextInput()`, because SDL 3 only delivers
+`SDL_EVENT_TEXT_INPUT` after that ("Text input events are not received by default",
+`SDL_keyboard.h`) and KOReader's own callers are its text fields; without it nothing typed would
+ever reach the plugin, and closing the viewer turns it back off.
+
+Forwarded are:
 printable characters (via `TextInput`, so keymaps and modifiers are already applied) plus the
 named keys — Backspace, Tab, Enter, Escape, the arrows, Home/End, Page Up/Down, Delete, Insert,
 F1–F12, Shift/Ctrl/Alt/Win — as X11 keysyms, including auto-repeat.
@@ -206,7 +212,9 @@ dismissable message, that the canvas covers the whole screen and follows a rotat
 the keyboard neither rescales nor moves the view, that the keyboard is re-laid out for the new
 screen dimensions after a rotation, that the menu swipe zone is registered while taps
 (anywhere, including the menu zone) still reach the remote desktop, that the menu's keyboard
-items really leave the keyboard in the state they promise, and that physical keys are forwarded
+items really leave the keyboard in the state they promise, that platform text input is enabled
+for as long as the viewer is up (and only then), that typing reaches the remote through
+KOReader's own SDL event handler, and that physical keys are forwarded
 (Escape/Enter/Tab/arrows/context-menu/F-keys, with releases and repeats) while the Menu key is
 kept back.
 
@@ -276,7 +284,10 @@ when it is off, restores it on disconnect, and never touches a Wi-Fi it did not 
 - **Multi-touch gestures cannot be synthesised** on the SDL3 build (no `ydotool`/`wtype`), so the
   gesture *handlers* are unit-tested but the gesture *detector* wiring (pinch/spread/rotate/
   two-finger drag/swipe) has to be exercised by hand on a touch device. The same applies to a
-  real tap in the menu zone.
+  real tap in the menu zone, and to pressing a physical key: there is no way to inject keyboard
+  input into KOReader from a script here (no `ydotool`/`wtype`, `/dev/uinput` not accessible, no
+  bare X server, and Xwayland ignores XTest keys for a window GNOME has not focused), so the
+  hardware-keyboard path is covered up to KOReader's own SDL event handler by `ui_smoke.lua`.
 - **Only the menu *swipe* is taken**: taps are never intercepted, so `DTAP_ZONE_MENU` (the top
   eighth) is only unavailable to the remote desktop for a *swipe down*; a tap or a drag there
   behaves like anywhere else on the screen.
