@@ -143,10 +143,16 @@ drag; there is no multi-touch in VNC), EV_KEY through the device's own event_map
 (so the keysym -> KOReader key name mapping is device independent), and TextInput events for typed
 text. VNC Authentication reuses des.lua and mirrors the client's construction exactly.
 
-Two LuaSocket traps this hit, worth remembering: receive(n) only returns once it has all n bytes,
+Four LuaSocket traps this hit, worth remembering: receive(n) only returns once it has all n bytes,
 so a non-blocking receive of a large chunk always "times out" with the data still in the kernel
 (read exactly the bytes the protocol owes, and give the socket a short positive timeout instead of
-zero), and a send on a zero-timeout socket can be dropped silently. Also: FFI arrays are 0-based
+zero), and a send on a zero-timeout socket can be dropped silently. Both a timed-out receive and a
+timed-out send still move bytes, and LuaSocket hands those back only in the third return value
+(receive's partial, send's last-byte index): ignoring them silently shifts every later message by
+the number of bytes lost, or sends the same bytes twice, while the connection stays up and nothing
+works. And RFB pointer input state (buttons, press_x/press_y, dragging) belongs to the input
+callback, which has to see the mask as it was *before* the message: storing it in the protocol layer
+first makes every press look like motion, so no click is ever injected. Also: FFI arrays are 0-based
 while the encoders index pixels 1..count, so the pixel-value array is allocated one slot larger.
 
 The server is off by default; it is started from the Network menu, and the menu carries the only
