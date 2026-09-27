@@ -852,7 +852,8 @@ check("client_input_reaches_a_widget", function()
     UIManager:show(widget)
     local ok, err = pcall(function()
         server:inject_pointer(120, 90, 1)
-        server:inject_pointer(120, 90, 0)
+        server:inject_pointer(121, 90, 1)               -- a mouse wobbles while clicking ...
+        server:inject_pointer(120, 90, 0)               -- ... and must still be a tap, not a drag
         server:inject_key(0xFF54, true)                 -- Down
         assert_true(received.tap ~= nil, "a client tap must reach a widget's onTap")
         assert_true(received.tap.x == 120 and received.tap.y == 90,

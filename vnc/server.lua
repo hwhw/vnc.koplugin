@@ -232,6 +232,8 @@ function Server:_record_dirty(mode, region)
     if rw <= 0 or rh <= 0 then return end
 
     self._gen = self._gen + 1
+    logger.dbg(string.format("vnc: recorded dirty region (mode %s): %d,%d %dx%d",
+        tostring(mode), x, y, rw, rh))
     local dirty = self._dirty
     dirty[#dirty + 1] = { gen = self._gen, x = x, y = y, w = rw, h = rh }
     while #dirty > Server.DIRTY_LIMIT do
@@ -248,6 +250,7 @@ function Server:_get_rects(client, region, full)
     if full or sent < self._evicted_gen then
         out[1] = { x = region.x, y = region.y, w = region.w, h = region.h }
         client.sent_gen = self._gen
+        logger.dbg("vnc: answering a client with the full region", region.w, region.h)
         return out
     end
     for _, d in ipairs(self._dirty) do
@@ -259,6 +262,11 @@ function Server:_get_rects(client, region, full)
         end
     end
     client.sent_gen = self._gen
+    if #out == 0 then
+        logger.dbg("vnc: nothing new for this client, sending an empty update")
+    else
+        logger.dbg("vnc: sending", #out, "changed rect(s) to a client")
+    end
     return out
 end
 
@@ -601,6 +609,16 @@ function Server:_on_pointer(client, x, y, mask)
         if down then
             -- A drag: the button is still down, so the position update is a touch move KOReader
             -- has to see. With no button down there is nothing to report (KOReader has no hover).
+            --
+            -- A mouse moves by a pixel or two while its button is pressed, and forwarding that
+            -- turns every click into a drag (KOReader cancels the tap and pans instead): motion is
+            -- only forwarded once the pointer has really left the press point.
+            if not client.dragging then
+                local dx = math.abs(x - (client.press_x or x))
+                local dy = math.abs(y - (client.press_y or y))
+                if dx + dy < 4 then return end
+                client.dragging = true
+            end
             self:_inject({
                 abs_ev(C.ABS_MT_POSITION_X, x),
                 abs_ev(C.ABS_MT_POSITION_Y, y),
@@ -611,6 +629,7 @@ function Server:_on_pointer(client, x, y, mask)
     end
     local slot = abs_ev(C.ABS_MT_SLOT, 0)
     if down then
+        client.press_x, client.press_y, client.dragging = x, y, false
         self:_inject({
             slot,
             abs_ev(C.ABS_MT_TRACKING_ID, 1),
