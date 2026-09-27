@@ -81,9 +81,14 @@ function Server.new(opts)
         _poll_task = nil,
     }, Server)
     self._inject_client = {}                 -- button state for Server:inject_pointer
+    -- Records the frame's dirty region and then does the refresh it wrapped. `_orig_refresh` is
+    -- always the *original* UIManager._refresh - never our own hook - so however the chain around
+    -- us is rearranged (a start after a stop somebody else wrapped, an unhook that could not
+    -- restore), this can neither call a nil nor call itself.
     self._refresh_hook = function(mgr, mode, region, dither)
         self:_record_dirty(mode, region)
-        return self._orig_refresh(mgr, mode, region, dither)
+        local orig = self._orig_refresh
+        if orig then return orig(mgr, mode, region, dither) end
     end
     self._poll_task = function() self:_poll() end
     return self
@@ -161,6 +166,11 @@ function Server:start()
     self:_firewall("add")
     self:_hook_refresh()
     self._gen, self._evicted_gen, self._dirty = 0, 0, {}
+    -- The generations just restarted from zero: a client that was somehow kept across the restart
+    -- must be told to expect a full frame, not to compare against its old `sent_gen`.
+    for _, client in pairs(self.clients) do
+        client.server.client.sent_gen = nil
+    end
     local sw, sh = self:_screen_size()
     self._screen_at = { sw, sh }
     UIManager:scheduleIn(Server.POLL_INTERVAL, self._poll_task)
@@ -203,23 +213,29 @@ end
 Wraps `UIManager._refresh`, KOReader's single "this frame is done" point.
 
 Only records rectangles here: encoding happens in the poll task, so a repaint never pays for a
-client's bandwidth. Other plugins may wrap the same function, so restoring is conditional on our
-own hook still being in place.
+client's bandwidth. Other plugins may wrap the same function, so `_orig_refresh` is captured once
+(the real `_refresh`) and kept across stop/start cycles: re-capturing it after somebody wrapped us
+would chain our hook to itself and recurse on every frame.
 ]]
 function Server:_hook_refresh()
-    if self._orig_refresh then return end
-    self._orig_refresh = UIManager._refresh
-    UIManager._refresh = self._refresh_hook
+    if not self._orig_refresh then
+        self._orig_refresh = UIManager._refresh
+    end
+    if UIManager._refresh ~= self._refresh_hook then
+        UIManager._refresh = self._refresh_hook
+    end
 end
 
 function Server:_unhook_refresh()
     if not self._orig_refresh then return end
     if UIManager._refresh == self._refresh_hook then
         UIManager._refresh = self._orig_refresh
+        self._orig_refresh = nil
     else
+        -- Somebody wrapped us: their hook still reaches ours, and ours still reaches the real
+        -- `_refresh`, so leave the chain alone (and keep `_orig_refresh` for a later start).
         logger.warn("vnc: UIManager._refresh was wrapped by somebody else; leaving it alone")
     end
-    self._orig_refresh = nil
 end
 
 --- Records what a refresh changed, as one generation-stamped rectangle.
@@ -254,24 +270,40 @@ function Server:_record_dirty(mode, region)
 end
 
 --- The rectangle list for one client's update (called by the protocol).
+---
+--- `sent_gen` may only ever advance over generations whose rectangle reached the client: the
+--- client's request covers `region` and nothing else, so a change it did not ask about (or that
+--- it only asked about in part) stays queued and is offered again on its next request. Advancing
+--- past it would drop it for good - the client would be told "nothing new" forever while the
+--- screen kept changing.
 function Server:_get_rects(client, region, full)
     local out = {}
-    local sent = client.sent_gen or 0
-    if full or sent < self._evicted_gen then
+    local sent = client.sent_gen
+    -- A client that has been sent nothing yet (or has fallen behind the eviction window) needs a
+    -- whole region: answering it with only the rectangles that happen to be dirty would show it
+    -- a mostly empty screen, and an *incremental* first request (some clients send one) an empty
+    -- update forever.
+    if full or sent == nil or sent < self._evicted_gen then
         out[1] = { x = region.x, y = region.y, w = region.w, h = region.h }
         client.sent_gen = self._gen
         logger.dbg("vnc: answering a client with the full region", region.w, region.h)
         return out
     end
+    local unsent_from = nil      -- oldest generation the client did not get in full
     for _, d in ipairs(self._dirty) do
         if d.gen > sent then
             local r = Util.intersect_rect(d, region)
             if r then
                 out[#out + 1] = { x = r.x, y = r.y, w = r.w, h = r.h }
+                if r.x ~= d.x or r.y ~= d.y or r.w ~= d.w or r.h ~= d.h then
+                    unsent_from = unsent_from and math.min(unsent_from, d.gen) or d.gen
+                end
+            else
+                unsent_from = unsent_from and math.min(unsent_from, d.gen) or d.gen
             end
         end
     end
-    client.sent_gen = self._gen
+    client.sent_gen = unsent_from and (unsent_from - 1) or self._gen
     if #out == 0 then
         logger.dbg("vnc: nothing new for this client, sending an empty update")
     else
@@ -461,10 +493,18 @@ function Server:_service_client(client)
         end
         if want <= 0 then break end
         sock:settimeout(client.state == "parked" and 0 or Server.IO_TIMEOUT)
-        local data, err = sock:receive(want)
+        local data, err, partial = sock:receive(want)
+        -- A timed-out read can still have received bytes, and LuaSocket hands those back *only*
+        -- in `partial`: dropping them would silently shift every later message by the number of
+        -- bytes lost, so the client's requests would be read as garbage (or never read again)
+        -- while the connection stayed up.
+        data = data or partial
         if data and #data > 0 then
             client.rx[#client.rx + 1] = data
             client.rx_len = client.rx_len + #data
+            -- `partial` only ever arrives together with a timeout: the socket has nothing more
+            -- waiting, so do not pay for another blocking read in this tick.
+            if err == "timeout" then break end
         elseif err == "timeout" then
             break
         else
@@ -481,6 +521,13 @@ function Server:_service_client(client)
     while client.tx_len > 0 and not client.dropped do
         local chunk = client.tx[1]
         local sent, err, last = sock:send(chunk, 1)
+        if not sent and err == "timeout" and type(last) == "number" and last > 0 then
+            -- A timed-out send still put the bytes up to `last` on the wire. Keeping them in the
+            -- queue would send them a second time on the next attempt, and the client would read
+            -- every later frame from the wrong offset - the corruption that looks like "the screen
+            -- stopped updating" while each rectangle was in fact sent.
+            sent = last
+        end
         if sent and sent > 0 then
             if sent >= #chunk then
                 table.remove(client.tx, 1)

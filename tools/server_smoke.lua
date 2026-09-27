@@ -824,6 +824,307 @@ check("server_serves_a_second_incremental_update", function()
     if not ok then error(err, 0) end
 end)
 
+-- ---------------------------------------------------------------- a client that asks incrementally
+
+--- The SetEncodings message announcing the one encoding these checks use: Raw, or ZRLE under
+--- VNC_TEST_ZRLE=1 like the other socket checks.
+local function set_encodings_wire()
+    return string.char(2, 0, 0, 1) ..
+        string.char(0, 0, 0, os.getenv("VNC_TEST_ZRLE") == "1" and 16 or 0)
+end
+
+--- Connects a raw socket client, completes the handshake (No security) and announces
+--- `encodings_wire` (a whole SetEncodings message). Returns the socket plus `request()` (builds a
+--- FramebufferUpdateRequest) and `read_update(plane)`, which reads one FramebufferUpdate, decodes
+--- every rectangle into `plane` and returns the rectangle count and their headers.
+local function connect_client(server, port, encodings_wire)
+    local socket = require("socket")
+    local cli = assert(socket.tcp())
+    cli:settimeout(0.2)
+    assert(cli:connect("127.0.0.1", port))
+    local function pump_and_read(n)
+        local deadline = os.time() + 5
+        local data, e
+        while os.time() <= deadline do
+            data, e = cli:receive(n)
+            if data then return data end
+            if e ~= "timeout" then break end
+            server:_poll()
+            socket.sleep(0.01)
+        end
+        assert_true(data ~= nil, string.format("short read of %d: %s", n, tostring(e)))
+        return data
+    end
+
+    assert_true(pump_and_read(12) == "RFB 003.008\n", "the server must announce 3.8")
+    cli:send("RFB 003.008\n")
+    local count = pump_and_read(1):byte()
+    pump_and_read(count)
+    cli:send(string.char(1))                        -- pick the None security type
+    pump_and_read(4)                                -- SecurityResult
+    cli:send(string.char(1))                        -- ClientInit, shared
+    pump_and_read(20)                               -- ServerInit geometry + pixel format
+    local name_len = pump_and_read(4)
+    pump_and_read(name_len:byte(1) * 16777216 + name_len:byte(2) * 65536
+        + name_len:byte(3) * 256 + name_len:byte(4))
+    cli:send(string.char(0) .. "\0\0\0" .. string.char(32, 24, 0, 1) ..
+        string.char(0, 255, 0, 255, 0, 255) .. string.char(0, 8, 16) .. "\0\0\0")
+    cli:send(encodings_wire)
+
+    local streams = Encodings.new_streams()
+    local function request(incremental, x, y, w, h)
+        return string.char(3, incremental and 1 or 0) ..
+            string.char(math.floor(x / 256), x % 256, math.floor(y / 256), y % 256) ..
+            string.char(math.floor(w / 256), w % 256, math.floor(h / 256), h % 256)
+    end
+    local function read_update(plane)
+        local head = pump_and_read(4)
+        assert_true(head:byte(1) == 0,
+            "expected a FramebufferUpdate, got message " .. head:byte(1))
+        local nrects = head:byte(3) * 256 + head:byte(4)
+        local rects = {}
+        for i = 1, nrects do
+            local r = pump_and_read(12)
+            local rect = {
+                x = r:byte(1) * 256 + r:byte(2),
+                y = r:byte(3) * 256 + r:byte(4),
+                w = r:byte(5) * 256 + r:byte(6),
+                h = r:byte(7) * 256 + r:byte(8),
+                enc = r:byte(9) * 16777216 + r:byte(10) * 65536 + r:byte(11) * 256 + r:byte(12),
+            }
+            local payload
+            if rect.enc == 16 then
+                local len_field = pump_and_read(4)
+                local n = len_field:byte(1) * 16777216 + len_field:byte(2) * 65536
+                    + len_field:byte(3) * 256 + len_field:byte(4)
+                assert_true(n > 0, "a ZRLE rectangle must carry compressed data")
+                payload = len_field .. pump_and_read(n)
+            else
+                assert_true(rect.enc == 0, "unexpected rectangle encoding " .. rect.enc)
+                payload = pump_and_read(rect.w * rect.h * 4)
+            end
+            local decoded, derr = Encodings.decode{
+                encoding = rect.enc, r = Util.mem_reader(payload), plane = plane,
+                -- the decoders write at the origin of the viewport they are given, so it is the
+                -- rectangle itself (this is how the client's own protocol.lua drives them)
+                vp = plane:viewport(rect.x, rect.y, rect.w, rect.h),
+                x = rect.x, y = rect.y, w = rect.w, h = rect.h, streams = streams,
+            }
+            assert_true(decoded, "decoding a rectangle failed: " .. tostring(derr))
+            rects[i] = rect
+        end
+        return nrects, rects
+    end
+    return { sock = cli, request = request, read_update = read_update }
+end
+
+check("server_sends_a_change_after_the_first_full_update", function()
+    -- The reported shape: the client takes the first full frame and then never gets another one,
+    -- although the screen keeps changing and the capture keeps recording it. One way into that
+    -- state is a client message that arrives in more than one TCP segment - a 10-byte request can
+    -- be split, and a clipboard or an encoding list certainly can. The bytes that did arrive must
+    -- be kept when the rest does not follow within the socket timeout: throwing them away shifts
+    -- every later message by the number of bytes lost, so requests are read from the wrong
+    -- offset, their region covers nothing, and every change answers "nothing new" for good while
+    -- the connection stays up and input still works.
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5941, 5949 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        -- take the first full update
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+        -- the screen changes and the refresh hook records it
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+
+        -- ... and the client asks for it, with its message split inside the x field: the server
+        -- reads the one byte it has, waits for the other, and must not drop the one it read.
+        local msg = client.request(true, 0, 0, sw, sh)
+        cli:send(msg:sub(1, 3))
+        for _ = 1, 3 do
+            server:_poll()                          -- reaches the two-byte read of x
+            socket.sleep(0.02)
+        end
+        socket.sleep(0.05)                          -- ... and times out there
+        cli:send(msg:sub(4))
+
+        assert_true(client.read_update(plane) >= 1, "the change must arrive as a rectangle")
+        local r1, g1, b1 = get(plane, 16, 16)
+        assert_true(r1 > 200 and g1 > 200 and b1 > 200, "the changed pixels must come through")
+        local r2, g2, b2 = get(plane, sw - 4, sh - 4)
+        assert_true(r2 < 60 and g2 < 60 and b2 < 60, "and the rest of the frame must stay intact")
+        plane:free()
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("server_gives_a_client_that_asks_incrementally_the_whole_screen", function()
+    -- A client that has been sent nothing yet must be given the whole screen even when its first
+    -- request is incremental (some clients send one): answering it with only the rectangles that
+    -- happen to be dirty hands it a patchwork, and with an empty update (nothing dirty yet) it
+    -- would sit in front of a blank screen forever. Every later change must then arrive normally.
+    local Server = require("vnc/server")
+
+    local server, port
+    for candidate = 5951, 5959 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        -- Paint the screen without telling the server about it: it has nothing recorded, which is
+        -- exactly what a client that connects to a static screen finds.
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local nrects, rects = client.read_update(plane)
+        assert_true(nrects >= 1, "a client that has seen nothing must be given the screen")
+        assert_true(rects[1].x == 0 and rects[1].y == 0
+            and rects[1].w == sw and rects[1].h == sh,
+            "and it must be the whole screen, not the dirty rectangles")
+        local r1, g1, b1 = get(plane, 16, 16)
+        assert_true(r1 > 200 and g1 > 200 and b1 > 200, "the painted rectangle must be in it")
+        local r2, g2, b2 = get(plane, sw - 4, sh - 4)
+        assert_true(r2 < 60 and g2 < 60 and b2 < 60, "and the untouched screen around it")
+
+        -- a change after that must arrive as an ordinary incremental update
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        cli:send(client.request(true, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the change must arrive")
+        plane:free()
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("server_keeps_a_change_a_client_did_not_ask_about", function()
+    -- A change outside the region a client asks about must not be marked as already sent. A client
+    -- that asks for one corner (its viewport, say) and later for the whole screen would otherwise
+    -- never be told about it - the change is dropped by the bookkeeping, not by the wire.
+    local Server = require("vnc/server")
+
+    local server, port
+    for candidate = 5961, 5969 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+        bb:paintRect(sw - 40, sh - 40, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = sw - 40, y = sh - 40, w = 16, h = 16 })
+
+        -- the client asks about a corner that does not contain the change ...
+        cli:send(client.request(true, 0, 0, 64, 64))
+        assert_true(client.read_update(plane) == 0, "nothing changed in that corner")
+
+        -- ... and then asks for the whole screen again: the change is still owed
+        cli:send(client.request(true, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1,
+            "a change the client did not ask about must not be marked as sent")
+        local r, g, b = get(plane, sw - 32, sh - 32)
+        assert_true(r > 200 and g > 200 and b > 200, "and its pixels must arrive")
+        plane:free()
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+check("server_survives_a_wrap_of_the_refresh_chain", function()
+    -- Another plugin may wrap UIManager._refresh after us. A stop then cannot take our hook out of
+    -- the chain, and a later start must neither chain our hook to itself (that recurses until the
+    -- stack blows on every frame) nor leave it calling a function that is no longer there.
+    local Server = require("vnc/server")
+
+    local real = UIManager._refresh
+    local reached = 0
+    UIManager._refresh = function(mgr, mode, region, dither)   -- the other plugin
+        reached = reached + 1
+        return real(mgr, mode, region, dither)
+    end
+
+    local server, port
+    for candidate = 5971, 5979 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        -- somebody wraps us, so our hook is no longer the outermost one
+        local hooked = UIManager._refresh
+        UIManager._refresh = function(mgr, mode, region, dither)
+            return hooked(mgr, mode, region, dither)
+        end
+
+        server:stop()
+        local ok_refresh, rerr = pcall(UIManager._refresh, UIManager, "fast",
+            Geom:new{ x = 0, y = 0, w = 8, h = 8 }, false)
+        assert_true(ok_refresh,
+            "a refresh after a stop that could not restore the chain must not fail: " .. tostring(rerr))
+
+        server:start()
+        local before = reached
+        ok_refresh, rerr = pcall(UIManager._refresh, UIManager, "fast",
+            Geom:new{ x = 0, y = 0, w = 8, h = 8 }, false)
+        assert_true(ok_refresh, "a refresh after a restart must not fail: " .. tostring(rerr))
+        -- (More than one call is normal: UIManager merges overlapping refreshes by re-entering
+        -- _refresh. What must not happen is the runaway recursion of our hook reaching itself.)
+        assert_true(reached > before and reached - before < 8,
+            "the refresh must reach the real one without recursing (" .. tostring(reached - before) .. ")")
+    end)
+
+    server:stop()
+    UIManager._refresh = real
+    if not ok then error(err, 0) end
+end)
+
 check("client_input_reaches_a_widget", function()
     -- The end of the chain: a tap and a key from a client must make a *real widget* on KOReader's
     -- window stack react. (The check below spies on UIManager:handleInputEvent, which only proves
