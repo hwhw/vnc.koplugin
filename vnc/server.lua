@@ -46,10 +46,6 @@ Server.POLL_INTERVAL = 0.05          -- seconds between socket services
 Server.IO_TIMEOUT = 0.05
 --- How long a held update request may block the client's other messages before the server sends
 --- an empty update to get back to reading them.
-Server.IDLE_FLUSH = 0.25
---- How long a client message may stay half-parsed before we give up on it and say so. A mis-read
---- length used to mean the coroutine waited forever, silently eating every later client message
---- (input included) as payload.
 Server.STALL_TIMEOUT = 10
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
@@ -378,7 +374,12 @@ function Server:_client_step(client)
             local kind, arg = step(client.server, data)
             self:_after_step(client, kind, arg)
         end
-    else
+    elseif client.state == "fresh" then
+        -- Start the state machine. A *parked* client must not be resumed here: it is waiting for
+        -- the update logic in `_poll` to wake it (with new content, or to flush), and resuming it
+        -- from the socket loop on every poll would re-park it at once and keep resetting that
+        -- timer - which is exactly how a client's keystrokes ended up queued behind a held
+        -- update request forever.
         local kind, arg = step(client.server, nil)
         self:_after_step(client, kind, arg)
     end
@@ -398,15 +399,6 @@ function Server:_after_step(client, kind, arg)
     elseif kind == nil then
         self:_drop_client(client, tostring(arg))
     end
-end
-
---- Whether this client has not been told about something that changed.
-function Server:_has_new_for(client)
-    local sent = client.sent_gen or 0
-    for _, d in ipairs(self._dirty) do
-        if d.gen > sent then return true end
-    end
-    return false
 end
 
 function Server:_take_rx(client, n)
@@ -527,16 +519,6 @@ function Server:_poll()
             end
         else
             client.pending_since = nil
-        end
-        if client.state == "parked" and not client.dropped then
-            local new = self:_has_new_for(client)
-            local stale = client.parked_at
-                and (socket.gettime() - client.parked_at) >= Server.IDLE_FLUSH
-            if new or stale then
-                client.state = "reading"
-                local kind, arg = client.server:step(stale and "flush" or nil)
-                self:_after_step(client, kind, arg)
-            end
         end
         ::continue_client::
     end

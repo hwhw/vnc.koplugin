@@ -713,6 +713,33 @@ check("server_serves_a_second_incremental_update", function()
         request(false)
         assert_true(read_update() >= 1, "the first update must carry the screen")
 
+        -- A client that has just asked for an update and got nothing (nothing had changed) must
+        -- still have its *later* messages - its keystrokes - acted upon immediately. If they only
+        -- arrive together with the next real update, a viewer's input looks dead until something
+        -- on the server happens to change.
+        do
+            local seen_key = false
+            local original_input_event = UIManager.handleInputEvent
+            UIManager.handleInputEvent = function(_, ev)
+                if tostring(ev.handler) == "onKeyPress" then seen_key = true end
+            end
+            local ok_held, held_err = pcall(function()
+                request(true)                        -- nothing dirty yet: the request is held
+                socket.sleep(0.05)
+                server:_poll()
+                cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))  -- KeyEvent Down
+                for _ = 1, 100 do                    -- ~2s, with no screen change at all
+                    server:_poll()
+                    socket.sleep(0.02)
+                    if seen_key then break end
+                end
+                assert_true(seen_key,
+                    "a keystroke must be acted on without waiting for a screen change")
+            end)
+            UIManager.handleInputEvent = original_input_event
+            if not ok_held then error(held_err, 0) end
+        end
+
         -- Keys and pointer events over the wire must reach KOReader's input handling.
         local injected = {}
         local original_input_event = UIManager.handleInputEvent

@@ -301,14 +301,14 @@ function Server:_handle_update_request()
     local x, y, w, h = r:u16(), r:u16(), r:u16(), r:u16()
 
     local rects = self:_collect_rects(x, y, w, h, not incremental)
-    while #rects == 0 and incremental do
-        -- Nothing changed: hold the request. The driver resumes us either when the screen has
-        -- changed (the yield returns nil) or after a short while (it passes "flush"), and the
-        -- latter is what keeps a client's keystrokes from being stuck behind an update: it makes
-        -- us send the (empty) update and return to reading messages.
-        local wake = coroutine.yield("idle")
-        rects = self:_collect_rects(x, y, w, h, false)
-        if #rects > 0 or wake == "flush" then break end
+    if #rects == 0 and incremental then
+        -- Nothing changed. Answer with an *empty* update instead of holding the request: the
+        -- state machine is one coroutine per client, so holding a request would also hold every
+        -- message the client sends afterwards - its keystrokes - until the screen happened to
+        -- change, which reads as "input does nothing". An empty update costs a few bytes, and the
+        -- client simply asks again.
+        self:_send_update({})
+        return
     end
     self:_send_update(rects)
 end
