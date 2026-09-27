@@ -65,7 +65,10 @@ Creates the server side of one client connection.
 ---   that client's pixel format and encoding
 --- @tparam[opt] function opts.get_colour_map -> 256 `{r, g, b}` entries, needed when a client asks
 ---   for a non-true-colour format (otherwise such a format is refused)
---- @tparam[opt] function opts.on_pointer `(x, y, mask, client)`
+--- @tparam[opt] function opts.on_pointer `(x, y, mask, client)`. This callback owns the client's
+---   input state (`buttons`, `press_x`/`press_y`, `dragging`, `pointer_x`/`pointer_y`): the message
+---   loop passes the PointerEvent through untouched, so the callback can see the mask *before* the
+---   message, which is the only way to tell a press or a release from motion.
 --- @tparam[opt] function opts.on_key `(keysym, down, client)`
 --- @tparam[opt] function opts.on_cut_text `(text, client)`
 --- @tparam[opt] function opts.on_ready `(client)` - handshake done, updates may be sent
@@ -93,6 +96,10 @@ function Server.new(opts)
             encodings = { 0 },         -- in the client's own preference order
             desktop_size_supported = false,
             last_rect_supported = false,
+            -- Input state. Owned, and kept up to date, by the `on_pointer` callback - the message
+            -- loop passes a PointerEvent through untouched so the callback can see the button mask
+            -- *change* (c.f., the msg == 5 branch in _message_loop, and Server:_on_pointer).
+            -- Initialised here so that shape is documented for a callback that runs early.
             pointer_x = 0,
             pointer_y = 0,
             buttons = 0,
@@ -385,8 +392,10 @@ function Server:_message_loop()
         elseif msg == 5 then
             local mask = r:u8()
             local x, y = r:u16(), r:u16()
-            self.client.pointer_x, self.client.pointer_y = x, y
-            self.client.buttons = mask
+            -- NOTE: the pointer state on self.client is deliberately *not* touched here. It is
+            -- owned by the on_pointer callback, which has to see the mask as it was *before* this
+            -- message to tell a press or a release from plain motion (c.f., Server:_on_pointer);
+            -- storing the new mask first would make every click look like motion.
             if self.on_pointer then self.on_pointer(x, y, mask, self.client) end
         elseif msg == 6 then
             r:bytes(3)                                  -- padding

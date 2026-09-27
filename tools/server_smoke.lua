@@ -767,6 +767,8 @@ check("server_serves_a_second_incremental_update", function()
             assert_true(#injected > 0, "no KOReader input event came out of the socket path")
             assert_true(saw_key, "a KeyEvent over the wire must become a KOReader key event, got "
                 .. table.concat(injected, ","))
+            assert_true(saw_gesture, "a PointerEvent over the wire must become a KOReader gesture, "
+                .. "got " .. table.concat(injected, ","))
 
             -- Messages a real viewer sends that RFC 6143 does not define. A server that closes
             -- the connection on one of them looks like a viewer whose input stops working as soon
@@ -1164,6 +1166,104 @@ check("client_input_reaches_a_widget", function()
             "a client key must reach a widget's onKeyPress, got " .. tostring(received.key))
     end)
     UIManager:close(widget)
+    if not ok then error(err, 0) end
+end)
+
+check("a_client_click_over_the_wire_reaches_a_widget", function()
+    -- The wire end of the chain: a PointerEvent that arrives over the socket, through the
+    -- protocol's per-client state, must make a *real widget* on the window stack react.
+    -- `client_input_reaches_a_widget` above drives Server:inject_pointer, which owns the button
+    -- state itself, so it cannot see the protocol layer pre-empting that state; this check goes
+    -- the way a viewer's click really arrives. (Before the msg == 5 branch stopped storing the
+    -- mask, no PointerEvent ever became a gesture, and this is the check that says so.)
+    local Server = require("vnc/server")
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    local GestureRange = require("ui/gesturerange")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5931, 5999 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local function full_screen()
+        return Geom:new{ x = 0, y = 0, w = 4000, h = 4000 }
+    end
+    local taps, moves = {}, {}
+    local widget = InputContainer:new{
+        dimen = Screen:getSize(),
+        disable_double_tap = true,
+        ges_events = {
+            Tap = { GestureRange:new{ ges = "tap", range = full_screen() } },
+            Pan = { GestureRange:new{ ges = "pan", range = full_screen() } },
+            Swipe = { GestureRange:new{ ges = "swipe", range = full_screen() } },
+        },
+    }
+    function widget:onTap(_, ges)
+        taps[#taps + 1] = { x = ges.pos.x, y = ges.pos.y }
+        return true
+    end
+    function widget:onPan(_, ges)
+        moves[#moves + 1] = ges.ges
+        return true
+    end
+    widget.onSwipe = widget.onPan
+    UIManager:show(widget)
+
+    local ok, err = pcall(function()
+        local conn = connect_client(server, port, set_encodings_wire())
+        local function pointer(mask, x, y)
+            return string.char(5, mask, math.floor(x / 256), x % 256, math.floor(y / 256), y % 256)
+        end
+        local function settle()
+            for _ = 1, 60 do
+                server:_poll()
+                socket.sleep(0.01)
+            end
+        end
+
+        -- A plain click: press then release, in place.
+        conn.sock:send(pointer(1, 120, 90))
+        conn.sock:send(pointer(0, 120, 90))
+        settle()
+        assert_true(#taps == 1,
+            "a click over the wire must reach a widget's onTap, got " .. #taps .. " tap(s)")
+        assert_true(taps[1].x == 120 and taps[1].y == 90,
+            string.format("the tap must land where the client clicked, got %s,%s",
+                tostring(taps[1].x), tostring(taps[1].y)))
+
+        -- The same click with the mouse wobbling a pixel or two while the button is held: under
+        -- the 4px drag threshold, so it must stay exactly one tap, at the release point, and the
+        -- motion must not be forwarded.
+        conn.sock:send(pointer(1, 200, 160))
+        conn.sock:send(pointer(1, 201, 160))                    -- 1px while held ...
+        conn.sock:send(pointer(1, 201, 161))                    -- ... 2px in total
+        conn.sock:send(pointer(0, 200, 160))
+        settle()
+        assert_true(#taps == 2,
+            "a wobbling click must still be a tap, got " .. #taps .. " tap(s)")
+        assert_true(taps[2].x == 200 and taps[2].y == 160,
+            string.format("the wobbling click must tap where it was released, got %s,%s",
+                tostring(taps[2].x), tostring(taps[2].y)))
+        assert_true(#moves == 0,
+            "a wobbling click must not be a drag, got " .. table.concat(moves, ","))
+
+        -- ... while a real drag must still be one: past the 4px threshold, and past the gesture
+        -- detector's 35px pan threshold, so the motion reaches the widget and the lift is no tap.
+        conn.sock:send(pointer(1, 300, 260))
+        for step = 1, 10 do
+            conn.sock:send(pointer(1, 300 + step * 10, 260))
+        end
+        conn.sock:send(pointer(0, 400, 260))
+        settle()
+        assert_true(#moves > 0, "a real drag must still reach the widget, got no pan/swipe")
+        assert_true(#taps == 2, "a real drag must not also be a tap, got " .. #taps .. " tap(s)")
+        conn.sock:close()
+    end)
+    UIManager:close(widget)
+    server:stop()
     if not ok then error(err, 0) end
 end)
 

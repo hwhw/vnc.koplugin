@@ -647,14 +647,13 @@ end
 local SYN = { type = C.EV_SYN, code = C.SYN_REPORT, value = 0 }
 
 --- PointerEvent: a press/release at a position, with the button mask doing the rest.
+---
+--- `client` is the connection's input state bag (`buttons`, `press_x`/`press_y`, `dragging`,
+--- `pointer_x`/`pointer_y`), and this function is its only writer: the protocol layer hands over
+--- the PointerEvent as it arrived and leaves that state alone (c.f., vnc/rfbserver.lua's
+--- `_message_loop`). Reading `client.buttons` as the *previous* mask is what turns a message into a
+--- press or a release; anything that stores the new mask first makes every click look like motion.
 function Server:_on_pointer(client, x, y, mask)
-    if not self._logged_motion then
-        self._logged_motion = true
-        logger.info("vnc: client pointer motion received at " .. tostring(x) .. "," .. tostring(y)
-            .. " (further motion is logged at debug level)")
-    else
-        logger.dbg("vnc: client pointer motion at", x, y, "mask", mask)
-    end
     local was_down = (client.buttons or 0) ~= 0
     local down = mask ~= 0
     client.buttons = mask
@@ -662,6 +661,14 @@ function Server:_on_pointer(client, x, y, mask)
     if down ~= was_down then
         logger.info(string.format("vnc: client pointer %s at %s,%s",
             down and "press" or "release", tostring(x), tostring(y)))
+    elseif not self._logged_motion then
+        -- The first *motion* of the server's life, at info: proof that a viewer's motion reaches
+        -- us at all. Transitions above are not motion, hence the elseif.
+        self._logged_motion = true
+        logger.info("vnc: client pointer motion received at " .. tostring(x) .. "," .. tostring(y)
+            .. " (further motion is logged at debug level)")
+    else
+        logger.dbg("vnc: client pointer motion at", x, y, "mask", mask)
     end
     if down == was_down then
         if down then
