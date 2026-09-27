@@ -54,6 +54,22 @@ Server.STALL_TIMEOUT = 10
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
+--- Bytes read from one client per poll tick, at most: a client that flooded the socket must not
+--- be able to keep the UI thread in the read loop for the whole tick.
+Server.READ_BUDGET = 262144
+--- How long one tick may spend feeding bytes to one client's state machine. Bytes that do not get
+--- their turn stay in the client's buffer and are parsed by the next poll, so a burst costs a few
+--- ticks instead of stalling the UI thread for as long as it takes to parse all of it.
+Server.PARSE_BUDGET = 0.004
+--- Longest side a rectangle handed to an encoder may have, for clients whose first encoding is
+--- one of the expensive ones. Such a rectangle is converted and encoded as one unit today: the
+--- tiles the encoder works in (16x16 Hextile, 64x64 ZRLE) are inside it, but the scratch and the
+--- per-pixel work of the whole rectangle are paid in one go, so a 600x800 full-screen change holds
+--- the UI thread for the whole encode. Tiling bounds how much of that an encoder handles per call
+--- and keeps its buffers small. Bytes on the wire are unchanged apart from such a rectangle being
+--- carried by several rectangle headers, which is ordinary RFB. Raw clients - whose conversion is
+--- cheap and whose payload *grows* with every header - are not tiled at all.
+Server.ENCODE_RECT_LIMIT = 256
 --- How far a client's pointer may move with the button down before it is a drag rather than the
 --- pixel or two of wobble a mouse makes while clicking (in both axes' distance, like core's
 --- gesture thresholds are).
@@ -82,6 +98,7 @@ function Server.new(opts)
         _evicted_gen = 0,
         _dirty = {},
         _screen_at = nil,       -- screen size the last update was built for
+        _conv_cache = {},       -- conversions shared by the clients served in one tick
         _orig_refresh = nil,
         _poll_task = nil,
     }, Server)
@@ -263,6 +280,10 @@ function Server:_record_dirty(mode, region)
     end
 
     self._gen = self._gen + 1
+    -- The screen has changed, so anything a tick converted before this point is stale. Dropping
+    -- the cache here (rather than trusting the tick's own invalidation) means no caller can be
+    -- handed pixels from before a refresh, whoever calls `_encode` and whenever.
+    if next(self._conv_cache) then self._conv_cache = {} end
     logger.dbg(string.format("vnc: recorded dirty region (mode %s): %d,%d %dx%d",
         tostring(mode), x, y, rw, rh))
     local dirty = self._dirty
@@ -281,6 +302,44 @@ end
 --- it only asked about in part) stays queued and is offered again on its next request. Advancing
 --- past it would drop it for good - the client would be told "nothing new" forever while the
 --- screen kept changing.
+
+--- A signature for a client pixel format: two clients with equal signatures convert (and encode)
+--- identically, which is what lets one conversion serve both.
+local function fmt_signature(fmt)
+    return table.concat({ fmt.bits_per_pixel, fmt.depth, fmt.big_endian, fmt.true_colour,
+                          fmt.red_max, fmt.green_max, fmt.blue_max,
+                          fmt.red_shift, fmt.green_shift, fmt.blue_shift }, ",")
+end
+
+--- The first encoding a client's preference list will actually reach, as far as the encoder is
+--- concerned: Raw is mandatory, so a Raw entry ends the list. An absent list is Raw.
+local function first_encoding(client)
+    for _, e in ipairs(client.encodings or {}) do
+        if e == ServerEnc.RAW then return ServerEnc.RAW end
+        if e == ServerEnc.ZRLE or e == ServerEnc.HEXTILE or e == ServerEnc.RRE then return e end
+    end
+    return ServerEnc.RAW
+end
+
+--- Appends `r` to `out`, cut into tiles of at most `limit` a side (`limit` nil/0 = whole).
+local function emit_rect(out, r, limit)
+    if not limit or limit <= 0 or (r.w <= limit and r.h <= limit) then
+        out[#out + 1] = { x = r.x, y = r.y, w = r.w, h = r.h }
+        return
+    end
+    local y, bottom = r.y, r.y + r.h
+    while y < bottom do
+        local h = math.min(limit, bottom - y)
+        local x, right = r.x, r.x + r.w
+        while x < right do
+            local w = math.min(limit, right - x)
+            out[#out + 1] = { x = x, y = y, w = w, h = h }
+            x = x + w
+        end
+        y = y + h
+    end
+end
+
 function Server:_get_rects(client, region, full)
     -- A client may ask for more than the framebuffer - some viewers send 65535x65535 to mean "the
     -- whole screen" - and the region a continuous-updates client names arrives the same way.
@@ -298,13 +357,16 @@ function Server:_get_rects(client, region, full)
         region = { x = x, y = y, w = math.min(region.w, sw - x), h = math.min(region.h, sh - y) }
     end
     local out = {}
+    -- A Raw client pays nothing for a big rectangle and would pay a header for each tile, so it is
+    -- left alone; the encoders that walk every pixel in Lua are the ones that get tiles.
+    local limit = (first_encoding(client) ~= ServerEnc.RAW) and Server.ENCODE_RECT_LIMIT or nil
     local sent = client.sent_gen
     -- A client that has been sent nothing yet (or has fallen behind the eviction window) needs a
     -- whole region: answering it with only the rectangles that happen to be dirty would show it
     -- a mostly empty screen, and an *incremental* first request (some clients send one) an empty
     -- update forever.
     if full or sent == nil or sent < self._evicted_gen then
-        out[1] = { x = region.x, y = region.y, w = region.w, h = region.h }
+        emit_rect(out, region, limit)
         client.sent_gen = self._gen
         logger.dbg("vnc: answering a client with the full region", region.w, region.h)
         return out
@@ -314,7 +376,7 @@ function Server:_get_rects(client, region, full)
         if d.gen > sent then
             local r = Util.intersect_rect(d, region)
             if r then
-                out[#out + 1] = { x = r.x, y = r.y, w = r.w, h = r.h }
+                emit_rect(out, r, limit)
                 if r.x ~= d.x or r.y ~= d.y or r.w ~= d.w or r.h ~= d.h then
                     unsent_from = unsent_from and math.min(unsent_from, d.gen) or d.gen
                 end
@@ -350,6 +412,29 @@ function Server:_encode(client, rect)
         enc:set_encodings(client.encodings)
         client.enc_encodings = client.encodings
     end
+    -- One conversion per (pixel format, rectangle) per tick. Clients of the same format are
+    -- looking at the same pixels, and `Enc:convert` is the expensive part of serving a rectangle
+    -- (a per-pixel pass over it, 6-7 ms for the full 600x800 screen), so the second client of a
+    -- tick re-uses what the first one converted. The cache is dropped on every refresh and at the
+    -- start of every tick, so a conversion can never outlive the pixels it was made from.
+    local cache = self._conv_cache
+    if cache then
+        -- `need_values` is part of the key: a conversion made for a Raw client does not carry the
+        -- per-pixel array a ZRLE/Hextile/RRE client needs, so the two must not be handed each
+        -- other's work. The source is passed on as well, so a conversion that does not fit this
+        -- encoder for any other reason is redone rather than trusted.
+        local need_values = ServerEnc.needs_values(enc.encodings)
+        local key = table.concat({ fmt_signature(fmt), rect.x, rect.y, rect.w, rect.h,
+                                   need_values and 1 or 0 }, ":")
+        local converted = cache[key]
+        if not converted then
+            local pixels, count = enc:convert(Screen.bb, rect, need_values)
+            converted = { pixels = pixels, count = count,
+                          values = need_values and enc.values or nil }
+            cache[key] = converted
+        end
+        return enc:encode(Screen.bb, rect, converted)
+    end
     return enc:encode(Screen.bb, rect)
 end
 
@@ -378,6 +463,7 @@ function Server:_adopt_client(sock)
     local client = {
         sock = sock,
         rx = {},                 -- incoming byte chunks, joined lazily
+        rx_off = 1,              -- position of the first unread byte in rx[1]
         rx_len = 0,
         tx = {},                 -- outgoing byte chunks
         tx_len = 0,
@@ -459,9 +545,14 @@ function Server:_after_step(client, kind, arg)
     if kind == "need" then
         client.pending = arg
         client.state = "reading"
-        -- Maybe the bytes are already buffered.
+        -- Maybe the bytes are already buffered: keep the state machine running over them. The
+        -- tick's parse budget bounds that - when it is spent, what is left stays in the buffer and
+        -- the next poll resumes with it, so a client's burst can never hold the UI thread for
+        -- longer than @{Server.PARSE_BUDGET} in one tick.
         if client.pending and client.rx_len >= client.pending then
-            self:_client_step(client)
+            if not client.parse_deadline or socket.gettime() < client.parse_deadline then
+                self:_client_step(client)
+            end
         end
     elseif kind == "idle" then
         client.state = "parked"
@@ -471,60 +562,70 @@ function Server:_after_step(client, kind, arg)
     end
 end
 
+--- Takes `n` bytes out of the client's buffer, oldest first.
+---
+--- `rx_off` is the position of the first unread byte in `rx[1]`: reading a field out of a chunk
+--- must not copy the *rest* of the chunk, which is what matters now that a tick reads a whole
+--- chunk rather than the bytes of the one request the protocol owed - with a 64 KiB chunk and a
+--- message per six bytes, re-copying the remainder per field would be quadratic.
 function Server:_take_rx(client, n)
     local parts = {}
     local got = 0
     while got < n do
         local chunk = client.rx[1]
-        local want = math.min(#chunk, n - got)
-        parts[#parts + 1] = chunk:sub(1, want)
-        got = got + want
-        if want == #chunk then
+        local off = client.rx_off
+        local avail = #chunk - off + 1
+        if avail <= 0 then
+            -- Defensive: `rx_len` says there are bytes, so an exhausted head chunk means the
+            -- buffer and its length drifted apart; drop it rather than loop forever.
             table.remove(client.rx, 1)
+            client.rx_off = 1
+            break
+        end
+        local want = math.min(avail, n - got)
+        parts[#parts + 1] = chunk:sub(off, off + want - 1)
+        got = got + want
+        if want == avail then
+            table.remove(client.rx, 1)
+            client.rx_off = 1
         else
-            client.rx[1] = chunk:sub(want + 1)
+            client.rx_off = off + want
         end
     end
     client.rx_len = client.rx_len - n
     return table.concat(parts)
 end
 
---- Reads from the socket, advances the state machine, flushes outgoing data.
-function Server:_service_client(client)
-    if client.dropped then return end
+--- Takes everything the socket has waiting, *without blocking*, and buffers it.
+---
+--- LuaSocket's `receive(n)` only returns the bytes it read in its third value when it times out
+--- on a short read, and that is the normal outcome here: with a zero timeout the socket never
+--- waits, so the first read returns whatever the kernel already had and the loop only goes on
+--- while it is still filling whole chunks. Dropping that third value would silently shift every
+--- later message by the bytes lost - the client's requests would be read as garbage, or never
+--- read again, while the connection stayed up. (`send` has the same shape: a timed-out send
+--- reports how far it got in its last return value; c.f., @{Server:_flush_client}.)
+---
+--- Reading a whole chunk (rather than the bytes of the one request the protocol owes) is what
+--- makes a burst cheap: the state machine is resumed over everything buffered, so several
+--- messages are parsed in one tick instead of one field per tick. `Server.READ_BUDGET` bounds how
+--- much one client can hand over per tick.
+---
+--- @treturn number bytes taken
+function Server:_read_available(client)
     local sock = client.sock
-
-    -- Read (bounded per tick). Ask for exactly what the protocol still owes: LuaSocket's
-    -- receive(n) only returns once it has all n bytes, so asking for a full chunk would stall
-    -- on any message smaller than that. The budget is generous because a moving mouse produces a
-    -- stream of small motion messages, and falling behind on those delays everything else the
-    -- client sends - its keystrokes in particular.
-    local budget = 256
-    while budget > 0 and (not client.pending or client.rx_len < client.pending) do
-        budget = budget - 1
-        local want = Server.READ_CHUNK
-        if client.state == "reading" and client.pending then
-            want = math.min(client.pending - client.rx_len, Server.READ_CHUNK)
-        elseif client.state == "parked" then
-            -- The protocol is holding an update request, so it cannot parse anything right now:
-            -- buffer whatever the client sends (its keystrokes) one byte at a time, without
-            -- blocking the UI thread.
-            want = 1
-        end
-        if want <= 0 then break end
-        sock:settimeout(client.state == "parked" and 0 or Server.IO_TIMEOUT)
-        local data, err, partial = sock:receive(want)
-        -- A timed-out read can still have received bytes, and LuaSocket hands those back *only*
-        -- in `partial`: dropping them would silently shift every later message by the number of
-        -- bytes lost, so the client's requests would be read as garbage (or never read again)
-        -- while the connection stayed up.
+    if not sock then return 0 end
+    sock:settimeout(0)
+    local total = 0
+    while total < Server.READ_BUDGET do
+        local data, err, partial = sock:receive(Server.READ_CHUNK)
         data = data or partial
         if data and #data > 0 then
             client.rx[#client.rx + 1] = data
             client.rx_len = client.rx_len + #data
-            -- `partial` only ever arrives together with a timeout: the socket has nothing more
-            -- waiting, so do not pay for another blocking read in this tick.
-            if err == "timeout" then break end
+            total = total + #data
+            -- A timeout on a short read means the socket is empty now, so stop asking.
+            if err == "timeout" or #data < Server.READ_CHUNK then break end
         elseif err == "timeout" then
             break
         else
@@ -532,10 +633,41 @@ function Server:_service_client(client)
                 logger.warn("vnc: client read error:", tostring(err))
             end
             self:_drop_client(client, "closed")
-            return
+            return total
         end
     end
-    self:_client_step(client)
+    return total
+end
+
+--- Reads from the socket, advances the state machine, flushes outgoing data.
+function Server:_service_client(client)
+    if client.dropped then return end
+    local sock = client.sock
+
+    -- Read, parse, and read once more. The reads do not block (c.f., @{Server:_read_available}):
+    -- the wait between messages is the poll interval itself, not a 10 ms receive on every tick,
+    -- which is also what keeps the flush below from being delayed by a socket that has nothing to
+    -- say. Everything the client had waiting is parsed in this tick, so the cost of a message is
+    -- its parse, not a poll interval.
+    client.parse_deadline = socket.gettime() + Server.PARSE_BUDGET
+    local got = self:_read_available(client)
+    local ready = client.pending and client.rx_len >= client.pending
+    -- The state machine is only skipped when it would find nothing to do: a "reading" client that
+    -- owes bytes none of which arrived. `pending == nil` in the reading state should not happen,
+    -- but resuming there costs nothing while skipping it would wedge the connection.
+    if got > 0 or client.state ~= "reading" or client.pending == nil or ready then
+        self:_client_step(client)
+    end
+    if got > 0 then
+        -- A viewer asks for the next update as soon as it has seen one, so its answer can already
+        -- be on the wire by the time we finish parsing. One more non-blocking look picks that up
+        -- in this same tick; when there is nothing waiting it is a single read that returns
+        -- immediately, so an idle client neither loops nor sleeps here.
+        local more = self:_read_available(client)
+        if more > 0 and not client.dropped then
+            self:_client_step(client)
+        end
+    end
     self:_flush_client(client)
 end
 
@@ -546,6 +678,10 @@ end
 function Server:_flush_client(client)
     if client.dropped or not client.sock then return end
     local sock = client.sock
+    -- Reads run with a zero timeout; writes keep the short blocking one they always had (a
+    -- timed-out send still reports its progress in `last`, c.f. below, so nothing is lost when it
+    -- does time out).
+    sock:settimeout(Server.IO_TIMEOUT)
     while client.tx_len > 0 and not client.dropped do
         local chunk = client.tx[1]
         local sent, err, last = sock:send(chunk, 1)
@@ -616,6 +752,9 @@ end
 function Server:_poll()
     self._poll_task_scheduled = false
     if not self.running then return end
+
+    -- The conversions the clients served in this tick may share (c.f., @{Server:_encode}).
+    self._conv_cache = {}
 
     self:_accept()
 
