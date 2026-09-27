@@ -27,10 +27,12 @@ Tap *More tools* → *VNC viewer* to get the connection list (or "New connection
 then pick a connection.
 
 The remote framebuffer owns the **whole screen** — there is no permanent toolbar. The menu is
-opened the way KOReader's file manager and reader open theirs: **tap, or swipe down, in
-KOReader's own menu zone** at the top of the screen (the same `DTAP_ZONE_MENU` area, honouring
-the global *activate menu on* preference, so with "swipe only" taps there still go to the remote
-desktop).
+opened with a **swipe down in KOReader's own menu zone** at the top of the screen (the same
+`DTAP_ZONE_MENU` area the file manager and reader use). Taps are deliberately not used for that:
+every single tap — including in that zone — stays a click on the remote desktop, so the canvas
+never has a dead spot. KOReader's global *activate menu on* preference is ignored here on
+purpose: under "tap only" the menu would become unreachable. On a device with a dedicated Menu
+button that button toggles the menu.
 
 Gestures on the canvas:
 
@@ -44,7 +46,7 @@ Gestures on the canvas:
 | two-finger rotate | change the screen orientation |
 | swipe up from the bottom | show the on-screen keyboard |
 | swipe down | hide it again |
-| tap / swipe down in the top menu zone | open the in-app menu |
+| swipe down in the top menu zone | open the in-app menu (taps there click the remote) |
 
 The on-screen keyboard is drawn **over** the framebuffer: showing or hiding it never rescales or
 moves the view. Pan (two-finger drag) if part of the remote desktop ends up behind the keyboard —
@@ -189,7 +191,8 @@ dialog left behind (cancel and save in the editor, Back in the per-connection di
 and confirmed deletes), that a failed connection returns to the connection list with exactly one
 dismissable message, that the canvas covers the whole screen and follows a rotation, that showing
 the keyboard neither rescales nor moves the view, that the keyboard is re-laid out for the new
-screen dimensions after a rotation, and that KOReader's menu tap/swipe zones are registered.
+screen dimensions after a rotation, and that the menu swipe zone is registered while taps
+(anywhere, including the menu zone) still reach the remote desktop.
 
 ### Live end-to-end
 
@@ -258,10 +261,9 @@ when it is off, restores it on disconnect, and never touches a Wi-Fi it did not 
   gesture *handlers* are unit-tested but the gesture *detector* wiring (pinch/spread/rotate/
   two-finger drag/swipe) has to be exercised by hand on a touch device. The same applies to a
   real tap in the menu zone.
-- **The top menu zone is reserved**: with the default `swipe_tap` activation, taps in KOReader's
-  `DTAP_ZONE_MENU` (the top eighth of the screen) open the menu instead of clicking the remote
-  desktop, exactly as they do in the file manager. Sweep that region mentally or switch
-  *activate menu on* to "swipe only" if you need those pixels.
+- **Only the menu *swipe* is taken**: taps are never intercepted, so `DTAP_ZONE_MENU` (the top
+  eighth) is only unavailable to the remote desktop for a *swipe down*; a tap or a drag there
+  behaves like anywhere else on the screen.
 - **Tight is off by default** and untested against a real server (see above).
 - **Wi-Fi**: on the SDL *Desktop* device (which is what `koreader` selects when `KO_MULTIUSER` is
   set) KOReader reports Wi-Fi as permanently on, so no Wi-Fi toggling happens there. The fake
