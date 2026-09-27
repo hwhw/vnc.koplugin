@@ -426,8 +426,10 @@ function Server:_service_client(client)
 
     -- Read (bounded per tick). Ask for exactly what the protocol still owes: LuaSocket's
     -- receive(n) only returns once it has all n bytes, so asking for a full chunk would stall
-    -- on any message smaller than that.
-    local budget = 16
+    -- on any message smaller than that. The budget is generous because a moving mouse produces a
+    -- stream of small motion messages, and falling behind on those delays everything else the
+    -- client sends - its keystrokes in particular.
+    local budget = 256
     while budget > 0 and (not client.pending or client.rx_len < client.pending) do
         budget = budget - 1
         local want = Server.READ_CHUNK
@@ -558,6 +560,13 @@ function Server:_inject(evs)
         end
     end
     for _, e in ipairs(handled) do
+        if e.handler == "onKeyPress" or e.handler == "onKeyRelease" then
+            local stack = UIManager._window_stack
+            local top = stack and stack[#stack] and stack[#stack].widget
+            logger.info(string.format("vnc: key %s dispatched to %s (window stack: %d)",
+                tostring(e.args and e.args[1] and e.args[1].key or "?"),
+                tostring(top and (top.name or top.id) or "nothing"), stack and #stack or 0))
+        end
         UIManager:handleInputEvent(e)
     end
 end
@@ -577,6 +586,12 @@ function Server:_on_pointer(client, x, y, mask)
     if (mask ~= 0) ~= ((client.buttons or 0) ~= 0) then
         logger.info(string.format("vnc: client pointer %s at %s,%s",
             mask ~= 0 and "press" or "release", tostring(x), tostring(y)))
+    elseif not self._logged_motion then
+        self._logged_motion = true
+        logger.info("vnc: client pointer motion received at " .. tostring(x) .. "," .. tostring(y)
+            .. " (further motion is logged at debug level)")
+    else
+        logger.dbg("vnc: client pointer motion at", x, y, "mask", mask)
     end
     local was_down = (client.buttons or 0) ~= 0
     client.buttons = mask
