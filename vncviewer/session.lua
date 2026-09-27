@@ -185,6 +185,10 @@ function Session:_do_connect()
             end,
             on_rect = function(x, y, w, h)
                 self_ref.dirty = Util.union_rect(self_ref.dirty, { x = x, y = y, w = w, h = h })
+                -- A payload larger than one poll tick is decoded across ticks, so a repaint
+                -- can happen while the plane is only half written. Invalidate the scale cache
+                -- *after* the write, or that half-written frame would be reused forever.
+                if self_ref.remote then self_ref.remote:mark_dirty() end
             end,
             on_desktop_resize = function(w, h)
                 logger.info("vncviewer: remote desktop resized to", w, h)

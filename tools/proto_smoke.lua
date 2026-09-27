@@ -61,6 +61,18 @@ local function log_has(path, needle)
     return s ~= nil and s:find(needle, 1, true) ~= nil
 end
 
+local function log_count(path, needle)
+    local s = read_file(path)
+    if not s then return 0 end
+    local n, pos = 0, 1
+    while true do
+        local i = s:find(needle, pos, true)
+        if not i then return n end
+        n = n + 1
+        pos = i + #needle
+    end
+end
+
 local function wait_for_log(path, needle, timeout)
     local deadline = os.time() + (timeout or 5)
     repeat
@@ -671,6 +683,10 @@ local function main()
                 proto:send_pointer(300, 200, 1)
                 proto:send_key(Keysyms.special.Press, true)
                 proto:send_key(Keysyms.special.Press, false)
+                -- URI/Dispatcher callers hand us strings: "0" must be a release, not a press
+                proto:send_key(Keysyms.special.Press, "1")
+                proto:send_key(Keysyms.special.Press, "0")
+                proto:send_key(Keysyms.special.Press, 0)
                 proto:send_cut_text("hello")
                 return true
             end,
@@ -689,6 +705,14 @@ local function main()
             end
         end
         stop_mock(pid)
+        -- down: true, "1"; up: false, "0", 0
+        local downs = log_count(log, "INPUT KeyEvent down=1 keysym=0xff0d")
+        local ups = log_count(log, "INPUT KeyEvent down=0 keysym=0xff0d")
+        if downs ~= 2 or ups ~= 3 then
+            return nil, string.format(
+                "key press/release counts: %d down, %d up (wanted 2/3); '0' must not mean down",
+                downs, ups)
+        end
         return true
     end)
 

@@ -43,9 +43,12 @@ end
 The plane, for writing.
 
 Handing the plane out advances the version counter, which invalidates the scale cache in
-@{Remote:draw_to}: every writer in this plugin asks for the plane immediately before it
-writes, so a stale cache cannot survive a plane change. Writers that go through some other
-channel must call @{Remote:mark_dirty}.
+@{Remote:draw_to}.
+
+Note that this happens *before* the write, and a decode can span several UI ticks (a frame
+can be several hundred KiB), so a repaint may well happen while the plane is half written.
+Every writer must therefore also call @{Remote:mark_dirty} once it is done (the session does
+this from its `on_rect` callback).
 --- @treturn BlitBuffer
 ]]
 function Remote:get_plane()

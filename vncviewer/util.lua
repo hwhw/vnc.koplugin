@@ -141,6 +141,17 @@ function Util.intersect_rect(a, b)
     return { x = x1, y = y1, w = x2 - x1, h = y2 - y1 }
 end
 
+--[[--
+Coerces the many ways a boolean can arrive (real booleans, 0/1, "0"/"1" from URI or
+Dispatcher callers) into a `0`/`1` wire bit.
+]]
+function Util.bool_to_bit(value)
+    if value == nil or value == false or value == 0 or value == "0" or value == "" then
+        return 0
+    end
+    return 1
+end
+
 --- Big-endian 16-bit read from a Lua string at 0-based byte offset.
 function Util.get_u16be(s, off)
     local a, b = s:byte(off + 1, off + 2)

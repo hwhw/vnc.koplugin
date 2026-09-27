@@ -276,7 +276,7 @@ end
 function Protocol:request_update(incremental, x, y, w, h)
     local wr = Util.writer()
     wr:u8(3)
-    wr:u8((incremental == true or incremental == 1) and 1 or 0)
+    wr:u8(Util.bool_to_bit(incremental))
     wr:u16(x); wr:u16(y); wr:u16(w); wr:u16(h)
     self.io.write(wr:tostring())
 end
@@ -285,7 +285,7 @@ end
 function Protocol:send_pointer(x, y, mask)
     local wr = Util.writer()
     wr:u8(5)
-    wr:u8(mask)
+    wr:u8(tonumber(mask) or 0)
     wr:u16(x); wr:u16(y)
     self.io.write(wr:tostring())
 end
@@ -294,7 +294,7 @@ end
 function Protocol:send_key(keysym, down)
     local wr = Util.writer()
     wr:u8(4)
-    wr:u8(down and 1 or 0)
+    wr:u8(Util.bool_to_bit(down))
     wr:u8(0); wr:u8(0)
     wr:u32(keysym % 4294967296)
     self.io.write(wr:tostring())
