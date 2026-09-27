@@ -528,6 +528,47 @@ check("menu_opens_on_swipe_only", function()
     remote:free()
 end)
 
+check("server_section_is_in_the_network_menu", function()
+    -- The plugin's own menu table, as `addToMainMenu` builds it.
+    local menu_items = {}
+    plugin:addToMainMenu(menu_items)
+
+    assert_true(menu_items.vncviewer == nil or menu_items.vncviewer.text == "VNC viewer",
+        "the viewer entry stays")
+    local section = menu_items.vncviewer_server
+    assert_true(section ~= nil, "a VNC server section must be registered")
+    assert_true(section.text == "VNC server", "named \"VNC server\", got " .. tostring(section.text))
+    assert_true(section.sorting_hint == "network", "it belongs in the Network menu")
+    assert_true(type(section.checked_func) == "function", "it must be checkable")
+    assert_true(section.checked_func() == false, "and not checked while the server is stopped")
+
+    local items = section.sub_item_table
+    assert_true(type(items) == "table" and #items >= 4, "it must offer a submenu")
+    local labels = {}
+    for _, item in ipairs(items) do
+        labels[#labels + 1] = item.text or (item.text_func and item.text_func())
+    end
+    local function has(pattern)
+        for _, l in ipairs(labels) do
+            if type(l) == "string" and l:find(pattern) then return l end
+        end
+        return nil
+    end
+    assert_true(has("^Start VNC server$") ~= nil,
+        "a start/stop entry, got: " .. table.concat(labels, " | "))
+    assert_true(has("^Not running$") ~= nil, "a status line, got: " .. table.concat(labels, " | "))
+    assert_true(has("^IP address: 0%.0%.0%.0$") ~= nil,
+        "the IP address with its default, got: " .. table.concat(labels, " | "))
+    assert_true(has("^Port: 5900$") ~= nil,
+        "the port with its default, got: " .. table.concat(labels, " | "))
+    assert_true(has("^Password: not set$") ~= nil,
+        "the optional password, got: " .. table.concat(labels, " | "))
+    assert_true(plugin.settings:server().ip == "0.0.0.0"
+        and plugin.settings:server().port == 5900
+        and plugin.settings:server().password == "",
+        "and the defaults it shows are the stored ones")
+end)
+
 check("settings_file_is_kept_in_shape", function()
     -- There is no schema version and no migration; the store still has to survive a file that a
     -- user edited by hand (or that does not exist yet). `LuaSettings` caches one instance per

@@ -58,6 +58,9 @@ end
 --[[--
 Byte writer building client -> server messages. `:tostring()` yields the wire bytes.
 ]]
+--- A writer for one protocol message. The methods return the writer, so they can be chained;
+--- `tostring()` returns what has been written so far (it never resets, so use one writer per
+--- message).
 function Util.writer()
     return setmetatable({ buf = {} }, { __index = Util.Writer })
 end
@@ -66,11 +69,13 @@ Util.Writer = {}
 
 function Util.Writer:u8(v)
     self.buf[#self.buf + 1] = string.char(v % 256)
+    return self
 end
 
 function Util.Writer:u16(v)
     v = v % 65536
     self.buf[#self.buf + 1] = string.char(math.floor(v / 256), v % 256)
+    return self
 end
 
 function Util.Writer:u32(v)
@@ -79,10 +84,12 @@ function Util.Writer:u32(v)
     local b = math.floor(v / 65536) % 256
     local c = math.floor(v / 256) % 256
     self.buf[#self.buf + 1] = string.char(a, b, c, v % 256)
+    return self
 end
 
 function Util.Writer:raw(s)
     self.buf[#self.buf + 1] = s
+    return self
 end
 
 function Util.Writer:tostring()

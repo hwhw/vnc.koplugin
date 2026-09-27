@@ -40,6 +40,41 @@ for i = 1, 12 do
     Keysyms.special["F" .. i] = 0xFFBE + (i - 1)
 end
 
+--- Keysyms -> KOReader key names, for the server side (which receives keysyms and has to
+--- produce KOReader key events). Built from @{Keysyms.special}; where two names share a keysym
+--- (the page keys) the first one wins.
+Keysyms.key_name = {}
+for name, sym in pairs(Keysyms.special) do
+    if Keysyms.key_name[sym] == nil then Keysyms.key_name[sym] = name end
+end
+-- Explicit choices where the KOReader name is the one a device is likely to map:
+Keysyms.key_name[0xFF0D] = "Press"          -- Return
+Keysyms.key_name[0xFF1B] = "Back"           -- Escape
+Keysyms.key_name[0xFF67] = "ContextMenu"    -- the PC "menu" key (F1 is KOReader's "Menu")
+
+--- The KOReader key name for a keysym, or nil.
+--- @tparam number keysym
+--- @treturn string|nil
+function Keysyms.name_for_keysym(keysym)
+    return Keysyms.key_name[keysym]
+end
+
+--- Encodes a Unicode codepoint as UTF-8 (for keysyms that are not ASCII).
+--- @tparam number cp
+--- @treturn string
+function Keysyms.utf8(cp)
+    if cp < 0x80 then
+        return string.char(cp)
+    elseif cp < 0x800 then
+        return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+    elseif cp < 0x10000 then
+        return string.char(0xE0 + math.floor(cp / 0x1000), 0x80 + math.floor(cp / 0x40) % 0x40,
+            0x80 + cp % 0x40)
+    end
+    return string.char(0xF0 + math.floor(cp / 0x40000), 0x80 + math.floor(cp / 0x1000) % 0x40,
+        0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+end
+
 --- Decodes the first UTF-8 character of `ch` into a Unicode codepoint.
 --- @treturn number|nil codepoint
 function Keysyms.codepoint(ch)

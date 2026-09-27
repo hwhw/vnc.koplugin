@@ -13,6 +13,7 @@ local _ = require("gettext")
 local T = require("ffi/util").template
 
 local DataStorage = require("datastorage")
+local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -20,6 +21,8 @@ local logger = require("logger")
 
 local Dialogs = require("vncviewer/dialogs")
 local Session = require("vncviewer/session")
+local Server = require("vncviewer/server")
+local ServerMenu = require("vncviewer/servermenu")
 local Settings = require("vncviewer/settings")
 local ViewerApp = require("vncviewer/app")
 
@@ -37,6 +40,13 @@ function VNCViewer:init()
     self.settings_file = DataStorage:getSettingsDir() .. "/vncviewer.lua"
     self.settings = Settings.open(self.settings_file)
 
+    -- The VNC server (serving KOReader's own screen). It is off until the user starts it from
+    -- the Network menu; nothing here listens on its own.
+    self.server = Server.new{
+        settings = self.settings:server(),
+        name = "KOReader" .. (Device.model and (" on " .. Device.model) or ""),
+    }
+
     -- File manager only (we have nothing to show inside a document).
     if self.ui and self.ui.menu and not self.ui.document then
         self.ui.menu:registerToMainMenu(self)
@@ -49,6 +59,7 @@ function VNCViewer:addToMainMenu(menu_items)
         sorting_hint = "more_tools",
         callback = function() self:show() end,
     }
+    ServerMenu.register(self, menu_items)
 end
 
 function VNCViewer:onFlushSettings()

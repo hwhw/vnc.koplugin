@@ -8,6 +8,11 @@ every client message it receives (one line per message, see ``--log``).
 VNC Authentication is verified with OpenSSL's DES through ctypes -- an implementation
 completely independent of the plugin's own DES, so it validates it.
 
+The client's SetPixelFormat is honoured: the pattern is converted on the fly to any of
+8/16/32 bpp, true-colour (channel maxima/shifts and byte order as requested) or, for
+``true_colour=0``, to a 256-entry 3-3-2 colour map plus indices. The canonical format the Lua
+client asks for (32bpp/24/LSB/true colour/255,255,255/0,8,16) keeps its exact legacy bytes.
+
 usage: mock_vnc_server.py [--port 5900] [--width 800] [--height 600]
                           [--security none|vnc] [--password secret]
                           [--encoding raw|hextile|rre|copyrect|trle|zrle|tight|mixed]
@@ -148,6 +153,78 @@ def vnc_response(password, challenge):
     return des_encrypt_ecb(key, challenge[:16])
 
 
+# ---------------------------------------------------------------- pixel format
+#
+# The mock always keeps its pattern in native RGB. The client's SetPixelFormat picks how it
+# goes on the wire; the canonical format (the one the Lua client asks for) keeps the exact
+# byte layout the mock has always served, so nothing about that case changes.
+
+CANONICAL_FORMAT = (32, 24, 0, 1, 255, 255, 255, 0, 8, 16)
+
+
+def is_canonical_format(pf):
+    return tuple(pf) == CANONICAL_FORMAT
+
+
+class PixelCodec:
+    def __init__(self, pf):
+        (self.bpp, self.depth, self.big_endian, self.true_colour,
+         self.red_max, self.green_max, self.blue_max,
+         self.red_shift, self.green_shift, self.blue_shift) = pf
+        self.bytes_per_pixel = max(1, self.bpp // 8)
+        if self.true_colour:
+            sig = max(self.red_shift + self.red_max.bit_length(),
+                      self.green_shift + self.green_max.bit_length(),
+                      self.blue_shift + self.blue_max.bit_length())
+            self.bytes_per_cpixel = max(1, (sig + 7) // 8)
+        else:
+            self.bytes_per_cpixel = self.bytes_per_pixel
+        self.canonical = is_canonical_format(pf)
+        self.byte_order = "big" if self.big_endian else "little"
+
+    @classmethod
+    def canonical(cls):
+        return cls(CANONICAL_FORMAT)
+
+    def value(self, rgb):
+        """The pixel's integer value in the negotiated format."""
+        r, g, b = rgb
+        if not self.true_colour:                     # 3-3-2 index into the colour map
+            return ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6)
+        rv = r if self.red_max == 255 else (r * self.red_max + 127) // 255
+        gv = g if self.green_max == 255 else (g * self.green_max + 127) // 255
+        bv = b if self.blue_max == 255 else (b * self.blue_max + 127) // 255
+        return (rv << self.red_shift) | (gv << self.green_shift) | (bv << self.blue_shift)
+
+    def _encode(self, rgb, nbytes):
+        full = self.value(rgb).to_bytes(self.bytes_per_pixel, self.byte_order)
+        if nbytes >= self.bytes_per_pixel:
+            return full
+        # A CPIXEL is the PIXEL with its padding bytes removed.
+        return full[:nbytes] if self.byte_order == "little" else full[-nbytes:]
+
+    def pixel(self, rgb):
+        if self.canonical:
+            return bytes(rgb) + b"\x00" * (self.bytes_per_pixel - 3)
+        return self._encode(rgb, self.bytes_per_pixel)
+
+    def cpixel(self, rgb):
+        if self.canonical:
+            return bytes(rgb)
+        return self._encode(rgb, self.bytes_per_cpixel)
+
+
+def colour_map_message():
+    """SetColorMapEntries with 256 3-3-2 entries (16-bit values, so client >>8 is exact)."""
+    out = bytearray(bytes([1, 0]) + struct.pack(">HH", 0, 256))
+    for i in range(256):
+        r = ((i >> 5) & 0x7) * 255 // 7
+        g = ((i >> 2) & 0x7) * 255 // 7
+        b = (i & 0x3) * 255 // 3
+        out += struct.pack(">HHH", r * 257, g * 257, b * 257)
+    return bytes(out)
+
+
 # ---------------------------------------------------------------- synthetic framebuffer
 
 class Framebuffer:
@@ -155,6 +232,13 @@ class Framebuffer:
         self.pattern = pattern
         self.w = w
         self.h = h
+        self.codec = PixelCodec.canonical()
+
+    def pixel(self, rgb):
+        return self.codec.pixel(rgb)
+
+    def cpixel(self, rgb):
+        return self.codec.cpixel(rgb)
 
     def pix(self, x, y):
         p = self.pattern
@@ -183,12 +267,11 @@ class Framebuffer:
         return bytes(out)
 
     def pixel32(self, x0, y0, w, h):
-        """Packed [R, G, B, 0] rows (our negotiated 32bpp format)."""
+        """Packed PIXELs for the negotiated format."""
         out = bytearray()
         for y in range(y0, y0 + h):
             for x in range(x0, x0 + w):
-                r, g, b = self.pix(x, y)
-                out += bytes((r, g, b, 0))
+                out += self.pixel(self.pix(x, y))
         return bytes(out)
 
 
@@ -213,9 +296,9 @@ def encode_rre(fb, x0, y0, w, h):
                 x += 1
             subrects.append((start - x0, y - y0, x - start, 1, col))
     out = bytearray(struct.pack(">I", len(subrects)))
-    out += bytes(bg) + b"\x00"
+    out += fb.pixel(bg)
     for (sx, sy, sw, sh, col) in subrects:
-        out += bytes(col) + b"\x00" + struct.pack(">HHHH", sx, sy, sw, sh)
+        out += fb.pixel(col) + struct.pack(">HHHH", sx, sy, sw, sh)
     return bytes(out)
 
 
@@ -261,7 +344,7 @@ class HextileEncoder:
             out = bytearray([1])
             for cy in range(th):
                 for cx in range(tw):
-                    out += bytes(tile[cy][cx]) + b"\x00"
+                    out += self.fb.pixel(tile[cy][cx])
             self.prev_bg_ok = False
             self.prev_fg_ok = False
             return bytes(out)
@@ -272,7 +355,7 @@ class HextileEncoder:
             pass
         else:
             mask |= 2
-            out += bytes(bg) + b"\x00"
+            out += self.fb.pixel(bg)
             self.prev_bg = bg
         self.prev_bg_ok = True
 
@@ -281,7 +364,7 @@ class HextileEncoder:
             fg = next(iter(colors))
             if not (fg == self.prev_fg and self.prev_fg_ok):
                 mask |= 4
-                out += bytes(fg) + b"\x00"
+                out += self.fb.pixel(fg)
                 self.prev_fg = fg
             self.prev_fg_ok = True
             if runs:
@@ -294,7 +377,7 @@ class HextileEncoder:
                 mask |= 8 | 16
                 out += bytes([len(runs)])
                 for (sx, sy, sw, col) in runs:
-                    out += bytes(col) + b"\x00"
+                    out += self.fb.pixel(col)
                     out += bytes([(sx << 4) | sy, ((sw - 1) << 4) | 0])
                 self.prev_fg_ok = False
         return bytes([mask]) + bytes(out)
@@ -342,7 +425,7 @@ class TileEncoder:
                 flat.append(self.fb.pix(x0 + cx, y0 + cy))
         distinct = sorted(set(flat))
         if len(distinct) == 1:
-            return bytes([1]) + bytes(distinct[0])
+            return bytes([1]) + self.fb.cpixel(distinct[0])
 
         if len(distinct) <= 16:
             palette = distinct
@@ -358,7 +441,7 @@ class TileEncoder:
             if choice == 0:
                 self.prev_palette = palette
                 self.prev_palette_ok = True
-                return bytes([len(palette)]) + b"".join(bytes(c) for c in palette) \
+                return bytes([len(palette)]) + b"".join(self.fb.cpixel(c) for c in palette) \
                     + self._packed(tw, th, palette, flat)
             if choice == 1:
                 return bytes([127]) + self._packed(tw, th, palette, flat)
@@ -367,16 +450,16 @@ class TileEncoder:
             if choice == 3:
                 return bytes([129]) + self._palette_rle(runs)
             # 130..255: the palette follows the subencoding byte, then the runs.
-            return bytes([128 + len(palette)]) + b"".join(bytes(c) for c in palette) \
+            return bytes([128 + len(palette)]) + b"".join(self.fb.cpixel(c) for c in palette) \
                 + self._palette_rle(runs)
 
         # Too many colours for a palette: alternate raw and plain RLE.
         if self.tile_index % 2 == 0:
-            return bytes([0]) + b"".join(bytes(c) for c in flat)
+            return bytes([0]) + b"".join(self.fb.cpixel(c) for c in flat)
         runs = self._runs(flat)
         out = bytearray([128])
         for (col, n) in runs:
-            out += bytes(col)
+            out += self.fb.cpixel(col)
             out += self._run_length(n)
         return bytes(out)
 
@@ -460,7 +543,7 @@ class TightEncoder:
         return bytes([b])
 
     def fill(self, x0, y0, w, h):
-        return self._ctl(TIGHT_FILL) + bytes(self.fb.pix(x0, y0))[:3]
+        return self._ctl(TIGHT_FILL) + self.fb.cpixel(self.fb.pix(x0, y0))
 
     def jpeg(self, x0, y0, w, h):
         return self._ctl(TIGHT_JPEG) + self._compact_len(len(self.jpeg_blob)) + self.jpeg_blob
@@ -526,7 +609,7 @@ class TightEncoder:
             data = bytearray(idx[p] for p in pixels)
         reset, comp = self._compress(stream_id, bytes(data))
         return self._ctl(stream_id | TIGHT_EXPLICIT_FILTER, stream_id, reset=reset) + bytes([1]) \
-            + bytes([n - 1]) + b"".join(bytes(c) for c in palette) \
+            + bytes([n - 1]) + b"".join(self.fb.cpixel(c) for c in palette) \
             + self._compact_len(len(comp)) + comp
 
 
@@ -669,9 +752,15 @@ class MockServer:
                 rshift, gshift, bshift = struct.unpack(">BBB", data[14:17])
                 log("INPUT SetPixelFormat bpp=%d red_shift=%d green_shift=%d blue_shift=%d"
                     % (bpp, rshift, gshift, bshift))
-                if (bpp, depth, big, true, rmax, gmax, bmax, rshift, gshift, bshift) != \
-                        (32, 24, 0, 1, 255, 255, 255, 0, 8, 16):
+                if bpp not in (8, 16, 32):
                     raise ValueError("unexpected pixel format %r" % (data[4:20],))
+                pf = (bpp, depth, big, true, rmax, gmax, bmax, rshift, gshift, bshift)
+                # Honour the requested format. The canonical one (what the Lua client asks
+                # for) keeps the exact legacy byte layout -- PixelCodec special-cases it.
+                self.fb.codec = (PixelCodec.canonical() if is_canonical_format(pf)
+                                 else PixelCodec(pf))
+                if not true:
+                    conn.sock.sendall(colour_map_message())
             elif t == 2:
                 count = struct.unpack(">H", data[2:4])[0]
                 encs = list(struct.unpack(">%di" % count, data[4:4 + 4 * count]))

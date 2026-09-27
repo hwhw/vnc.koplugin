@@ -21,7 +21,7 @@ Settings.__index = Settings
 Settings.PROFILE_FIELDS = { "name", "host", "port", "password" }
 
 --- The only top-level keys of the file.
-Settings.DATA_KEYS = { "profiles", "settings" }
+Settings.DATA_KEYS = { "profiles", "settings", "server" }
 
 local known_data_key = {}
 for _, key in ipairs(Settings.DATA_KEYS) do known_data_key[key] = true end
@@ -32,6 +32,13 @@ Settings.DEFAULTS = {
     keyboard_always_visible = false,
     zoom_mode = "fit",               -- "fit", "fit_with_keyboard", or a numeric scale factor
     enable_tight = false,            -- opt-in Tight encoding (not in RFC 6143; see NOTES.txt)
+}
+
+--- VNC server defaults (the `server` sub-table). See @{vncviewer.server}.
+Settings.SERVER_DEFAULTS = {
+    ip = "0.0.0.0",                  -- bind address; 0.0.0.0 serves every interface
+    port = 5900,
+    password = "",                   -- empty = no authentication (RFB "None" security)
 }
 
 --- Opens (and returns) the settings store at `path`.
@@ -98,16 +105,25 @@ function Settings:normalise()
         end
     end
 
-    if type(data.settings) ~= "table" then data.settings = {} end
-    for key, default in pairs(Settings.DEFAULTS) do
-        data.settings[key] = coerce_like(data.settings[key], default)
-    end
-    for key in pairs(data.settings) do
-        if Settings.DEFAULTS[key] == nil then
-            logger.dbg("vncviewer: dropping unknown setting", key)
-            data.settings[key] = nil
+    local function normalise_section(key, defaults)
+        if type(data[key]) ~= "table" then data[key] = {} end
+        local section = data[key]
+        for name, default in pairs(defaults) do
+            section[name] = coerce_like(section[name], default)
         end
+        for name in pairs(section) do
+            if defaults[name] == nil then
+                logger.dbg("vncviewer: dropping unknown", key, "key", name)
+                section[name] = nil
+            end
+        end
+        return section
     end
+
+    normalise_section("settings", Settings.DEFAULTS)
+    local server = normalise_section("server", Settings.SERVER_DEFAULTS)
+    server.port = math.max(1, math.min(65535, math.floor(server.port)))
+    if server.ip == "" then server.ip = Settings.SERVER_DEFAULTS.ip end
 
     if type(data.profiles) ~= "table" then data.profiles = {} end
     local cleaned = {}
@@ -201,6 +217,12 @@ function Settings:delete_profile(name)
         end
     end
     return false
+end
+
+--- The VNC server configuration sub-table (bind address, port, password).
+--- @treturn table
+function Settings:server()
+    return self.data.server
 end
 
 --- @treturn any the global setting `key`, or nil
