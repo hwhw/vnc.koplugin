@@ -47,6 +47,10 @@ Server.IO_TIMEOUT = 0.05
 --- How long a held update request may block the client's other messages before the server sends
 --- an empty update to get back to reading them.
 Server.IDLE_FLUSH = 0.25
+--- How long a client message may stay half-parsed before we give up on it and say so. A mis-read
+--- length used to mean the coroutine waited forever, silently eating every later client message
+--- (input included) as payload.
+Server.STALL_TIMEOUT = 10
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
@@ -503,7 +507,27 @@ function Server:_poll()
     end
 
     for _, client in pairs(self.clients) do
-        self:_service_client(client)
+        local ok, err = pcall(self._service_client, self, client)
+        if not ok then
+            logger.err("vnc: servicing a client failed:", tostring(err))
+            self:_drop_client(client, tostring(err))
+        end
+        -- A message that is *partially* received and then goes quiet means we are waiting for
+        -- bytes that are never coming (a length we mis-read, so every later message is being
+        -- swallowed as its payload). Waiting for a client's *next* message is normal and must not
+        -- count, hence the `rx_len > 0` requirement.
+        if not client.dropped and client.state == "reading" and client.pending
+                and client.rx_len > 0 and client.rx_len < client.pending then
+            client.pending_since = client.pending_since or socket.gettime()
+            if socket.gettime() - client.pending_since >= Server.STALL_TIMEOUT then
+                self:_drop_client(client, string.format(
+                    "stuck on a client message: %d of %d bytes arrived in %ds",
+                    client.rx_len, client.pending, Server.STALL_TIMEOUT))
+                goto continue_client
+            end
+        else
+            client.pending_since = nil
+        end
         if client.state == "parked" and not client.dropped then
             local new = self:_has_new_for(client)
             local stale = client.parked_at
@@ -514,6 +538,7 @@ function Server:_poll()
                 self:_after_step(client, kind, arg)
             end
         end
+        ::continue_client::
     end
 
     -- The dirty list is deliberately *not* cleared here: each client remembers the generation it
