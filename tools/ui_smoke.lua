@@ -39,6 +39,7 @@ _G.G_defaults = require("luasettings"):wrap(dofile("defaults.lua"))
 local Device = require("device")
 require("document/canvascontext"):init(Device)
 local Screen = Device.screen
+local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 
 package.path = plugin_dir .. "/?.lua;" .. package.path
@@ -258,29 +259,38 @@ end)
 
 -- ---------------------------------------------------------------- a real viewer widget
 
---- Builds a shown viewer app with a fake session (no network involved).
+--- Builds a shown viewer app with a fake session and plugin (no network involved).
+--- @treturn table, table, table the app, its remote plane and a record of what it sent
 local function new_app()
     local ViewerApp = require("vncviewer/app")
     local Remote = require("vncviewer/framebuffer")
     local remote = Remote.new(400, 300)
+    local sent = { pointer = {}, key = {} }
     local app = ViewerApp:new{
         plugin = {
-            settings = { data = { settings = { orientation = 0, keyboard_always_visible = false,
-                                               zoom_mode = "fit", enable_tight = false } } },
+            settings = {
+                data = { settings = { orientation = 0, keyboard_always_visible = false,
+                                      zoom_mode = "fit", enable_tight = false } },
+                profiles = function() return {} end,
+                flush = function() end,
+            },
             leave_app = function() end,
             disconnect_session = function() end,
+            connect_profile = function() end,
         },
         session = {
             get_remote = function() return remote end,
-            send_pointer = function() end,
-            send_key = function() end,
+            send_pointer = function(_, x, y, mask)
+                sent.pointer[#sent.pointer + 1] = { x = x, y = y, mask = mask }
+            end,
+            send_key = function(_, keysym, down) sent.key[#sent.key + 1] = { keysym = keysym, down = down } end,
             get_state = function() return "connected" end,
             get_error = function() return nil end,
             get_profile = function() return { name = "test" } end,
         },
     }
     UIManager:show(app)
-    return app, remote
+    return app, remote, sent
 end
 
 check("canvas_covers_the_screen", function()
@@ -361,22 +371,49 @@ check("keyboard_follows_rotation", function()
     remote:free()
 end)
 
-check("menu_zones_registered", function()
-    local app, remote = new_app()
+check("menu_opens_on_swipe_only", function()
+    local app, remote, sent = new_app()
+
+    -- no tap zone may exist: the top strip must stay available to the remote desktop
+    assert_true(not app:checkRegisterTouchZone("vncviewer_menu_tap"),
+        "there must be no menu tap zone")
+    assert_true(not app:checkRegisterTouchZone("vncviewer_menu_tap_ext"),
+        "there must be no menu tap zone")
+    assert_true(app:checkRegisterTouchZone("vncviewer_menu_swipe"),
+        "the menu swipe zone must be registered")
+    assert_true(app:checkRegisterTouchZone("vncviewer_menu_swipe_ext"),
+        "the extended menu swipe zone must be registered")
+
     local zone = G_defaults:readSetting("DTAP_ZONE_MENU")
     local size = Screen:getSize()
-    for _, id in ipairs({ "vncviewer_menu_tap", "vncviewer_menu_swipe",
-                          "vncviewer_menu_tap_ext", "vncviewer_menu_swipe_ext" }) do
-        assert_true(app:checkRegisterTouchZone(id), "touch zone " .. id .. " must be registered")
-    end
-    local gs_range = app._zones["vncviewer_menu_tap"].gs_range
+    local gs_range = app._zones["vncviewer_menu_swipe"].gs_range
     assert_true(math.abs(gs_range.range.w - size.w * zone.w) < 1,
-        "the menu tap zone must cover KOReader's DTAP_ZONE_MENU width")
+        "the menu swipe zone must cover KOReader's DTAP_ZONE_MENU width")
     assert_true(math.abs(gs_range.range.h - size.h * zone.h) < 1,
-        "the menu tap zone must cover KOReader's DTAP_ZONE_MENU height")
-    -- the zone does not swallow the canvas: a tap below it is still a remote click
-    local ac = { x = 0, y = math.floor(size.h * 0.5), w = 1, h = 1 }
-    assert_true(gs_range.range:contains(ac) == false, "the menu zone must stay out of the canvas")
+        "the menu swipe zone must cover KOReader's DTAP_ZONE_MENU height")
+
+    -- dispatch: a tap inside that zone must click the remote, not open the menu
+    local inside = Geom:new{ x = 10, y = 10 }
+    app.menu = nil
+    sent.pointer = {}
+    app:onGesture({ ges = "tap", pos = inside })
+    assert_true(app.menu == nil, "a tap must never open the menu")
+    assert_true(#sent.pointer == 3, "a tap in the top zone must click the remote, got "
+        .. #sent.pointer .. " pointer events")
+
+    -- dispatch: a south swipe there opens the menu, other directions do not
+    app:onGesture({ ges = "swipe", direction = "south", pos = inside })
+    assert_true(app.menu ~= nil, "a swipe down in the top zone must open the menu")
+    app:close_menu()
+    app:onGesture({ ges = "swipe", direction = "north", pos = inside })
+    assert_true(app.menu == nil, "only a south swipe opens the menu")
+
+    -- and a tap anywhere else is a click too
+    sent.pointer = {}
+    app:onGesture({ ges = "tap", pos = Geom:new{ x = 10, y = size.h - 10 } })
+    assert_true(#sent.pointer == 3, "a tap below the zone must click the remote")
+    assert_true(app.menu == nil, "and must not open the menu")
+
     app:onCloseWidget()
     remote:free()
 end)

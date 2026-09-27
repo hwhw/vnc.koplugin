@@ -3,11 +3,11 @@ The full-screen viewer widget.
 
 The remote framebuffer owns the whole screen; the on-screen keyboard is drawn *over* it
 (KOReader stacks it above us), so showing the keyboard never rescales the view — pan it if part
-of the remote desktop ends up behind the keyboard. The menu is reached the way KOReader's file
-manager and reader reach theirs: a tap, or a swipe down, in KOReader's own menu zone at the top
-of the screen, honouring the global `activate_menu` preference. Rotations and screen resizes go
-through KOReader's generic `SetRotationMode` / `ScreenResize` events, so that the keyboard is
-re-laid out for the new dimensions as well.
+of the remote desktop ends up behind the keyboard. The menu is opened by a **swipe down** in
+KOReader's own top screen zone (the `DTAP_ZONE_MENU` area); taps are *never* taken away from the
+remote desktop, so a single tap means "click over there" everywhere on the screen. Rotations and
+screen resizes go through KOReader's generic `SetRotationMode` / `ScreenResize` events, so that
+the keyboard is re-laid out for the new dimensions as well.
 
 It is a plain (non-modal) full-screen `InputContainer` flagged `is_always_active`, so that it
 keeps receiving gestures even while one of its own popups is on top — hence the
@@ -76,9 +76,13 @@ end
 -- ---------------------------------------------------------------- menu activation
 
 --[[--
-Registers KOReader's own "show the menu" zones (the ones the file manager and reader use):
-a tap in `DTAP_ZONE_MENU`, or a swipe down there, opens our menu, according to the global
-`activate_menu` preference ("swipe_tap" by default). Nothing is permanently on screen for it.
+Registers the "show the menu" gesture: a **swipe down** inside KOReader's own top menu zone
+(`DTAP_ZONE_MENU`, plus its taller middle extension).
+
+Taps are deliberately *not* registered: every single tap must stay a click on the remote
+desktop, so the top zone is only taken away from the canvas for that one swipe. This also
+ignores KOReader's global *activate menu on* preference on purpose — under "tap only" the menu
+would otherwise become unreachable here.
 ]]
 function ViewerApp:init_menu_zones()
     if not Device:isTouchDevice() then return end
@@ -90,19 +94,6 @@ function ViewerApp:init_menu_zones()
         or { x = 1 / 4, y = 0, w = 1 / 2, h = 1 / 5 }
 
     self:registerTouchZones({
-        {
-            id = "vncviewer_menu_tap",
-            ges = "tap",
-            screen_zone = zone_ratios(zone),
-            handler = function(ges) return self:onMenuTap(ges) end,
-        },
-        {
-            id = "vncviewer_menu_tap_ext",
-            ges = "tap",
-            screen_zone = zone_ratios(zone_ext),
-            overrides = { "vncviewer_menu_tap" },
-            handler = function(ges) return self:onMenuTap(ges) end,
-        },
         {
             id = "vncviewer_menu_swipe",
             ges = "swipe",
@@ -119,25 +110,21 @@ function ViewerApp:init_menu_zones()
     })
 end
 
---- @treturn string the `activate_menu` preference ("tap" | "swipe" | "swipe_tap")
-function ViewerApp:_activate_menu()
-    return G_reader_settings:readSetting("activate_menu") or "swipe_tap"
-end
-
---- A tap in the menu zone opens the menu (unless the menu should only open on swipes), and
---- otherwise falls through to the canvas, which sends it to the remote.
-function ViewerApp:onMenuTap(ges)
-    if self.menu or self:_activate_menu() == "swipe" then return nil end
-    self:open_menu()
-    return true
-end
-
---- A swipe down in the menu zone opens the menu (unless it should only open on taps).
+--- A swipe down in the top menu zone opens the menu; anything else falls through to the canvas.
 function ViewerApp:onMenuSwipe(ges)
-    if self.menu or self:_activate_menu() == "tap" then return nil end
+    if self.menu then return nil end
     if BD.flipDirectionIfMirroredUILayout(ges.direction) ~= "south" then return nil end
     self:open_menu()
     return true
+end
+
+--- Opens the menu, or closes it when it is already open.
+function ViewerApp:toggle_menu()
+    if self.menu then
+        self:close_menu()
+    else
+        self:open_menu()
+    end
 end
 
 function ViewerApp:init_gestures()
@@ -457,6 +444,12 @@ end
 function ViewerApp:onKeyPress(key)
     if key.key == "Back" then
         self:on_back()
+        return true
+    end
+    if key.key == "Menu" and Device:hasFewKeys() then
+        -- a dedicated menu button: KOReader's own convention is that it opens the menu (on a
+        -- full keyboard the Menu key is just another key we forward to the remote)
+        self:toggle_menu()
         return true
     end
     local keysym = Keysyms.special[key.key]
