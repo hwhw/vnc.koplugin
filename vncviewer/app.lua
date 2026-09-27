@@ -57,6 +57,9 @@ function ViewerApp:init()
     self.remote = self.session:get_remote()
     self.canvas = nil
     self.vk_visible = false
+    self.vk_wanted = false           -- the user's wish, independent of what is on top of us
+    self._keyboard_sync_pending = false
+    self._keyboard_watch_pending = false
     self.vk = Keyboard.new(self.session, function() self:on_keyboard_height_changed() end)
     self._drag_active = nil
     self._last_pinch_factor = nil
@@ -242,6 +245,7 @@ function ViewerApp:paintTo(bb, x, y)
     if self.remote then
         self.remote:draw_to(bb, self.canvas.x, self.canvas.y, self.canvas.w, self.canvas.h, dither)
     end
+
 end
 
 --[[--
@@ -265,7 +269,9 @@ function ViewerApp:on_remote_resized()
 end
 
 function ViewerApp:on_bell()
-    UIManager:show(Notification:new{ text = _("Bell"), timeout = 1 })
+    -- A status blip at the top of the screen, not a dialog: it may share the screen with the
+    -- keyboard. ("toast" is also what keeps KOReader stacking it above everything else.)
+    UIManager:show(Notification:new{ text = _("Bell"), timeout = 1, toast = true })
 end
 
 function ViewerApp:onCloseWidget()
@@ -275,9 +281,12 @@ function ViewerApp:onCloseWidget()
         self._text_input_asserted = false
         Device:stopTextInput()
     end
+    UIManager:unschedule(self._watch_keyboard_tick)
+    self._keyboard_watch_pending = false
     if self.vk then
-        if self.vk:isVisible() then UIManager:close(self.vk) end
+        self.vk:hideKeyboard()
         self.vk_visible = false
+        self.vk_wanted = false
     end
     Keyboard.restore_layout()
     self.canvas = nil
@@ -471,6 +480,8 @@ end
 
 function ViewerApp:onShow()
     self:_ensure_text_input()
+    self:evaluate_keyboard()
+    self:_watch_keyboard_state()
 end
 
 --[[--
@@ -548,46 +559,89 @@ end
 
 -- ---------------------------------------------------------------- keyboard
 
-function ViewerApp:set_keyboard_visible(want)
-    if self.settings.keyboard_always_visible then want = true end
-    if self:_modal_above() then want = false end
-    want = want and true or false
+--- What the user asked for: the "keyboard always visible" setting, or their last manual choice.
+function ViewerApp:is_keyboard_wanted()
+    return self.settings.keyboard_always_visible or self.vk_wanted or false
+end
+
+--- The keyboard is only up while the framebuffer view owns the screen; a menu or dialog above it
+--- takes the keyboard out of the way, and it comes back when that popup is gone.
+function ViewerApp:_wanted_keyboard_visible()
+    if self:_modal_above() then return false end
+    return self:is_keyboard_wanted()
+end
+
+--- Applies the state implied by the setting, the user's wish and the window stack.
+function ViewerApp:evaluate_keyboard()
+    local want = self:_wanted_keyboard_visible()
     if want == self.vk_visible then
         -- The height may still have changed (layout switch); re-flow regardless.
         self.canvas = self:_layout()
         return
     end
     self.vk_visible = want
+    -- The canvas does not change: the keyboard overlaps the framebuffer, so the view (and its
+    -- scale) stays put and the user pans if something important ends up behind the keyboard.
     if want then
-        UIManager:show(self.vk)
+        self.vk:showKeyboard()
     else
         self.vk:hideKeyboard()
     end
-    -- The canvas does not change: the keyboard overlaps the framebuffer, so the view (and its
-    -- scale) stays put and the user pans if something important ends up behind the keyboard.
     UIManager:setDirty(self, "ui")
 end
 
+--- Asks for a keyboard state for as long as the framebuffer view is the topmost window.
+function ViewerApp:set_keyboard_visible(want)
+    self.vk_wanted = want and true or false
+    self:evaluate_keyboard()
+end
+
+--- Flips the keyboard, and keeps the "always visible" setting in sync: that setting wins over
+--- the wish, so asking for the keyboard to go away while it is on would silently do nothing.
 function ViewerApp:toggle_keyboard()
-    self:set_keyboard_visible(not self.vk_visible)
+    local want = not self:is_keyboard_wanted()
+    if not want and self.settings.keyboard_always_visible then
+        self.settings.keyboard_always_visible = false
+        self.plugin.settings:flush()
+    end
+    self:set_keyboard_visible(want)
 end
 
-function ViewerApp:_sync_keyboard()
-    self:set_keyboard_visible(self.settings.keyboard_always_visible and true or false)
-end
+--- How often the window stack is re-checked while the viewer is shown.
+ViewerApp.KEYBOARD_WATCH_INTERVAL = 0.25
 
---- Deferred variant for menu/dialog close callbacks: by then the popup is gone, so
---- `_modal_above()` sees the real state.
+--- Re-evaluates the keyboard state on a short timer.
 ---
---- It only ever *shows* the keyboard (to re-assert "keyboard always visible" after a popup hid
---- it). It must not hide one: a menu item that just showed the keyboard runs *before* this, and
---- forcing the setting off here would close it again right away.
+--- A popup opening above us cannot be noticed any other way: KOReader starts painting at the
+--- topmost full-screen widget, so a widget shown *above* the viewer never repaints it (only
+--- closing one dirties the widgets beneath). Popups we open ourselves notify us immediately;
+--- this catches everything else (a message shown from outside the viewer, another plugin, ...).
+function ViewerApp:_watch_keyboard_tick()
+    self._keyboard_watch_pending = false
+    if not UIManager:isWidgetShown(self) then return end
+    if self.vk_visible ~= self:_wanted_keyboard_visible() then
+        self:_sync_keyboard_later()
+    end
+    self:_watch_keyboard_state()
+end
+
+function ViewerApp:_watch_keyboard_state()
+    if self._keyboard_watch_pending then return end
+    self._keyboard_watch_pending = true
+    UIManager:scheduleIn(ViewerApp.KEYBOARD_WATCH_INTERVAL, self._watch_keyboard_tick, self)
+end
+
+--- Deferred re-evaluation for the popup show/close paths (`_sync_keyboard_later`): by the time
+--- the tick runs the window stack has settled.
 function ViewerApp:_sync_keyboard_later()
+    if self._keyboard_sync_pending then return end
+    self._keyboard_sync_pending = true
     UIManager:nextTick(function()
+        self._keyboard_sync_pending = false
+        -- the viewer may have been left in the meantime: never bring a keyboard back on its own
+        if not UIManager:isWidgetShown(self) then return end
         self:reassert_text_input()
-        if self.settings.keyboard_always_visible then
-            self:set_keyboard_visible(true)
-        end
+        self:evaluate_keyboard()
     end)
 end
 
@@ -641,6 +695,9 @@ end
 function ViewerApp:open_menu()
     if self.menu then return self.menu end
     self.menu = require("vncviewer/menu").open(self)
+    -- The menu is on the window stack now: it owns the screen, so the keyboard gets out of the
+    -- way (it is part of the framebuffer view, not of the menu).
+    self:evaluate_keyboard()
     return self.menu
 end
 
@@ -650,6 +707,9 @@ function ViewerApp:close_menu()
         local menu = self.menu
         self.menu = nil
         UIManager:close(menu)
+        -- `UIManager:close` does not run the menu's `close_callback`; hand the screen back to the
+        -- framebuffer view (and its keyboard) ourselves.
+        self:_sync_keyboard_later()
     end
 end
 
@@ -663,6 +723,8 @@ function ViewerApp:on_session_error(err)
         text = _("VNC connection lost: ") .. tostring(message),
         timeout = 4,
     })
+    -- it is above the framebuffer view now, and owns the screen until it goes away
+    self:_sync_keyboard_later()
 end
 
 --- Leaves the app, keeping the connection alive.

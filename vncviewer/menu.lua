@@ -143,11 +143,13 @@ function MenuBuilder.open(app)
         callback = action(function()
             settings.keyboard_always_visible = not settings.keyboard_always_visible
             plugin.settings:flush()
-            app:_sync_keyboard()
+            app:evaluate_keyboard()
         end),
     }
     item_table[#item_table + 1] = {
-        text = app.vk_visible and _("Hide keyboard") or _("Show keyboard"),
+        -- Driven by the wish, not by the current state: while this very menu is open the
+        -- keyboard is hidden, but the item must still describe what tapping it does.
+        text = app:is_keyboard_wanted() and _("Hide keyboard") or _("Show keyboard"),
         callback = action(function() app:toggle_keyboard() end),
     }
 
@@ -203,7 +205,10 @@ function MenuBuilder.open(app)
                 ok_text = _("Disconnect"),
                 dismissable = false,
                 ok_callback = function() app:disconnect_session() end,
+                cancel_callback = function() app:_sync_keyboard_later() end,
             })
+            -- the confirmation is above the view now: it owns the screen too
+            app:_sync_keyboard_later()
         end),
     }
     item_table[#item_table + 1] = {

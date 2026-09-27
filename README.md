@@ -55,6 +55,13 @@ re-laid out from the current screen dimensions whenever they change, so it fits 
 just like everything else (rotations and screen resizes go through KOReader's generic
 `SetRotationMode` / `ScreenResize` events).
 
+The keyboard belongs to the framebuffer view, so it is only on screen while that view owns the
+screen: opening the in-app menu (or leaving for the connection list, a confirmation, any other
+dialog) takes it out of the way — KOReader stacks menus *below* the modal keyboard, so it would
+otherwise cover their lower half — and it comes back when the popup closes. "Hide keyboard" /
+"Show keyboard" always describes what you asked for, and asking to hide it clears the "keyboard
+always visible" setting rather than being silently overruled by it.
+
 A physical keyboard is forwarded to the remote, exactly as you would expect from a VNC client.
 While the viewer is on screen it calls `Device:startTextInput()`, because SDL 3 only delivers
 `SDL_EVENT_TEXT_INPUT` after that ("Text input events are not received by default",
@@ -212,7 +219,8 @@ dismissable message, that the canvas covers the whole screen and follows a rotat
 the keyboard neither rescales nor moves the view, that the keyboard is re-laid out for the new
 screen dimensions after a rotation, that the menu swipe zone is registered while taps
 (anywhere, including the menu zone) still reach the remote desktop, that the menu's keyboard
-items really leave the keyboard in the state they promise, that platform text input is enabled
+items really leave the keyboard in the state they promise, that the keyboard yields to menus and
+dialogs above the view (and comes back afterwards), that platform text input is enabled
 for as long as the viewer is up (and only then), that typing reaches the remote through
 KOReader's own SDL event handler, and that physical keys are forwarded
 (Escape/Enter/Tab/arrows/context-menu/F-keys, with releases and repeats) while the Menu key is

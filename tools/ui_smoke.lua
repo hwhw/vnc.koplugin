@@ -418,6 +418,69 @@ check("menu_opens_on_swipe_only", function()
     remote:free()
 end)
 
+check("keyboard_yields_to_popups", function()
+    -- The keyboard belongs to the framebuffer view: a menu or dialog above it takes it out of the
+    -- way, and it comes back when that popup is gone.
+    local app, remote = new_app()
+    app.settings.keyboard_always_visible = true
+    app:set_keyboard_visible(true)
+    assert_true(app.vk_visible, "with the setting on the keyboard covers the framebuffer")
+
+    app:open_menu()
+    assert_true(not app.vk_visible, "opening the menu must hide the keyboard")
+    assert_true(app:is_keyboard_wanted(), "without forgetting that it was asked for")
+    UIManager:_checkTasks()
+    assert_true(not app.vk_visible, "and it must stay hidden while the menu is open")
+
+    -- the menu's own keyboard item must describe the wish, not the state the menu just forced
+    local label
+    for _, item in ipairs(app.menu.item_table) do
+        if item.text == "Hide keyboard" or item.text == "Show keyboard" then label = item.text end
+    end
+    assert_true(label == "Hide keyboard", "the item must still offer to hide it, got " .. tostring(label))
+
+    app:close_menu()
+    UIManager:_checkTasks()
+    assert_true(app.vk_visible, "closing the menu must bring the keyboard back")
+
+    -- any popup above the view, ours or not
+    local InfoMessage = require("ui/widget/infomessage")
+    local dialog = InfoMessage:new{ text = "dialog" }
+    UIManager:show(dialog)
+    app:_sync_keyboard_later()                 -- what the repaint watcher does when a popup appears
+    UIManager:_checkTasks()
+    assert_true(not app.vk_visible, "a dialog above the view must hide the keyboard")
+
+    UIManager:close(dialog)
+    app:_sync_keyboard_later()
+    UIManager:_checkTasks()
+    assert_true(app.vk_visible, "and closing it must bring the keyboard back")
+
+    -- "Hide keyboard" has to work even with the setting on, or the item would lie
+    app:open_menu()
+    app:toggle_keyboard()
+    assert_true(not app.settings.keyboard_always_visible, "the setting must follow the user's wish")
+    assert_true(not app:is_keyboard_wanted(), "and the wish is recorded")
+    assert_true(not app.vk_visible, "still hidden while the menu is open")
+    app:close_menu()
+    UIManager:_checkTasks()
+    assert_true(not app.vk_visible, "and hidden after the menu closes")
+
+    -- leaving the viewer never resurrects the keyboard over whatever comes next
+    app.settings.keyboard_always_visible = true
+    app:evaluate_keyboard()
+    assert_true(app.vk_visible, "the setting on again")
+    local popup = InfoMessage:new{ text = "after the viewer" }
+    app:onCloseWidget()
+    UIManager:show(popup)
+    app:_sync_keyboard_later()
+    UIManager:_checkTasks()
+    assert_true(not app.vk:isVisible(), "no keyboard may appear after the viewer closed")
+    UIManager:close(popup)
+
+    remote:free()
+end)
+
 check("menu_keyboard_items_work", function()
     -- A real tap goes through Menu:onMenuSelect, which runs the item callback *and* the menu's
     -- close callback; the latter used to switch the keyboard off again right after the item
@@ -433,7 +496,9 @@ check("menu_keyboard_items_work", function()
                 return
             end
         end
-        error(string.format("no %q menu item", text))
+        local have = {}
+        for _i, item in ipairs(menu.item_table) do have[#have + 1] = tostring(item.text) end
+        error(string.format("no %q menu item, only: %s", text, table.concat(have, ", ")))
     end
 
     assert_true(not app.vk_visible, "the keyboard starts hidden")
@@ -444,21 +509,15 @@ check("menu_keyboard_items_work", function()
     choose_menu_item("Hide keyboard")
     assert_true(not app.vk_visible, "\"Hide keyboard\" must leave it hidden")
 
-    -- with the setting on, the keyboard survives a menu round trip
+    -- with the setting on, the keyboard survives a menu round trip. (The item is labelled
+    -- "Hide keyboard" throughout: it describes the wish, not the state the open menu forces.)
     app.settings.keyboard_always_visible = true
-    choose_menu_item("Show keyboard")
-    assert_true(app.vk_visible, "with the setting on the keyboard must stay visible")
-
-    -- and a popup that forced it away brings it back when it closes
-    local InfoMessage = require("ui/widget/infomessage")
-    local popup = InfoMessage:new{ text = "popup" }
-    UIManager:show(popup)
-    app:set_keyboard_visible(true)                    -- refused: a popup is above us
-    assert_true(not app.vk_visible, "a popup must keep our keyboard hidden")
-    UIManager:close(popup)
-    app:_sync_keyboard_later()
+    app:set_keyboard_visible(true)
+    app:open_menu()
+    assert_true(not app.vk_visible, "the menu hides the keyboard while it is open")
+    app:close_menu()
     UIManager:_checkTasks()
-    assert_true(app.vk_visible, "closing the popup must bring the keyboard back")
+    assert_true(app.vk_visible, "the setting must bring it back when the menu closes")
 
     app.settings.keyboard_always_visible = false
     app:set_keyboard_visible(false)

@@ -109,7 +109,11 @@ call at any point (and it never leaves two lists stacked).
 ]]
 function VNCViewer:show_connection_list()
     -- Every dialog of ours returns here; a text field among them turned SDL text input off.
-    if self.app then self.app:reassert_text_input() end
+    if self.app then
+        self.app:reassert_text_input()
+        -- The list is above the viewer now: its keyboard must not stay on top of it.
+        self.app:_sync_keyboard_later()
+    end
     self:close_connection_list()
     self.connection_list = Dialogs.open_connection_list(self, {
         on_close = function() self.connection_list = nil end,
