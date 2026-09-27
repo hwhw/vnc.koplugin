@@ -38,8 +38,9 @@ function Settings.open(path)
     local self = setmetatable({}, Settings)
     self.ls = ls
     self.data = ls.data
-    --- Normalise whatever was on disk before anybody reads it.
-    Settings.migrate(self.data)
+    --- Normalise whatever was on disk before anybody reads it. The caller persists the
+    --- result (see `migrated`) so an upgraded file is written back once.
+    self.migrated = Settings.migrate(self.data)
     return self
 end
 
