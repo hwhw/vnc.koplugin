@@ -134,15 +134,33 @@ function Enc:set_encodings(encodings)
     self.encodings = encodings
 end
 
+--- Whether the client's list will need the per-pixel `values` array.
+---
+--- The list is in preference order and Raw is mandatory for every client, so the first entry of
+--- the encodings we can actually reach decides: an encoder after a Raw entry never runs, and Raw
+--- itself is happy with the byte string. Skipping the array matters for a Raw client - building it
+--- is a pass over every pixel of the rectangle, and it is 4 bytes per pixel of allocation.
+--- @tparam table|nil encodings
+--- @treturn boolean
+function Enc.needs_values(encodings)
+    for _, encoding in ipairs(encodings or {}) do
+        if encoding == Enc.RAW then return false end
+        if encoding == Enc.ZRLE or encoding == Enc.HEXTILE or encoding == Enc.RRE then
+            return true
+        end
+    end
+    return false
+end
+
 -- ---------------------------------------------------------------- conversion
 
-local function ensure_buffers(self, w, h)
+local function ensure_buffers(self, w, h, need_values)
     local bpp = math.floor(self.fmt.bits_per_pixel / 8)
     if self.bb24 == nil or self.bb24:getWidth() < w or self.bb24:getHeight() < h then
         if self.bb24 then self.bb24:free() end
         self.bb24 = BB.new(w, h, BB.TYPE_BBRGB24)
     end
-    if self.values == nil or (self.values_size or 0) < w * h then
+    if need_values ~= false and (self.values == nil or (self.values_size or 0) < w * h) then
         -- FFI arrays are 0-based while the encoders index pixels 1..count, so one extra slot.
         self.values = ffi.new("uint32_t[?]", w * h + 1)
         self.values_size = w * h
@@ -156,17 +174,88 @@ local function ensure_buffers(self, w, h)
 end
 
 --[[--
+The byte-aligned RGB copy: the RGB24 plane is already the pixel (only a 32bpp format's padding byte
+differs), so the bytes go straight across. Four plain loops rather than one with the layout tests
+inside: the tests are constant for the whole rectangle, and a loop that carries them does not
+compile as well (measured 25 ns/pixel against 2-4 ns/pixel here).
+
+Each helper is `(data, stride, out, [values,] w, h)`; the caller has already blitted the rectangle
+into `self.bb24`, so `data`/`stride` describe that RGB24 buffer.
+]]
+local function rgb32_into(data, stride, out, w, h)          -- 32bpp, no values array
+    for y = 0, h - 1 do
+        local p = data + y * stride
+        local o = y * w * 4
+        for x = 0, w - 1 do
+            out[o], out[o + 1], out[o + 2], out[o + 3] = p[0], p[1], p[2], 0
+            p = p + 3
+            o = o + 4
+        end
+    end
+end
+
+local function rgb32_values_into(data, stride, out, values, w, h)
+    for y = 0, h - 1 do
+        local p = data + y * stride
+        local o = y * w * 4
+        local vi = y * w + 1
+        for x = 0, w - 1 do
+            local r, g, b = p[0], p[1], p[2]
+            out[o], out[o + 1], out[o + 2], out[o + 3] = r, g, b, 0
+            values[vi + x] = r + g * 256 + b * 65536
+            p = p + 3
+            o = o + 4
+        end
+    end
+end
+
+local function rgb24_into(data, stride, out, w, h)          -- 24bpp, no values array
+    for y = 0, h - 1 do
+        local p = data + y * stride
+        local o = y * w * 3
+        for x = 0, w - 1 do
+            out[o], out[o + 1], out[o + 2] = p[0], p[1], p[2]
+            p = p + 3
+            o = o + 3
+        end
+    end
+end
+
+local function rgb24_values_into(data, stride, out, values, w, h)
+    for y = 0, h - 1 do
+        local p = data + y * stride
+        local o = y * w * 3
+        local vi = y * w + 1
+        for x = 0, w - 1 do
+            local r, g, b = p[0], p[1], p[2]
+            out[o], out[o + 1], out[o + 2] = r, g, b
+            values[vi + x] = r + g * 256 + b * 65536
+            p = p + 3
+            o = o + 3
+        end
+    end
+end
+
+--[[--
 Converts one screen rectangle into the client's pixel format.
 
-Returns the byte string as it goes on the wire; `self.values` additionally holds one entry per
-pixel (the same value, unpacked into a Lua number) for the encoders that have to compare pixels.
+Returns the byte string as it goes on the wire. When `need_values` is true, `self.values`
+additionally holds one entry per pixel (the same value, unpacked into a Lua number) for the
+encoders that have to compare pixels; when it is false, `self.values` is left as it was (an
+encoding that does not need it never reads it, and the array is not even allocated).
 ]]
+--- `need_values` may be false when the client's first encoding is Raw (c.f.,
+--- @{Enc.needs_values}): the byte string is all that encoding needs, and the per-pixel array is a
+--- whole extra pass and four bytes per pixel of allocation.
+---
 --- @tparam BlitBuffer source the screen being served
 --- @tparam table rect `{x, y, w, h}` in screen coordinates
+--- @tparam[opt=true] boolean need_values
 --- @treturn string pixels, number count
-function Enc:convert(source, rect)
+function Enc:convert(source, rect, need_values)
+    if need_values == nil then need_values = true end
     local w, h = rect.w, rect.h
-    local bpp = ensure_buffers(self, w, h)
+    local bpp = ensure_buffers(self, w, h, need_values)
     local fmt = self.fmt
     local true_colour = fmt.true_colour ~= 0
 
@@ -177,6 +266,28 @@ function Enc:convert(source, rect)
 
     local out, values = self.out, self.values
     local count = w * h
+
+    -- The layout every viewer asks for (and the one ServerInit announces): 8 bits per channel, in
+    -- byte order, so the RGB24 plane is *already* the pixel - only a 32bpp format's padding byte
+    -- differs. Copy the bytes straight across instead of looking each channel up in a LUT and
+    -- re-assembling the value with divisions; the general loop below stays for every other format.
+    local byte_aligned = true_colour and fmt.big_endian == 0 and fmt.red_max == 255
+        and fmt.green_max == 255 and fmt.blue_max == 255 and fmt.red_shift == 0
+        and fmt.green_shift == 8 and fmt.blue_shift == 16 and (bpp == 3 or bpp == 4)
+    if byte_aligned then
+        if bpp == 4 then
+            if need_values then
+                rgb32_values_into(data, stride, out, values, w, h)
+            else
+                rgb32_into(data, stride, out, w, h)
+            end
+        elseif need_values then
+            rgb24_values_into(data, stride, out, values, w, h)
+        else
+            rgb24_into(data, stride, out, w, h)
+        end
+        return ffi.string(out, count * bpp), count
+    end
 
     if true_colour then
         local R, G, B = self.lut[1], self.lut[2], self.lut[3]
@@ -189,7 +300,9 @@ function Enc:convert(source, rect)
                 local v = R[p[0]] + G[p[1]] + B[p[2]]
                 p = p + 3
                 pi = pi + 1
-                values[pi] = v            -- 1-based, matching the encoders' pixel loops
+                -- May be nil: a client whose first encoding is Raw asked for the bytes only
+                -- (c.f., @{Enc.needs_values}), and no encoder that reads the array can run then.
+                if values then values[pi] = v end   -- 1-based, matching the encoders' loops
                 if bpp == 4 then
                     -- build the little-endian bytes, then reverse for big-endian clients
                     local b0, b1 = v % 256, math.floor(v / 256) % 256
@@ -229,7 +342,7 @@ function Enc:convert(source, rect)
                 local idx = map_index(p[0], p[1], p[2])
                 p = p + 3
                 pi = pi + 1
-                values[pi] = idx         -- 1-based
+                if values then values[pi] = idx end  -- 1-based; nil for a Raw-only client
                 out[i] = idx
                 i = i + 1
             end
@@ -278,12 +391,24 @@ end
 Encodes one rectangle with the best encoding the client announced (its list is in preference
 order), falling back to Raw.
 ]]
+--- `converted` (optional) is a conversion of this same rectangle, in this encoder's pixel
+--- format, made by another encoder ({ pixels = <string>, count = <number>, values = <array|nil> }).
+--- The server hands one over when several clients of the same format are being served in the same
+--- tick, so the per-pixel conversion is done once rather than once per client. It is only used
+--- when it carries what this client's encodings need.
+---
 --- @treturn number encoding, string payload
-function Enc:encode(source, rect)
-    local pixels, count = self:convert(source, rect)
-    -- The encoders compare pixels, so they work on the per-pixel value array; only Raw uses the
-    -- byte string itself.
-    local values = self.values
+function Enc:encode(source, rect, converted)
+    local want_values = Enc.needs_values(self.encodings)
+    local pixels, count, values
+    if converted and (converted.values ~= nil or not want_values) then
+        pixels, count, values = converted.pixels, converted.count, converted.values
+    else
+        pixels, count = self:convert(source, rect, want_values)
+        -- The encoders compare pixels, so they work on the per-pixel value array; only Raw uses
+        -- the byte string itself.
+        values = self.values
+    end
     for _, encoding in ipairs(self.encodings) do
         if encoding == Enc.ZRLE then
             local payload = self:encode_zrle(values, count, rect.w, rect.h)
@@ -427,8 +552,10 @@ function Enc:encode_hextile(values, count, w, h)
                     tile[n] = values[base + x + 1]
                 end
             end
-            local _, uniform_count = dominant(tile, 1, n, scratch)
-            local bg = dominant(tile, 1, n, scratch)      -- (counts are cleared by each call)
+            -- One call answers both questions: `bg` is the tile's most frequent value and
+            -- `uniform_count` its count, which is the whole tile exactly when it is uniform. The
+            -- second pass over the same range would recompute the first one's answer.
+            local bg, uniform_count = dominant(tile, 1, n, scratch)
             local mask = 0
             local payload = Util.writer()
 
@@ -514,13 +641,14 @@ end
 --- One TRLE tile (the subencoding ZRLE is built from), for a 64x64 (or smaller) tile.
 local function zrle_tile(self, out, tile, tw, th, scratch)
     local n = tw * th
-    local uniform, uniform_count = dominant(tile, 1, n, scratch)
+    -- One call answers all three: the most frequent value, its count (the tile is solid exactly
+    -- when that count is the whole tile) and how many distinct values there are.
+    local uniform, uniform_count, distinct = dominant(tile, 1, n, scratch)
     if uniform_count == n then
         out:u8(1)                                            -- solid
         out:raw(self:cpixel_bytes_of(uniform))
         return
     end
-    local _, _, distinct = dominant(tile, 1, n, scratch)
 
     if distinct <= 16 then
         -- packed palette: subencoding = palette size, palette, then packed indices
