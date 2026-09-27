@@ -27,8 +27,10 @@ Current version: **v0.5**.
 
 1. On GitHub, download this repository as a ZIP: green **Code** button ▸ **Download ZIP**.
 2. Unpack the ZIP.
-3. Move the `vncviewer.koplugin` folder into the `plugins` directory in your KOReader folder
-   (create the `plugins` directory if it is not there yet).
+3. Move the plugin folder into the `plugins` directory in your KOReader folder (create the
+   `plugins` directory if it is not there yet). GitHub names the unpacked folder after the
+   repository and the branch — `vncviewer.koplugin-main` — so rename it to **`vncviewer.koplugin`**
+   while you are at it: KOReader only loads plugin directories whose name ends in `.koplugin`.
 4. Restart KOReader.
 
 That is all — there are no release artefacts to fetch, because the plugin is plain Lua and uses
