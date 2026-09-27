@@ -291,10 +291,14 @@ function Server:_handle_update_request()
     local x, y, w, h = r:u16(), r:u16(), r:u16(), r:u16()
 
     local rects = self:_collect_rects(x, y, w, h, not incremental)
-    if #rects == 0 and incremental then
-        -- Nothing changed: hold this request until the screen does (see the module comment).
-        coroutine.yield("idle")
+    while #rects == 0 and incremental do
+        -- Nothing changed: hold the request. The driver resumes us either when the screen has
+        -- changed (the yield returns nil) or after a short while (it passes "flush"), and the
+        -- latter is what keeps a client's keystrokes from being stuck behind an update: it makes
+        -- us send the (empty) update and return to reading messages.
+        local wake = coroutine.yield("idle")
         rects = self:_collect_rects(x, y, w, h, false)
+        if #rects > 0 or wake == "flush" then break end
     end
     self:_send_update(rects)
 end
@@ -334,19 +338,21 @@ function Server:_send_update(rects)
     end
 
     local header = Util.writer()
-    header:u8(0)
+    header:u8(0)                   -- FramebufferUpdate
     header:u8(0)
     header:u16(#encoded)
-    for _, e in ipairs(encoded) do
-        header:u16(e.rect.x)
-        header:u16(e.rect.y)
-        header:u16(e.rect.w)
-        header:u16(e.rect.h)
-        header:u32(e.encoding)     -- u32() wraps, so pseudo-encodings stay signed on the wire
-    end
     self:_write(header:tostring())
 
+    -- Each rectangle's header is followed immediately by its data (RFC 6143 §7.6.1); writing all
+    -- headers first would misalign everything after the first rectangle's payload.
     for _, e in ipairs(encoded) do
+        local rh = Util.writer()
+        rh:u16(e.rect.x)
+        rh:u16(e.rect.y)
+        rh:u16(e.rect.w)
+        rh:u16(e.rect.h)
+        rh:u32(e.encoding)         -- u32() wraps, so pseudo-encodings stay signed on the wire
+        self:_write(rh:tostring())
         if e.payload then self:_write(e.payload) end
     end
 end

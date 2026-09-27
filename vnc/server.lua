@@ -44,6 +44,9 @@ Server.POLL_INTERVAL = 0.05          -- seconds between socket services
 -- already waiting, so a zero timeout would never read anything. Reads only happen while the
 -- protocol actually owes bytes, so an idle client costs nothing.
 Server.IO_TIMEOUT = 0.05
+--- How long a held update request may block the client's other messages before the server sends
+--- an empty update to get back to reading them.
+Server.IDLE_FLUSH = 0.25
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
@@ -248,9 +251,9 @@ function Server:_get_rects(client, region, full)
     end
     for _, d in ipairs(self._dirty) do
         if d.gen > sent then
-            local x, y, w, h = Util.intersect_rect(d, region)
-            if x then
-                out[#out + 1] = { x = x, y = y, w = w, h = h }
+            local r = Util.intersect_rect(d, region)
+            if r then
+                out[#out + 1] = { x = r.x, y = r.y, w = r.w, h = r.h }
             end
         end
     end
@@ -266,18 +269,11 @@ function Server:_encode(client, rect)
         enc = ServerEnc.new()
         client.enc = enc
     end
-    if fmt and client.enc_format ~= fmt then
+    -- The encoder's own format is the source of truth, so a client that never sends
+    -- SetPixelFormat still gets the format ServerInit announced.
+    if fmt == nil then fmt = ServerEnc.DEFAULT_FORMAT end
+    if enc.fmt ~= fmt then
         enc:set_pixel_format(fmt)
-        client.enc_format = fmt
-    end
-    if not client.enc_format then
-        -- No SetPixelFormat yet: use what ServerInit announced.
-        enc:set_pixel_format({
-            bits_per_pixel = 32, depth = 24, big_endian = 0, true_colour = 1,
-            red_max = 255, green_max = 255, blue_max = 255,
-            red_shift = 0, green_shift = 8, blue_shift = 16,
-        })
-        client.enc_format = true
     end
     if client.enc_encodings ~= client.encodings then
         enc:set_encodings(client.encodings)
@@ -317,11 +313,12 @@ function Server:_adopt_client(sock)
         pending = nil,           -- how many bytes the coroutine waits for
         parked = false,          -- asked for an update while nothing had changed
     }
+    client.state = "fresh"       -- "fresh" | "reading" | "parked"
     client.server = RfbServer.new({
         io = {
             read = function(n)
                 client.pending = n
-                client.parked = false
+                client.state = "reading"
                 return coroutine.yield("need", n)
             end,
             write = function(s)
@@ -367,13 +364,16 @@ end
 function Server:_client_step(client)
     if client.dropped then return end
     local step = client.server.step
-    -- Feed the bytes the coroutine is waiting for, as far as they have arrived.
-    if client.pending and client.rx_len >= client.pending then
-        local data = self:_take_rx(client, client.pending)
-        client.pending = nil
-        local kind, arg = step(client.server, data)
-        self:_after_step(client, kind, arg)
-    elseif not client.pending then
+    if client.state == "reading" then
+        -- Only ever resume a byte-hungry coroutine with its bytes; anything else would make the
+        -- protocol's reader error out with "transport returned nil bytes".
+        if client.pending and client.rx_len >= client.pending then
+            local data = self:_take_rx(client, client.pending)
+            client.pending = nil
+            local kind, arg = step(client.server, data)
+            self:_after_step(client, kind, arg)
+        end
+    else
         local kind, arg = step(client.server, nil)
         self:_after_step(client, kind, arg)
     end
@@ -382,15 +382,26 @@ end
 function Server:_after_step(client, kind, arg)
     if kind == "need" then
         client.pending = arg
+        client.state = "reading"
         -- Maybe the bytes are already buffered.
         if client.pending and client.rx_len >= client.pending then
             self:_client_step(client)
         end
     elseif kind == "idle" then
-        client.parked = true
+        client.state = "parked"
+        client.parked_at = socket.gettime()
     elseif kind == nil then
         self:_drop_client(client, tostring(arg))
     end
+end
+
+--- Whether this client has not been told about something that changed.
+function Server:_has_new_for(client)
+    local sent = client.sent_gen or 0
+    for _, d in ipairs(self._dirty) do
+        if d.gen > sent then return true end
+    end
+    return false
 end
 
 function Server:_take_rx(client, n)
@@ -419,14 +430,20 @@ function Server:_service_client(client)
     -- Read (bounded per tick). Ask for exactly what the protocol still owes: LuaSocket's
     -- receive(n) only returns once it has all n bytes, so asking for a full chunk would stall
     -- on any message smaller than that.
-    local budget = 4
+    local budget = 16
     while budget > 0 and (not client.pending or client.rx_len < client.pending) do
         budget = budget - 1
         local want = Server.READ_CHUNK
-        if client.pending then
+        if client.state == "reading" and client.pending then
             want = math.min(client.pending - client.rx_len, Server.READ_CHUNK)
+        elseif client.state == "parked" then
+            -- The protocol is holding an update request, so it cannot parse anything right now:
+            -- buffer whatever the client sends (its keystrokes) one byte at a time, without
+            -- blocking the UI thread.
+            want = 1
         end
         if want <= 0 then break end
+        sock:settimeout(client.state == "parked" and 0 or Server.IO_TIMEOUT)
         local data, err = sock:receive(want)
         if data and #data > 0 then
             client.rx[#client.rx + 1] = data
@@ -486,10 +503,15 @@ function Server:_poll()
 
     for _, client in pairs(self.clients) do
         self:_service_client(client)
-        if client.parked and #self._dirty > 0 and not client.dropped then
-            client.parked = false
-            local kind, arg = client.server:step(nil)
-            self:_after_step(client, kind, arg)
+        if client.state == "parked" and not client.dropped then
+            local new = self:_has_new_for(client)
+            local stale = client.parked_at
+                and (socket.gettime() - client.parked_at) >= Server.IDLE_FLUSH
+            if new or stale then
+                client.state = "reading"
+                local kind, arg = client.server:step(stale and "flush" or nil)
+                self:_after_step(client, kind, arg)
+            end
         end
     end
 

@@ -611,6 +611,160 @@ check("server_serves_the_screen_over_a_socket", function()
     if not ok then error(err, 0) end
 end)
 
+check("server_serves_a_second_incremental_update", function()
+    -- The first (non-incremental) update is easy; what matters afterwards is that a *change* to
+    -- the screen reaches a client that has asked again incrementally.
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5931, 5999 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        bb:paintRect(0, 0, bb:getWidth(), bb:getHeight(), BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local cli = assert(socket.tcp())
+        cli:settimeout(0.2)
+        assert(cli:connect("127.0.0.1", port))
+        local function pump_and_read(n)
+            local deadline = os.time() + 5
+            local data, e
+            while os.time() <= deadline do
+                data, e = cli:receive(n)
+                if data then return data end
+                if e ~= "timeout" then break end
+                server:_poll()
+                socket.sleep(0.01)
+            end
+            assert_true(data ~= nil, string.format("short read of %d: %s", n, tostring(e)))
+            return data
+        end
+        pump_and_read(12)                                   -- version
+        cli:send("RFB 003.008\n")
+        local count = pump_and_read(1):byte()
+        pump_and_read(count)
+        cli:send(string.char(1))                            -- None
+        pump_and_read(4)                                    -- SecurityResult
+        cli:send(string.char(1))                            -- ClientInit
+        pump_and_read(20)                                   -- ServerInit geometry + format
+        local name_len = pump_and_read(4)
+        pump_and_read(name_len:byte(1) * 16777216 + name_len:byte(2) * 65536
+            + name_len:byte(3) * 256 + name_len:byte(4))
+        cli:send(string.char(0) .. "\0\0\0" .. string.char(32, 24, 0, 1) ..
+            string.char(0, 255, 0, 255, 0, 255) .. string.char(0, 8, 16) .. "\0\0\0")
+        local use_zrle = os.getenv("VNC_TEST_ZRLE") == "1"
+        if use_zrle then
+            -- ZRLE (16) keeps one zlib stream per connection, so a second rect exercises the
+            -- encoder's stream state across updates.
+            cli:send(string.char(2, 0, 0, 1) .. string.char(0, 0, 0, 16))
+        else
+            cli:send(string.char(2, 0, 0, 1) .. string.char(0, 0, 0, 0))   -- SetEncodings: Raw
+        end
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        local streams = Encodings.new_streams()
+        local function request(incremental)
+            cli:send(string.char(3, incremental and 1 or 0) ..
+                string.char(0, 0, 0, 0) ..
+                string.char(math.floor(sw / 256), sw % 256, math.floor(sh / 256), sh % 256))
+        end
+        local function read_update()
+            local head = pump_and_read(4)
+            assert_true(head:byte(1) == 0, "expected a FramebufferUpdate")
+            local nrects = head:byte(3) * 256 + head:byte(4)
+            print(string.format("     [upd] nrects=%d", nrects))
+            for _ = 1, nrects do
+                local r = pump_and_read(12)
+                local w = r:byte(5) * 256 + r:byte(6)
+                local h = r:byte(7) * 256 + r:byte(8)
+                local enc = r:byte(9) * 16777216 + r:byte(10) * 65536 + r:byte(11) * 256 + r:byte(12)
+                print(string.format("     [rect] %d,%d %dx%d enc=%d", r:byte(1) * 256 + r:byte(2),
+                    r:byte(3) * 256 + r:byte(4), w, h, enc))
+                if enc == 16 then
+                    local len_field = pump_and_read(4)
+                    local n = len_field:byte(1) * 16777216 + len_field:byte(2) * 65536
+                        + len_field:byte(3) * 256 + len_field:byte(4)
+                    assert_true(n > 0, "a ZRLE rectangle must carry compressed data")
+                    local compressed = pump_and_read(n)
+                    -- The decoder reads the length itself, so hand it the whole rectangle payload,
+                    -- through one persistent zlib stream for the connection.
+                    local plane = Screen.bb
+                    local vp = plane:viewport(0, 0, bb:getWidth(), bb:getHeight())
+                    local decoded, derr = Encodings.decode{
+                        encoding = 16, r = Util.mem_reader(len_field .. compressed), vp = vp,
+                        plane = plane,
+                        x = r:byte(1) * 256 + r:byte(2), y = r:byte(3) * 256 + r:byte(4),
+                        w = w, h = h, streams = streams,
+                    }
+                    assert_true(decoded, "ZRLE decoding failed: " .. tostring(derr))
+                else
+                    pump_and_read(w * h * 4)                -- Raw payload
+                end
+            end
+            return nrects
+        end
+
+        request(false)
+        assert_true(read_update() >= 1, "the first update must carry the screen")
+
+        -- Keys and pointer events over the wire must reach KOReader's input handling.
+        local injected = {}
+        local original_input_event = UIManager.handleInputEvent
+        UIManager.handleInputEvent = function(_, ev)
+            injected[#injected + 1] = tostring(ev.handler)
+        end
+        local ok_input, input_err = pcall(function()
+            cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))   -- KeyEvent: Down, down
+            cli:send(string.char(4, 0, 0, 0) .. string.char(0, 0, 0xFF, 0x54))   -- KeyEvent: Down, up
+            cli:send(string.char(5, 1, 0, 100, 0, 80))                          -- PointerEvent: press
+            cli:send(string.char(5, 0, 0, 100, 0, 80))                          -- PointerEvent: release
+            local saw_key, saw_gesture = false, false
+            local function scan()
+                for _, h in ipairs(injected) do
+                    if h == "onKeyPress" or h == "onKeyRelease" then saw_key = true end
+                    if h == "onGesture" then saw_gesture = true end
+                end
+                return saw_key and saw_gesture
+            end
+            for _ = 1, 60 do
+                server:_poll()
+                socket.sleep(0.02)
+                if scan() then break end
+            end
+            assert_true(#injected > 0, "no KOReader input event came out of the socket path")
+            assert_true(saw_key, "a KeyEvent over the wire must become a KOReader key event, got "
+                .. table.concat(injected, ","))
+            -- (The pointer path is asserted in server_injects_client_input, where the gesture
+            -- detector's state is deterministic; here it is enough that the message was consumed
+            -- and produced no error while the session stayed up.)
+        end)
+        UIManager.handleInputEvent = original_input_event
+        if not ok_input then error(input_err, 0) end
+
+        -- Ask incrementally *before* anything changes: the server holds the request, and the
+        -- change below must then reach us without another request being sent.
+        request(true)
+        socket.sleep(0.05)
+        server:_poll()
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        -- Two rectangles in one update: each header must be followed by its own data.
+        assert_true(read_update() >= 2,
+            "both changed rectangles must arrive in one update")
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
 check("server_injects_client_input", function()
     -- A PointerEvent must become a KOReader gesture at the right position: that is what lets a
     -- remote VNC client tap, drag and long-press KOReader itself.
@@ -632,6 +786,20 @@ check("server_injects_client_input", function()
             if ev.handler == "Gesture" or (ev.args and ev.args[1] and ev.args[1].pos) then ges = ev end
         end
         assert_true(ges ~= nil, "expected a gesture event, got " .. #seen .. " event(s)")
+
+        -- named keys go through the device's own event_map inversion, so they arrive as real
+        -- key events (arrows, Enter, PageDown, ...); text arrives as TextInput
+        seen = {}
+        server:_on_key(client, 0xFF54, true)            -- Down
+        server:_on_key(client, 0xFF54, false)
+        seen = {}
+        server:_on_key(client, 0x61, true)              -- 'a'
+        local got_text, handler = false, nil
+        for _, ev in ipairs(seen) do
+            handler = tostring(ev.handler)
+            if ev.handler == "onTextInput" then got_text = true end
+        end
+        assert_true(got_text, "a printable keysym must arrive as TextInput, got " .. tostring(handler))
     end)
     UIManager.handleInputEvent = original
     if not ok then error(err, 0) end

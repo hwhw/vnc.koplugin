@@ -36,6 +36,15 @@ Enc.ZRLE = 16
 Enc.HEXTILE_SIZE = 16
 Enc.ZRLE_TILE = 64
 
+--- The pixel format a client sees if it never sends SetPixelFormat (and what ServerInit
+--- announces): 32bpp true colour with RGB in the low address bytes, i.e. what this plugin's own
+--- client asks for.
+Enc.DEFAULT_FORMAT = {
+    bits_per_pixel = 32, depth = 24, big_endian = 0, true_colour = 1,
+    red_max = 255, green_max = 255, blue_max = 255,
+    red_shift = 0, green_shift = 8, blue_shift = 16,
+}
+
 --- The 3-3-2 colour map served to colour-mapped clients (256 entries of `{r, g, b}`, 0..255).
 Enc.COLOUR_MAP = {}
 for i = 0, 255 do
@@ -58,7 +67,9 @@ end
 
 function Enc.new()
     return setmetatable({
-        fmt = nil,
+        -- Never nil: an encoder is always able to convert, and ServerInit announces this format
+        -- until the client asks for another one.
+        fmt = Enc.DEFAULT_FORMAT,
         encodings = { Enc.RAW },
         -- reuse buffers across rectangles; a full-screen rectangle is the worst case
         bb24 = nil,
@@ -66,6 +77,8 @@ function Enc.new()
         values = nil,
         pixel_buf = ffi.new("uint8_t[8]"),
         zstream = nil,
+        values_size = 0,             -- pixels the buffer holds (0 = nothing allocated yet)
+        out_len = 0,                 -- bytes the packed-pixel buffer holds
         cpixel_bytes = nil,          -- which of the 4 bytes of a 32bpp pixel carry the channels
         lut = { ffi.new("uint32_t[256]"), ffi.new("uint32_t[256]"), ffi.new("uint32_t[256]") },
     }, Enc)
@@ -129,13 +142,13 @@ local function ensure_buffers(self, w, h)
         if self.bb24 then self.bb24:free() end
         self.bb24 = BB.new(w, h, BB.TYPE_BBRGB24)
     end
-    if self.values == nil or self.values_size < w * h then
+    if self.values == nil or (self.values_size or 0) < w * h then
         -- FFI arrays are 0-based while the encoders index pixels 1..count, so one extra slot.
         self.values = ffi.new("uint32_t[?]", w * h + 1)
         self.values_size = w * h
     end
     local need = w * h * bpp
-    if self.out == nil or self.out_len < need then
+    if self.out == nil or (self.out_len or 0) < need then
         self.out = ffi.new("uint8_t[?]", need)
         self.out_len = need
     end
@@ -394,6 +407,7 @@ function Enc:encode_hextile(values, count, w, h)
     self.scratch = scratch
     local out = Util.writer()
     local background, foreground          -- carried between tiles, per RFC 6143 §7.7.4
+    local first_tile = true               -- ... but never assumed at the start of a rectangle
 
     local ty = 0
     while ty < h do
@@ -419,7 +433,7 @@ function Enc:encode_hextile(values, count, w, h)
             local payload = Util.writer()
 
             if uniform_count == n then
-                if bg ~= background then
+                if first_tile or bg ~= background then
                     mask = mask + 2                          -- BackgroundSpecified
                     payload:raw(self:pixel_bytes(bg))
                 end
@@ -427,7 +441,7 @@ function Enc:encode_hextile(values, count, w, h)
                 -- A tile with no subrects is entirely background.
             else
                 -- subrectangles: one per run of equal pixels, keeping the tile's own geometry
-                if bg ~= background then
+                if first_tile or bg ~= background then
                     mask = mask + 2
                     payload:raw(self:pixel_bytes(bg))
                     background = bg
@@ -472,6 +486,7 @@ function Enc:encode_hextile(values, count, w, h)
                 end
             end
             out:u8(mask):raw(payload:tostring())
+            first_tile = false
             tx = tx + tw
         end
         ty = ty + th
