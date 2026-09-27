@@ -38,12 +38,15 @@ local C = ffi.C
 local Server = {}
 Server.__index = Server
 
-Server.POLL_INTERVAL = 0.05          -- seconds between socket services
+-- One client message is processed per poll, so the poll rate *is* the input rate: at 50 ms a
+-- moving mouse (dozens of motion messages per second) could never keep up. 10 ms gives ~100
+-- messages per second, and the short socket timeout keeps an idle poll cheap.
+Server.POLL_INTERVAL = 0.01          -- seconds between socket services
 -- Client sockets use a short *blocking* timeout rather than a non-blocking zero one: LuaSocket's
 -- receive(n) demands all n bytes and returns nil (with "timeout") even when some of them are
 -- already waiting, so a zero timeout would never read anything. Reads only happen while the
 -- protocol actually owes bytes, so an idle client costs nothing.
-Server.IO_TIMEOUT = 0.05
+Server.IO_TIMEOUT = 0.01
 --- How long a held update request may block the client's other messages before the server sends
 --- an empty update to get back to reading them.
 Server.STALL_TIMEOUT = 10
@@ -229,7 +232,14 @@ function Server:_record_dirty(mode, region)
         rw = math.min(w - x, math.ceil(region.w or w))
         rh = math.min(h - y, math.ceil(region.h or h))
     end
-    if rw <= 0 or rh <= 0 then return end
+    if rw <= 0 or rh <= 0 then
+        -- Never hide this: a region we decided not to record is exactly what "the screen does not
+        -- update" looks like from the inside.
+        logger.dbg(string.format("vnc: ignoring a dirty region (mode %s): %s,%s %sx%s of %dx%d",
+            tostring(mode), tostring(region and region.x), tostring(region and region.y),
+            tostring(region and region.w), tostring(region and region.h), w, h))
+        return
+    end
 
     self._gen = self._gen + 1
     logger.dbg(string.format("vnc: recorded dirty region (mode %s): %d,%d %dx%d",
@@ -591,10 +601,7 @@ local SYN = { type = C.EV_SYN, code = C.SYN_REPORT, value = 0 }
 
 --- PointerEvent: a press/release at a position, with the button mask doing the rest.
 function Server:_on_pointer(client, x, y, mask)
-    if (mask ~= 0) ~= ((client.buttons or 0) ~= 0) then
-        logger.info(string.format("vnc: client pointer %s at %s,%s",
-            mask ~= 0 and "press" or "release", tostring(x), tostring(y)))
-    elseif not self._logged_motion then
+    if not self._logged_motion then
         self._logged_motion = true
         logger.info("vnc: client pointer motion received at " .. tostring(x) .. "," .. tostring(y)
             .. " (further motion is logged at debug level)")
@@ -602,9 +609,13 @@ function Server:_on_pointer(client, x, y, mask)
         logger.dbg("vnc: client pointer motion at", x, y, "mask", mask)
     end
     local was_down = (client.buttons or 0) ~= 0
+    local down = mask ~= 0
     client.buttons = mask
     client.pointer_x, client.pointer_y = x, y
-    local down = mask ~= 0
+    if down ~= was_down then
+        logger.info(string.format("vnc: client pointer %s at %s,%s",
+            down and "press" or "release", tostring(x), tostring(y)))
+    end
     if down == was_down then
         if down then
             -- A drag: the button is still down, so the position update is a touch move KOReader
