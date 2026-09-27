@@ -143,6 +143,15 @@ drag; there is no multi-touch in VNC), EV_KEY through the device's own event_map
 (so the keysym -> KOReader key name mapping is device independent), and TextInput events for typed
 text. VNC Authentication reuses des.lua and mirrors the client's construction exactly.
 
+Injected input must be stamped on the clock the device stamps its own events with (the one
+GestureDetector probed; Server:_inject's `at` defaults to it). An event on another clock - os.time()
+is CLOCK_REALTIME in whole seconds - arms a hold timer decades away, and while such a timer is
+pending Input:waitEvent never returns to UIManager, so the scheduled poll task stops. A client press
+must not be injected the moment it is read: a contact that is down starves that same loop, so the
+plugin buffers it (Server:_on_pointer) until it is a tap (down+lift, one frame each), a drag (down +
+motion past Server.DRAG_THRESHOLD), or a real long press (the bare down, from Server:_flush_pointer
+at the detector's own hold interval).
+
 Four LuaSocket traps this hit, worth remembering: receive(n) only returns once it has all n bytes,
 so a non-blocking receive of a large chunk always "times out" with the data still in the kernel
 (read exactly the bytes the protocol owes, and give the socket a short positive timeout instead of
