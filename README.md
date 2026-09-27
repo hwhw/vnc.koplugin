@@ -31,8 +31,8 @@ opened with a **swipe down in KOReader's own menu zone** at the top of the scree
 `DTAP_ZONE_MENU` area the file manager and reader use). Taps are deliberately not used for that:
 every single tap — including in that zone — stays a click on the remote desktop, so the canvas
 never has a dead spot. KOReader's global *activate menu on* preference is ignored here on
-purpose: under "tap only" the menu would become unreachable. On a device with a dedicated Menu
-button that button toggles the menu.
+purpose: under "tap only" the menu would become unreachable. With a keyboard, the **Menu** key
+toggles the menu; on a device with a dedicated Menu button that button does.
 
 Gestures on the canvas:
 
@@ -55,9 +55,22 @@ re-laid out from the current screen dimensions whenever they change, so it fits 
 just like everything else (rotations and screen resizes go through KOReader's generic
 `SetRotationMode` / `ScreenResize` events).
 
-A physical keyboard is forwarded too: printable characters via `TextInput`, and the named keys
-(Backspace, Tab, arrows, Home/End, Page Up/Down, F1-F12, modifiers, …) as X11 keysyms. `Back`
-leaves the viewer without dropping the connection.
+A physical keyboard is forwarded to the remote, exactly as you would expect from a VNC client:
+printable characters (via `TextInput`, so keymaps and modifiers are already applied) plus the
+named keys — Backspace, Tab, Enter, Escape, the arrows, Home/End, Page Up/Down, Delete, Insert,
+F1–F12, Shift/Ctrl/Alt/Win — as X11 keysyms, including auto-repeat.
+
+Two keys are not forwarded:
+
+- **Menu** opens and closes the in-app menu (KOReader's own key name for it; on the SDL keymap
+  that is F1, so F1 is not available to the remote there). This is the only key the viewer keeps
+  for itself, and it is how a keyboard-only device reaches the menu.
+- On a device *without* a keyboard, `Back` leaves the viewer (there would be no other way out).
+  With a keyboard, `Back` is Escape and goes to the remote; leave through the menu's
+  *Leave (keep connection)*.
+
+Device-control keys that KOReader names `Power`, `Sym` or `ScreenKB` are ignored. The PC's
+"menu" key reaches the remote as the X11 `Menu` keysym.
 
 The in-app menu offers everything the viewer can do: the connection list, a status line, zoom
 presets (**Fit framebuffer** included), a "keyboard always visible" toggle, show/hide keyboard,
@@ -191,8 +204,11 @@ dialog left behind (cancel and save in the editor, Back in the per-connection di
 and confirmed deletes), that a failed connection returns to the connection list with exactly one
 dismissable message, that the canvas covers the whole screen and follows a rotation, that showing
 the keyboard neither rescales nor moves the view, that the keyboard is re-laid out for the new
-screen dimensions after a rotation, and that the menu swipe zone is registered while taps
-(anywhere, including the menu zone) still reach the remote desktop.
+screen dimensions after a rotation, that the menu swipe zone is registered while taps
+(anywhere, including the menu zone) still reach the remote desktop, that the menu's keyboard
+items really leave the keyboard in the state they promise, and that physical keys are forwarded
+(Escape/Enter/Tab/arrows/context-menu/F-keys, with releases and repeats) while the Menu key is
+kept back.
 
 ### Live end-to-end
 

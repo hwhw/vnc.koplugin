@@ -441,15 +441,29 @@ end
 
 -- ---------------------------------------------------------------- physical keyboard
 
+--[[--
+True for the one key we keep for ourselves: KOReader's `Menu` key opens (and closes) our menu,
+which is also how a keyboard-only device reaches it. Everything else is forwarded to the remote
+desktop — including Escape/Back, which is what a VNC client is expected to do; leaving the
+viewer with a keyboard is done from the menu.
+]]
+function ViewerApp:_is_menu_key(key)
+    return key.key == "Menu"
+end
+
+--- True when `Back` means "leave the viewer" rather than "send Escape".
+--- On a device without a keyboard there is no other way to get out, so it leaves there.
+function ViewerApp:_back_leaves(key)
+    return key.key == "Back" and not Device:hasKeyboard()
+end
+
 function ViewerApp:onKeyPress(key)
-    if key.key == "Back" then
-        self:on_back()
+    if self:_is_menu_key(key) then
+        self:toggle_menu()
         return true
     end
-    if key.key == "Menu" and Device:hasFewKeys() then
-        -- a dedicated menu button: KOReader's own convention is that it opens the menu (on a
-        -- full keyboard the Menu key is just another key we forward to the remote)
-        self:toggle_menu()
+    if self:_back_leaves(key) then
+        self:on_back()
         return true
     end
     local keysym = Keysyms.special[key.key]
@@ -462,10 +476,21 @@ function ViewerApp:onKeyPress(key)
 end
 
 function ViewerApp:onKeyRelease(key)
-    if key.key == "Back" then return true end
+    if self:_is_menu_key(key) or self:_back_leaves(key) then return true end
     local keysym = Keysyms.special[key.key]
     if keysym then
         self:send_key(keysym, false)
+        return true
+    end
+    return nil
+end
+
+--- Auto-repeat is just another key press as far as the remote is concerned.
+function ViewerApp:onKeyRepeat(key)
+    if self:_is_menu_key(key) or self:_back_leaves(key) then return true end
+    local keysym = Keysyms.special[key.key]
+    if keysym then
+        self:send_key(keysym, true)
         return true
     end
     return nil
@@ -518,10 +543,18 @@ function ViewerApp:_sync_keyboard()
     self:set_keyboard_visible(self.settings.keyboard_always_visible and true or false)
 end
 
---- Deferred variant, for use in menu/dialog close callbacks: by then the popup is gone, so
+--- Deferred variant for menu/dialog close callbacks: by then the popup is gone, so
 --- `_modal_above()` sees the real state.
+---
+--- It only ever *shows* the keyboard (to re-assert "keyboard always visible" after a popup hid
+--- it). It must not hide one: a menu item that just showed the keyboard runs *before* this, and
+--- forcing the setting off here would close it again right away.
 function ViewerApp:_sync_keyboard_later()
-    UIManager:nextTick(function() self:_sync_keyboard() end)
+    UIManager:nextTick(function()
+        if self.settings.keyboard_always_visible then
+            self:set_keyboard_visible(true)
+        end
+    end)
 end
 
 --- The keyboard reports a new height (e.g. after a layout switch). It repaints itself; we

@@ -31,6 +31,9 @@ Keysyms.special = {
     AA        = 0xFFEA,
     Win       = 0xFFEB,
     Menu      = 0xFF67,
+    -- The key PC keyboards call "menu" (KOReader uses "Menu" for F1 on its SDL keymap, so
+    -- this is the one that still reaches the remote as an X11 Menu keysym).
+    ContextMenu = 0xFF67,
 }
 
 for i = 1, 12 do

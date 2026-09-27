@@ -418,6 +418,118 @@ check("menu_opens_on_swipe_only", function()
     remote:free()
 end)
 
+check("menu_keyboard_items_work", function()
+    -- A real tap goes through Menu:onMenuSelect, which runs the item callback *and* the menu's
+    -- close callback; the latter used to switch the keyboard off again right after the item
+    -- had switched it on.
+    local app, remote = new_app()
+    local function choose_menu_item(text)
+        app:open_menu()
+        local menu = app.menu
+        for _, item in ipairs(menu.item_table) do
+            if item.text == text then
+                menu:onMenuSelect(item)
+                UIManager:_checkTasks()   -- run the deferred keyboard sync
+                return
+            end
+        end
+        error(string.format("no %q menu item", text))
+    end
+
+    assert_true(not app.vk_visible, "the keyboard starts hidden")
+    choose_menu_item("Show keyboard")
+    assert_true(app.menu == nil, "choosing an item closes the menu")
+    assert_true(app.vk_visible, "\"Show keyboard\" must leave the keyboard shown")
+
+    choose_menu_item("Hide keyboard")
+    assert_true(not app.vk_visible, "\"Hide keyboard\" must leave it hidden")
+
+    -- with the setting on, the keyboard survives a menu round trip
+    app.settings.keyboard_always_visible = true
+    choose_menu_item("Show keyboard")
+    assert_true(app.vk_visible, "with the setting on the keyboard must stay visible")
+
+    -- and a popup that forced it away brings it back when it closes
+    local InfoMessage = require("ui/widget/infomessage")
+    local popup = InfoMessage:new{ text = "popup" }
+    UIManager:show(popup)
+    app:set_keyboard_visible(true)                    -- refused: a popup is above us
+    assert_true(not app.vk_visible, "a popup must keep our keyboard hidden")
+    UIManager:close(popup)
+    app:_sync_keyboard_later()
+    UIManager:_checkTasks()
+    assert_true(app.vk_visible, "closing the popup must bring the keyboard back")
+
+    app.settings.keyboard_always_visible = false
+    app:set_keyboard_visible(false)
+    assert_true(not app.vk_visible, "and it can be hidden again once the setting is off")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keys_forward_to_the_remote", function()
+    local Key = require("device/key")
+    local app, remote, sent = new_app()
+    assert_true(Device:hasKeyboard(), "this check is about devices that have a keyboard")
+
+    local function press(name)
+        sent.key = {}
+        app:onKeyPress(Key:new(name, {}))
+        app:onKeyRelease(Key:new(name, {}))
+        local out = {}
+        for _, e in ipairs(sent.key) do
+            out[#out + 1] = string.format("%s0x%X", e.down and "+" or "-", e.keysym)
+        end
+        return table.concat(out, ",")
+    end
+
+    local cases = {
+        { "Back", "+0xFF1B,-0xFF1B" },          -- Escape: the remote gets it, we do not leave
+        { "Press", "+0xFF0D,-0xFF0D" },         -- Enter
+        { "Tab", "+0xFF09,-0xFF09" },
+        { "Backspace", "+0xFF08,-0xFF08" },
+        { "Left", "+0xFF51,-0xFF51" },
+        { "ContextMenu", "+0xFF67,-0xFF67" },   -- the PC "menu" key
+        { "F5", "+0xFFC2,-0xFFC2" },
+    }
+    for _, case in ipairs(cases) do
+        local got = press(case[1])
+        assert_true(got == case[2], string.format("%s must be forwarded as %s, got %s",
+            case[1], case[2], got))
+    end
+
+    -- auto-repeat is another press
+    sent.key = {}
+    app:onKeyRepeat(Key:new("Left", {}))
+    assert_true(#sent.key == 1 and sent.key[1].down and sent.key[1].keysym == 0xFF51,
+        "a repeated key must be forwarded as a press")
+
+    -- the Menu key is ours: it must not be sent, and it opens the menu
+    sent.key = {}
+    app:onKeyPress(Key:new("Menu", {}))
+    assert_true(#sent.key == 0, "the Menu key must not be forwarded")
+    assert_true(app.menu ~= nil, "the Menu key must open the menu")
+    app:onKeyPress(Key:new("Menu", {}))
+    assert_true(app.menu == nil, "the Menu key must close it again")
+    app:onKeyRelease(Key:new("Menu", {}))
+    assert_true(#sent.key == 0, "the Menu key release must not be forwarded either")
+
+    -- on a device without a keyboard, Back leaves the viewer instead
+    local left = false
+    app.plugin.leave_app = function() left = true end
+    app:onKeyPress(Key:new("Back", {}))
+    assert_true(not left, "with a keyboard, Escape must not leave the viewer")
+    local original = Device.hasKeyboard
+    Device.hasKeyboard = function() return false end
+    app:onKeyPress(Key:new("Back", {}))
+    Device.hasKeyboard = original
+    assert_true(left, "without a keyboard, Back must leave the viewer")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
 if failures > 0 then
     print(string.format("%d check(s) failed", failures))
     os.exit(1)
