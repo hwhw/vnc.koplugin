@@ -183,6 +183,23 @@ function Remote:get_view_rect()
 end
 
 --[[--
+Maps a remote rect onto canvas coordinates, for dirty regions.
+
+The result is deliberately generous by a pixel: a scaled rect's edges can land between
+pixels, and repainting one extra row/column is cheaper than a missing one.
+--- @tparam table rect `{x, y, w, h}` in remote coordinates
+--- @tparam number cx, cy canvas origin
+--- @treturn number, number, number, number
+]]
+function Remote:rect_to_canvas(rect, cx, cy)
+    local x = cx + math.floor((rect.x - self.view_x) * self.scale)
+    local y = cy + math.floor((rect.y - self.view_y) * self.scale)
+    local w = math.ceil(rect.w * self.scale) + 1
+    local h = math.ceil(rect.h * self.scale) + 1
+    return x, y, w, h
+end
+
+--[[--
 Draws the visible part of the plane into `bb` at `(cx, cy)`, using a canvas of `cw` x `ch`.
 
 At 1:1 this is a straight blit; otherwise the source rect is scaled through
