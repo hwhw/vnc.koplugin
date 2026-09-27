@@ -3,7 +3,9 @@
 Standalone test harness for the vnc protocol layer.
 
 Starts `tools/mock_vnc_server.py` (one instance per case, on an ephemeral port) and drives
-@{vnc.protocol} against it over a real socket, plus a few in-memory byte-stream cases.
+@{vnc.protocol} against it over a real socket, plus a few in-memory byte-stream cases. The last
+two checks drive @{vnc.session}'s own transport (queue flush and read buffering) rather than the
+protocol directly.
 
 Run with KOReader's own LuaJIT from the KOReader root:
 
@@ -111,6 +113,7 @@ local function start_mock(opts)
     if opts.password then table.insert(cmd, "--password"); table.insert(cmd, opts.password) end
     if opts.repaint then table.insert(cmd, "--repaint"); table.insert(cmd, tostring(opts.repaint)) end
     if opts.resize_after then table.insert(cmd, "--resize-after"); table.insert(cmd, tostring(opts.resize_after)) end
+    if opts.split then table.insert(cmd, "--split"); table.insert(cmd, tostring(opts.split)) end
     table.insert(cmd, "--once")
     local full = table.concat(cmd, " ") .. " > " .. log .. ".stdout 2>&1 & echo $!"
     local h = assert(io.popen(full, "r"))
@@ -330,6 +333,19 @@ local function run_mem(bytes, o)
     end
     proto:free()
     return nil, "protocol did not terminate"
+end
+
+--[[--
+Loads @{vnc.session} for the transport-level checks. The session requires `ui/uimanager` for
+its poll task, which drags in the whole widget stack; the harness has none, so stand one in
+that only provides the two scheduling calls the session makes. It is installed lazily so the
+protocol-only checks keep running without it.
+]]
+local function load_session()
+    package.preload["ui/uimanager"] = package.preload["ui/uimanager"] or function()
+        return { scheduleIn = function() end, unschedule = function() end }
+    end
+    return require("vnc/session")
 end
 
 -- ---------------------------------------------------------------- checks
@@ -742,6 +758,188 @@ local function main()
             return nil, "error was " .. tostring(err) .. ", wanted \"unsupported encoding 6\""
         end
         return true
+    end)
+
+    -- 10. A client message that a timed-out `send` only partly wrote: LuaSocket reports the
+    -- bytes it did put on the wire as the *third* return value, so a queue that ignores it
+    -- re-sends them on the next attempt, duplicating the prefix of every message.
+    check("session_send_partial_progress", function()
+        local Session = load_session()
+        -- A socket that behaves like LuaSocket's: it writes what its buffer has room for and
+        -- then reports `nil, "timeout", last_index_written`.
+        local sock = { sent = "", room = 7 }
+        function sock:send(data, i)
+            i = i or 1
+            if self.room <= 0 then return nil, "timeout", i - 1 end
+            local n = math.min(self.room, #data - i + 1)
+            self.sent = self.sent .. data:sub(i, i + n - 1)
+            self.room = self.room - n
+            local last = i + n - 1
+            if self.room > 0 then return last end
+            return nil, "timeout", last
+        end
+
+        local s = setmetatable({ tx = { "AAAAABBBBB", "CC" }, sock = sock }, Session)
+        local ok, err = s:_flush_tx()
+        if not ok then return nil, "flush failed: " .. tostring(err) end
+        if s.tx[1] ~= "BBB" or #s.tx ~= 2 then
+            return nil, string.format(
+                "after a partial send the queue is {%s, ...} (%d frames), wanted {\"BBB\", \"CC\"}",
+                tostring(s.tx[1]), #s.tx)
+        end
+        while #s.tx > 0 do
+            sock.room = 7
+            local ok2, err2 = s:_flush_tx()
+            if not ok2 then return nil, "drain failed: " .. tostring(err2) end
+        end
+        if sock.sent ~= "AAAAABBBBBCC" then
+            return nil, string.format("wire carried %q, wanted every byte exactly once (%q)",
+                sock.sent, "AAAAABBBBBCC")
+        end
+        return true
+    end)
+
+    -- 11. A server message that arrives split across TCP segments: the transport keeps the
+    -- partial reads and resumes, and the protocol decodes the message once the rest arrives.
+    -- (The mock writes every message in small chunks, with a pause between them, so the reads
+    -- between the chunks really do time out.)
+    check("session_split_server_message", function()
+        local Session = load_session()
+        local W, H = 32, 24
+        local pid, port = start_mock{
+            name = "split", encoding = "raw", pattern = "gradient",
+            width = W, height = H, split = 16,
+        }
+        local s = Session.new{
+            profile = { host = "127.0.0.1", port = port, password = "", name = "split" },
+            network_mgr = {
+                isWifiOn = function() return true end,
+                turnOffWifi = function() end,
+            },
+        }
+        local connected, cerr
+        s:connect(function(ok, err) connected, cerr = ok, err end)
+        if not connected then
+            stop_mock(pid)
+            return nil, "connect failed: " .. tostring(cerr)
+        end
+
+        local dirty_seen = false
+        s.app = {
+            on_framebuffer_dirty = function() dirty_seen = true end,
+            on_remote_resized = function() end,
+            on_bell = function() end,
+        }
+        s:request_full_update()
+        s:_flush_now()
+
+        local deadline = os.time() + 20
+        local stopped = false
+        while not s.dirty and os.time() < deadline do
+            if s:_pump() == "error" then
+                stopped = true
+                break
+            end
+            socket.sleep(0.01)
+        end
+        local ok, err = true, nil
+        if stopped then
+            ok, err = nil, "pump failed: " .. tostring(s:get_error())
+        elseif not s.dirty then
+            ok, err = nil, "no rectangle decoded from the split update"
+        else
+            local cok, cerr2 = check_plane(s.remote:get_plane(), W, H, expect_pattern("gradient", W, H))
+            if not cok then ok, err = nil, cerr2 end
+        end
+        if ok then
+            -- What the poll task does with the accumulated rect; the UI is the consumer.
+            s.attached = true
+            s:_poll()
+            s.attached = false
+            if not dirty_seen then
+                ok, err = nil, "rectangle decoded but the app was not told it is dirty"
+            end
+        end
+        s:disconnect()
+        stop_mock(pid)
+        return ok, err
+    end)
+
+    -- 12. The same partial write over a real socket: a message larger than the send buffer,
+    -- flushed in one go, must not be duplicated. SO_SNDBUF is shrunk so the write really is
+    -- split; if it cannot be shrunk the check fails instead of passing vacuously.
+    check("session_send_partial_end_to_end", function()
+        local Session = load_session()
+        ffi.cdef[[
+            int setsockopt(int fd, int level, int optname, const void *optval, unsigned int optlen);
+            int getsockopt(int fd, int level, int optname, void *optval, unsigned int *optlen);
+        ]]
+        local SOL_SOCKET, SO_SNDBUF = 1, 7 -- Linux socket ABI
+        local payload = 200000
+        local pid, port, log = start_mock{
+            name = "bigsend", encoding = "raw", pattern = "gradient", width = 32, height = 24,
+        }
+        local s = Session.new{
+            profile = { host = "127.0.0.1", port = port, password = "", name = "bigsend" },
+            network_mgr = {
+                isWifiOn = function() return true end,
+                turnOffWifi = function() end,
+            },
+        }
+        local connected, cerr
+        s:connect(function(ok, err) connected, cerr = ok, err end)
+        if not connected then
+            stop_mock(pid)
+            return nil, "connect failed: " .. tostring(cerr)
+        end
+
+        local function done(ok, err)
+            s:disconnect()
+            stop_mock(pid)
+            return ok, err
+        end
+
+        local fd = s.sock:getfd()
+        local want = ffi.new("int[1]", 4096)
+        if ffi.C.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, want, 4) ~= 0 then
+            return done(nil, "could not shrink SO_SNDBUF")
+        end
+        local got, gotlen = ffi.new("int[1]"), ffi.new("unsigned int[1]", 4)
+        ffi.C.getsockopt(fd, SOL_SOCKET, SO_SNDBUF, got, gotlen)
+        if got[0] >= payload then
+            return done(nil, string.format(
+                "send buffer is %d bytes, too large to force a partial send", got[0]))
+        end
+
+        s:send_cut_text(string.rep("Z", payload))
+        local deadline = os.time() + 20
+        while #s.tx > 0 and os.time() < deadline do
+            s:_flush_now()
+            socket.sleep(0.005)
+        end
+        if s:get_state() == "error" then
+            return done(nil, "session failed: " .. tostring(s:get_error()))
+        end
+        if #s.tx > 0 then
+            return done(nil, string.format(
+                "queue never drained (%d bytes left) - the timed-out send's progress was lost",
+                #s.tx[1]))
+        end
+
+        s:send_pointer(7, 9, 1)
+        local ok, err = nil, "the mock never saw the pointer event"
+        for _ = 1, 200 do
+            s:_flush_now()
+            if log_has(log, "INPUT PointerEvent mask=1 x=7 y=9") then ok, err = true, nil break end
+            socket.sleep(0.02)
+        end
+        if ok and not log_has(log, string.format("INPUT ClientCutText len=%d", payload)) then
+            ok, err = nil, "the mock never saw the cut text"
+        end
+        if ok and log_has(log, "ERROR") then
+            ok, err = nil, "the mock read the client stream out of frame"
+        end
+        return done(ok, err)
     end)
 
     if failures > 0 then

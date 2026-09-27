@@ -615,6 +615,26 @@ class TightEncoder:
 
 # ---------------------------------------------------------------- connection
 
+class ChunkedSock:
+    """Wraps a socket so every message is written in `chunk`-sized pieces, with a short pause
+    between them: the peer sees each server message split across TCP segments, so a read that
+    is answered from a partially-filled buffer has to cope with the rest arriving later."""
+
+    def __init__(self, sock, chunk, delay=0.02):
+        self._sock = sock
+        self._chunk = chunk
+        self._delay = delay
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+    def sendall(self, data):
+        for i in range(0, len(data), self._chunk):
+            self._sock.sendall(data[i:i + self._chunk])
+            if i + self._chunk < len(data):
+                time.sleep(self._delay)
+
+
 class Connection:
     def __init__(self, sock):
         self.sock = sock
@@ -631,31 +651,41 @@ class Connection:
 
     def try_message(self):
         """Returns (type, payload_bytes) or None when no complete message is buffered."""
-        if not self.buf:
-            self.buf += self._poll()
+        while True:
             if not self.buf:
+                self.buf += self._poll()
+                if not self.buf:
+                    return None
+                continue
+            t = self.buf[0]
+            if t == 0:
+                need = 20
+            elif t == 2:
+                if len(self.buf) < 4:
+                    need = None
+                else:
+                    need = 4 + 4 * struct.unpack(">H", self.buf[2:4])[0]
+            elif t in (3, 4):
+                need = 10 if t == 3 else 8
+            elif t == 5:
+                need = 6
+            elif t == 6:
+                if len(self.buf) < 8:
+                    need = None
+                else:
+                    need = 8 + struct.unpack(">I", self.buf[4:8])[0]
+            else:
+                raise ValueError("unknown client message type %d" % t)
+            if need is not None and len(self.buf) >= need:
+                out, self.buf = self.buf[:need], self.buf[need:]
+                return t, out
+            # The message is not complete yet: read more (this waits up to the poll timeout)
+            # instead of spinning on the same buffered bytes, which would wedge a message that
+            # the client had to split across several writes (a large clipboard, say).
+            data = self._poll()
+            if not data:
                 return None
-        t = self.buf[0]
-        if t == 0:
-            need = 20
-        elif t == 2:
-            if len(self.buf) < 4:
-                return None
-            need = 4 + 4 * struct.unpack(">H", self.buf[2:4])[0]
-        elif t in (3, 4):
-            need = 10 if t == 3 else 8
-        elif t == 5:
-            need = 6
-        elif t == 6:
-            if len(self.buf) < 8:
-                return None
-            need = 8 + struct.unpack(">I", self.buf[4:8])[0]
-        else:
-            raise ValueError("unknown client message type %d" % t)
-        if len(self.buf) < need:
-            return None
-        out, self.buf = self.buf[:need], self.buf[need:]
-        return t, out
+            self.buf += data
 
     def _poll(self):
         import select
@@ -933,6 +963,9 @@ def main():
     ap.add_argument("--repaint", type=float, default=0)
     ap.add_argument("--log", default=None)
     ap.add_argument("--resize-after", type=int, default=0)
+    ap.add_argument("--split", type=int, default=0,
+                    help="write server messages in chunks of this many bytes, with a short "
+                         "pause between them (exercises the client's partial-read handling)")
     ap.add_argument("--once", action="store_true", help="exit after the first connection")
     args = ap.parse_args()
 
@@ -948,6 +981,8 @@ def main():
     while True:
         sock, _ = srv.accept()
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if args.split > 0:
+            sock = ChunkedSock(sock, args.split)
         conn = Connection(sock)
         try:
             server = MockServer(args)

@@ -257,11 +257,18 @@ end
 function Session:_flush_tx()
     while #self.tx > 0 do
         local out = self.tx[1]
-        local last, err = self.sock:send(out)
-        if last == #out then
+        local sent, err, last = self.sock:send(out)
+        -- A timed-out send has still put the bytes up to `last` on the wire, and LuaSocket
+        -- reports that progress only as its *third* return value. Keeping those bytes queued
+        -- would send them again on the next attempt, and the server would read every later
+        -- message from the wrong offset.
+        if not sent and err == "timeout" and type(last) == "number" and last > 0 then
+            sent = last
+        end
+        if sent == #out then
             table.remove(self.tx, 1)
-        elseif last then
-            self.tx[1] = out:sub(last + 1)
+        elseif sent then
+            self.tx[1] = out:sub(sent + 1)
             return true
         elseif err == "timeout" then
             return true
