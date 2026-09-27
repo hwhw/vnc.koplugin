@@ -440,6 +440,37 @@ check("encoder_survives_reuse", function()
     enc:free()
 end)
 
+--- Waits that must not depend on how fast the server reads: see @{pump_until} and
+--- @{step_for} - both are defined here because the first check below uses them.
+--- Pumps `step` until `cond()` holds, bounded by `seconds` of *wall clock*.
+---
+--- Never by a poll count: what one poll gets through depends on the server's own pacing (how much
+--- it reads per poll, how long a poll's work takes, what the client sent in one write), so a count
+--- that happens to match one machine's speed is what makes a check fail on a slower one. The poll
+--- count comes back so a check can put it in its message.
+--- @treturn boolean, number whether the condition held, and the polls it took
+local function pump_until(step, seconds, cond)
+    local socket = require("socket")
+    local deadline = socket.gettime() + (seconds or 5)
+    local polls = 0
+    while true do
+        polls = polls + 1
+        step()
+        if cond() then return true, polls end
+        if socket.gettime() >= deadline then return false, polls end
+        socket.sleep(0.01)
+    end
+end
+
+--- Runs `step` for `seconds` of wall clock. For a check that asserts something did *not* happen:
+--- the wait has to be long enough for it to have happened, and that is a matter of time, not of a
+--- poll count.
+local function step_for(step, seconds)
+    local socket = require("socket")
+    local deadline = socket.gettime() + seconds
+    while socket.gettime() < deadline do step() end
+end
+
 -- ---------------------------------------------------------------- the server protocol and runtime
 
 --- A side of the in-process byte pump: an object with `step()`, plus what it has written.
@@ -603,30 +634,38 @@ check("server_serves_the_screen_over_a_socket", function()
         cli:settimeout(3)
         assert(cli:connect("127.0.0.1", settings.port))
         cli:settimeout(0.2)
+        cli:setoption("tcp-nodelay", true)         -- c.f., connect_client: a write must be readable
         local function expect(n)
-            local deadline = os.time() + 5
-            local data, e
-            while os.time() <= deadline do
+            -- Bounded by wall clock and by the condition (bytes arrived), never by a poll count:
+            -- how much one poll reads is the server's business. The socket timeout is lowered
+            -- while pumping so the loop is not throttled by it (c.f., connect_client).
+            local timeout = cli:gettimeout()
+            cli:settimeout(0.02)
+            local deadline = socket.gettime() + 5
+            local polls, data, e = 0, nil, nil
+            while socket.gettime() < deadline do
                 data, e = cli:receive(n)
-                if data then return data end
+                if data then break end
                 if e ~= "timeout" then break end
                 server:_poll()
-                socket.sleep(0.01)
+                polls = polls + 1
             end
-            assert_true(data ~= nil, string.format("short read of %d bytes: %s", n, tostring(e)))
+            cli:settimeout(timeout)
+            assert_true(data ~= nil, string.format(
+                "short read of %d bytes after %d poll(s) in 5 s: %s", n, polls, tostring(e)))
             return data
         end
 
-        local function pump_server(n)
-            for _ = 1, n or 20 do
-                server:_poll()                     -- services sockets and the coroutines
-                socket.sleep(0.02)
-            end
+        -- Lets the server produce what it already has (it is polled, nothing was sent to it): a
+        -- wall-clock settle rather than a poll count - `expect` below waits for each reply for as
+        -- long as it takes.
+        local function pump_server(seconds)
+            step_for(function() server:_poll() end, seconds or 0.05)
         end
         -- A small positive timeout: non-blocking sends on a fresh socket can be dropped
         -- silently, and expect() below treats "timeout" as "pump the server and retry".
 
-        pump_server(20)
+        pump_server()
         assert_true(expect(12) == "RFB 003.008\n", "the server must announce 3.8")
         cli:send("RFB 003.008\n")
         local count = expect(1):byte()
@@ -637,7 +676,7 @@ check("server_serves_the_screen_over_a_socket", function()
         local result = expect(4)
         assert_true(result == "\0\0\0\0", "SecurityResult must be 0 (ok)")
         cli:send(string.char(1))                   -- ClientInit, shared
-        pump_server(4)
+        pump_server()
         local init = expect(20)                  -- width, height, 16-byte PIXEL_FORMAT
         local sw = init:byte(1) * 256 + init:byte(2)
         local sh = init:byte(3) * 256 + init:byte(4)
@@ -653,10 +692,10 @@ check("server_serves_the_screen_over_a_socket", function()
             string.char(0, 8, 16) .. "\0\0\0")
         cli:send(string.char(2, 0, 0, 1) ..                            -- SetEncodings: Raw
             string.char(0, 0, 0, 0))
-        pump_server(10)
+        pump_server()
         cli:send(string.char(3, 0) .. string.char(0, 0, 0, 0) ..       -- FramebufferUpdateRequest
             string.char(math.floor(sw / 256), sw % 256, math.floor(sh / 256), sh % 256))
-        pump_server(20)
+        pump_server()
 
         local head = expect(4)
         assert_true(head:byte(1) == 0, "expected a FramebufferUpdate, got message " .. head:byte(1))
@@ -712,6 +751,12 @@ end)
 --- per poll (`want = min(pending - rx_len, READ_CHUNK)`), so a ten-byte client message needs about
 --- ten polls before anything can come back, and at the 0.2 s timeout the other readers use that is
 --- already two seconds of waiting.
+--- @treturn string exactly `n` bytes
+local function recv_exact(cli, n, server)
+    return table.concat(parts)
+end
+
+
 --- @treturn string exactly `n` bytes
 local function recv_exact(cli, n, server)
     local socket = require("socket")
@@ -781,16 +826,22 @@ check("server_serves_a_second_incremental_update", function()
         cli:settimeout(0.2)
         assert(cli:connect("127.0.0.1", port))
         local function pump_and_read(n)
-            local deadline = os.time() + 5
-            local data, e
-            while os.time() <= deadline do
+            -- Wall clock and the condition, not a poll count (c.f., pump_until), and a short
+            -- socket timeout while pumping so the read timeout does not throttle the loop.
+            local timeout = cli:gettimeout()
+            cli:settimeout(0.02)
+            local deadline = socket.gettime() + 5
+            local polls, data, e = 0, nil, nil
+            while socket.gettime() < deadline do
                 data, e = cli:receive(n)
-                if data then return data end
+                if data then break end
                 if e ~= "timeout" then break end
                 server:_poll()
-                socket.sleep(0.01)
+                polls = polls + 1
             end
-            assert_true(data ~= nil, string.format("short read of %d: %s", n, tostring(e)))
+            cli:settimeout(timeout)
+            assert_true(data ~= nil, string.format(
+                "short read of %d after %d poll(s) in 5 s: %s", n, polls, tostring(e)))
             return data
         end
         pump_and_read(12)                                   -- version
@@ -871,17 +922,16 @@ check("server_serves_a_second_incremental_update", function()
                 if tostring(ev.handler) == "onKeyPress" then seen_key = true end
             end
             local ok_held, held_err = pcall(function()
-                request(true)                        -- nothing dirty yet: the request is held
-                socket.sleep(0.05)
-                server:_poll()
+                -- Nothing dirty: the request is answered with an empty update at once (that is what
+                -- the next section drains), so the keystroke behind it is read in the same poll or
+                -- the next - which is what this waits for, by wall clock.
+                request(true)
                 cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))  -- KeyEvent Down
-                for _ = 1, 100 do                    -- ~2s, with no screen change at all
-                    server:_poll()
-                    socket.sleep(0.02)
-                    if seen_key then break end
-                end
-                assert_true(seen_key,
-                    "a keystroke must be acted on without waiting for a screen change")
+                local acted, polls = pump_until(function() server:_poll() end, 2,
+                    function() return seen_key end)
+                assert_true(acted, string.format(
+                    "a keystroke must be acted on without waiting for a screen change (%d poll(s) "
+                    .. "in 2 s)", polls))
             end)
             UIManager.handleInputEvent = original_input_event
             if not ok_held then error(held_err, 0) end
@@ -906,11 +956,10 @@ check("server_serves_a_second_incremental_update", function()
                 end
                 return saw_key and saw_gesture
             end
-            for _ = 1, 60 do
-                server:_poll()
-                socket.sleep(0.02)
-                if scan() then break end
-            end
+            local arrived, polls = pump_until(function() server:_poll() end, 2, scan)
+            assert_true(arrived, string.format(
+                "a KeyEvent and a PointerEvent over the wire must both become KOReader input events"
+                .. " (%d poll(s) in 2 s, got %s)", polls, table.concat(injected, ",")))
             assert_true(#injected > 0, "no KOReader input event came out of the socket path")
             assert_true(saw_key, "a KeyEvent over the wire must become a KOReader key event, got "
                 .. table.concat(injected, ","))
@@ -953,17 +1002,16 @@ check("server_serves_a_second_incremental_update", function()
             -- ... and the session must still take input afterwards
             injected = {}
             cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))   -- KeyEvent: Down
-            local still_alive = false
-            for _ = 1, 60 do
-                server:_poll()
-                socket.sleep(0.02)
+            local function saw_key_press()
                 for _, h in ipairs(injected) do
-                    if h == "onKeyPress" then still_alive = true end
+                    if h == "onKeyPress" then return true end
                 end
-                if still_alive then break end
+                return false
             end
-            assert_true(still_alive,
-                "the session must still take input after non-RFC client messages (it closed)")
+            local still_alive, polls = pump_until(function() server:_poll() end, 2, saw_key_press)
+            assert_true(still_alive, string.format(
+                "the session must still take input after non-RFC client messages (it closed after"
+                .. " %d poll(s) in 2 s)", polls))
             -- (The pointer path is asserted in server_injects_client_input, where the gesture
             -- detector's state is deterministic; here it is enough that the message was consumed
             -- and produced no error while the session stayed up.)
@@ -983,7 +1031,6 @@ check("server_serves_a_second_incremental_update", function()
         -- soon as reading got cheaper. What reached the client earlier in this check - the answer
         -- to the request in the input section above - is dropped before the change, so the update
         -- read below can only be the one this change produced.
-        socket.sleep(0.05)
         drain_socket(cli, 0.2, server)
         bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
         bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
@@ -1024,17 +1071,31 @@ local function connect_client(server, port, encodings_wire, pump)
     local cli = assert(socket.tcp())
     cli:settimeout(0.2)
     assert(cli:connect("127.0.0.1", port))
+    -- Nagle would let a write sit in this client's kernel until the peer's delayed ACK (tens of ms
+    -- on loopback), so "the write has been sent" would not mean "the server can read it" - and the
+    -- checks that assert what one poll must read need it to mean that. A viewer that cares about
+    -- latency turns it off for the same reason.
+    cli:setoption("tcp-nodelay", true)
     local function pump_and_read(n)
-        local deadline = os.time() + 5
-        local data, e
-        while os.time() <= deadline do
+        -- Wall clock and the condition, not a poll count (c.f., pump_until) - and while waiting,
+        -- read with a short socket timeout: at the session's 0.2 s the loop would spend most of its
+        -- deadline asleep inside `receive`, so how many times it got to pump in five seconds (and
+        -- so whether it got through a slower reader's messages) would depend on that timeout
+        -- rather than on the server.
+        local timeout = cli:gettimeout()
+        cli:settimeout(0.02)
+        local deadline = socket.gettime() + 5
+        local polls, data, e = 0, nil, nil
+        while socket.gettime() < deadline do
             data, e = cli:receive(n)
-            if data then return data end
+            if data then break end
             if e ~= "timeout" then break end
             step()
-            socket.sleep(0.01)
+            polls = polls + 1
         end
-        assert_true(data ~= nil, string.format("short read of %d: %s", n, tostring(e)))
+        cli:settimeout(timeout)
+        assert_true(data ~= nil, string.format(
+            "short read of %d after %d poll(s) in 5 s: %s", n, polls, tostring(e)))
         return data
     end
 
@@ -1148,11 +1209,20 @@ check("server_sends_a_change_after_the_first_full_update", function()
         -- reads the one byte it has, waits for the other, and must not drop the one it read.
         local msg = client.request(true, 0, 0, sw, sh)
         cli:send(msg:sub(1, 3))
-        for _ = 1, 3 do
-            server:_poll()                          -- reaches the two-byte read of x
-            socket.sleep(0.02)
+        -- Wait for the *state* the check is about - the server holds the three bytes it was given
+        -- and is waiting for the rest of the message (type, incremental and one byte of x are in
+        -- hand, two bytes of x are owed) - rather than for a number of polls. Three polls used to
+        -- be enough to walk it to the x field, and how many it takes is the server's own business.
+        local function mid_message()
+            for _, record in pairs(server.clients) do
+                if record.rx_len == 1 and record.pending == 2 then return true end
+            end
+            return false
         end
-        socket.sleep(0.05)                          -- ... and times out there
+        local waiting, polls = pump_until(function() server:_poll() end, 2, mid_message)
+        assert_true(waiting, string.format(
+            "a half-received request must leave the server waiting for the rest of it, with the"
+            .. " bytes it did get kept (%d poll(s) in 2 s)", polls))
         cli:send(msg:sub(4))
 
         assert_true(client.read_update(plane) >= 1, "the change must arrive as a rectangle")
@@ -1296,22 +1366,26 @@ check("a_burst_of_pointer_events_is_parsed_in_one_poll", function()
             parts[i] = string.char(5, 0, (i % 250) + 1, 1, (i % 250) + 1, 2)
         end
         parts[#parts + 1] = client.request(false, 0, 0, 16, 16)
+        -- No wait before the poll: `send` handed the bytes to the kernel, and which poll reads them
+        -- is what this asserts.
         cli:send(table.concat(parts))
-        socket.sleep(0.02)                      -- let the whole write arrive
-
         client.polls(2)
         local record
         for _, r in pairs(server.clients) do record = r end
         assert_true(record ~= nil, "the client must be registered while it is connected")
+        -- Two polls is the *design* bound, not a speed budget: one poll reads and parses a whole
+        -- write (that is what the read-ahead is for), the second is the slack the read/parse split
+        -- needs for bytes that land while the first is being parsed.
         assert_true(record.rx_len == 0, string.format(
-            "the whole write must be parsed within two polls, %d byte(s) still unread",
+            "one poll must read and parse a whole write, %d byte(s) still unread after two polls",
             record.rx_len))
 
         -- ... and the request behind the burst was answered in the same poll: its update is
         -- already on the wire, so it is read here without pumping the server any further.
         local head, e = cli:receive(4)
         assert_true(head ~= nil and head:byte(1) == 0, string.format(
-            "the request behind the burst must be answered within two polls (%s)", tostring(e)))
+            "the burst and the request are one write, so one poll must have read and parsed both"
+            .. " (%s)", tostring(e)))
         assert_true(head:byte(3) * 256 + head:byte(4) == 1,
             "the 16x16 request must be answered with one rectangle")
         cli:close()
@@ -1344,22 +1418,20 @@ check("a_large_client_message_is_consumed_in_one_poll", function()
         for _ = 1, 200 do parts[#parts + 1] = string.char(0, 0, 0, 0) end
         parts[#parts + 1] = client.request(false, 0, 0, 16, 16)
         cli:send(table.concat(parts))
-        socket.sleep(0.02)
-
         client.polls(2)
         local record
         for _, r in pairs(server.clients) do record = r end
         assert_true(record ~= nil, "the client must be registered while it is connected")
         assert_true(record.rx_len == 0, string.format(
-            "the whole encoding list must be parsed within two polls, %d byte(s) still unread",
-            record.rx_len))
+            "one poll must read and parse a whole write - this one is 200 four-byte reads -"
+            .. " %d byte(s) still unread after two polls", record.rx_len))
         assert_true(#(record.server.client.encodings or {}) == 200,
             "all 200 announced encodings must have been recorded")
 
         local head, e = cli:receive(4)
         assert_true(head ~= nil and head:byte(1) == 0, string.format(
-            "the request behind the encoding list must be answered within two polls (%s)",
-            tostring(e)))
+            "the encoding list and the request behind it are one write, so one poll must have read"
+            .. " and parsed both (%s)", tostring(e)))
         cli:close()
     end)
 
@@ -1397,14 +1469,14 @@ check("an_incremental_request_with_nothing_changed_is_answered_at_once", functio
         assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
         plane:free()
 
-        -- nothing changed since: ask incrementally and pump exactly two polls
+        -- nothing changed since: ask incrementally and pump exactly two polls (the answer is due
+        -- in the poll that reads the request, so the second is slack, not a speed budget)
         cli:send(client.request(true, 0, 0, sw, sh))
-        socket.sleep(0.02)
         client.polls(2)
 
         local head, e = cli:receive(4)
         assert_true(head ~= nil and head:byte(1) == 0, string.format(
-            "an incremental request must be answered within two polls (%s)", tostring(e)))
+            "an incremental request must be answered in the poll that read it (%s)", tostring(e)))
         local nrects = head:byte(3) * 256 + head:byte(4)
         assert_true(nrects == 0, string.format(
             "with nothing changed the answer must be an empty update, got %d rectangle(s)", nrects))
@@ -1457,15 +1529,15 @@ check("two_clients_of_one_format_share_one_conversion", function()
         bb:paintRect(8, 8, 200, 100, BB.COLOR_WHITE)
         server:_record_dirty("partial", { x = 8, y = 8, w = 200, h = 100 })
 
-        -- both ask in the same tick
+        -- both ask in the same tick: `send` put each request in the kernel, so the next poll
+        -- serves both clients - no wait is involved, and the sharing asserted below is per poll.
         a.send(a.request(true, 0, 0, sw, sh))
         b.send(b.request(true, 0, 0, sw, sh))
-        socket.sleep(0.02)                  -- both requests are on the wire
         calls = 0                           -- the first frames are not part of this
         server:_poll()
         assert_true(calls == 1, string.format(
-            "two clients of one pixel format must share one conversion, converted %d time(s)",
-            calls))
+            "one poll must convert a rectangle once for every client of that pixel format that asks"
+            .. " in it, converted %d time(s)", calls))
 
         -- ... and both were served in that poll: their answers are already on the wire
         local ahead = a.sock:receive(4)
@@ -1524,18 +1596,19 @@ check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", func
         -- EnableContinuousUpdates(enable = 1, the whole screen): from here on this client asks
         -- for nothing at all.
         cli:send(enable_continuous(true, 0, 0, sw, sh))
-        local enabled = false
-        for _ = 1, 100 do
-            server:_poll()
-            enabled = false
+        -- Wall clock, not a poll count: how much of the message one poll gets through is the
+        -- server's business, and a count that matched one machine's read speed is exactly what
+        -- makes a check fail on a slower one.
+        local function recorded()
             for _, record in pairs(server.clients) do
-                if record.server.client.continuous then enabled = true end
+                if record.server.client.continuous then return true end
             end
-            if enabled then break end
-            socket.sleep(0.01)
+            return false
         end
-        assert_true(enabled,
-            "the server must record the region a client asked to be kept up to date")
+        local enabled, polls = pump_until(function() server:_poll() end, 5, recorded)
+        assert_true(enabled, string.format(
+            "the server must record the region a client asked to be kept up to date (%d poll(s)"
+            .. " in 5 s)", polls))
 
         -- ... and it must not be answered: there is nothing to answer, the client relies on the
         -- pushes now (an answer here is exactly the message that tells a viewer to go back to
@@ -1909,19 +1982,19 @@ check("a_client_click_over_the_wire_reaches_a_widget", function()
         local function pointer(mask, x, y)
             return string.char(5, mask, math.floor(x / 256), x % 256, math.floor(y / 256), y % 256)
         end
-        local function settle()
-            for _ = 1, 60 do
-                server:_poll()
-                socket.sleep(0.01)
-            end
+        -- Waits for what the check is about, by wall clock: 60 polls was enough while a poll read
+        -- one field of one message, and a poll count would tie the check to that again.
+        local function settle(cond)
+            return pump_until(function() server:_poll() end, 2, cond)
         end
 
         -- A plain click: press then release, in place.
         conn.sock:send(pointer(1, 120, 90))
         conn.sock:send(pointer(0, 120, 90))
-        settle()
-        assert_true(#taps == 1,
-            "a click over the wire must reach a widget's onTap, got " .. #taps .. " tap(s)")
+        local tapped, polls = settle(function() return #taps == 1 end)
+        assert_true(tapped, string.format(
+            "a click over the wire must reach a widget's onTap, got %d tap(s) after %d poll(s)"
+            .. " in 2 s", #taps, polls))
         assert_true(taps[1].x == 120 and taps[1].y == 90,
             string.format("the tap must land where the client clicked, got %s,%s",
                 tostring(taps[1].x), tostring(taps[1].y)))
@@ -1933,9 +2006,10 @@ check("a_client_click_over_the_wire_reaches_a_widget", function()
         conn.sock:send(pointer(1, 201, 160))                    -- 1px while held ...
         conn.sock:send(pointer(1, 201, 161))                    -- ... 2px in total
         conn.sock:send(pointer(0, 200, 160))
-        settle()
-        assert_true(#taps == 2,
-            "a wobbling click must still be a tap, got " .. #taps .. " tap(s)")
+        local tapped, polls = settle(function() return #taps == 2 end)
+        assert_true(tapped, string.format(
+            "a wobbling click must still be a tap, got %d tap(s) after %d poll(s) in 2 s",
+            #taps, polls))
         assert_true(taps[2].x == 200 and taps[2].y == 160,
             string.format("the wobbling click must tap where it was released, got %s,%s",
                 tostring(taps[2].x), tostring(taps[2].y)))
@@ -1949,8 +2023,10 @@ check("a_client_click_over_the_wire_reaches_a_widget", function()
             conn.sock:send(pointer(1, 300 + step * 10, 260))
         end
         conn.sock:send(pointer(0, 400, 260))
-        settle()
-        assert_true(#moves > 0, "a real drag must still reach the widget, got no pan/swipe")
+        local dragged, polls = settle(function() return #moves > 0 and #taps == 2 end)
+        assert_true(dragged, string.format(
+            "a real drag must still reach the widget, got no pan/swipe after %d poll(s) in 2 s",
+            polls))
         assert_true(#taps == 2, "a real drag must not also be a tap, got " .. #taps .. " tap(s)")
         conn.sock:close()
     end)
@@ -2698,7 +2774,9 @@ check("a_client_drag_in_the_live_loop_is_a_pan", function()
 
         -- Motion with no button down is nothing KOReader has: no hover, so nothing may be injected.
         cli:send(pointer_event(0, 500, 500))
-        for _ = 1, 5 do stage.ui_step() end
+        -- Long enough, in wall clock, for a motion the server *had* forwarded to have come out the
+        -- other end: "nothing was injected" is only evidence if the loop had the time to do it.
+        stage.pump_ui(0.2)
         assert_true(#stage.injected == 0 and #stage.acted == 0,
             "motion without a button down must be forwarded to nothing (" .. stage.describe() .. ")")
 
