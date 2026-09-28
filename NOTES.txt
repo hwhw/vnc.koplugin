@@ -139,6 +139,13 @@ one it was served with, so a client that lagged behind the eviction window is si
 frame instead of a partial one. A screen-size change (rotation) sends every client a DesktopSize
 rectangle (-223) and then a full update.
 
+A conversion may be shared only while it is still the encoder's latest. Only `pixels` - an immutable
+copy of the rectangle's bytes - may be kept; `values` is the encoder's *single* per-pixel array,
+which the next conversion overwrites, so it is handed out only while the owner's convert_serial
+still marks it current. Sharing it after another conversion makes every rectangle of a repeated
+geometry - KOReader records one click as a "nil" and a "full" refresh of the same region - carry the
+last rectangle converted's pixels: a whole region painted with the bottom-right tile's content.
+
 A request that has nothing to answer is *held*, not answered. Answering it with an empty update
 looks harmless, but a viewer asks again the moment it is answered: measured with TigerVNC that is a
 ping-pong at the poll rate - 97 round trips a second in both directions, ~9 kB/s on the wire, 194
