@@ -48,9 +48,30 @@ Server.POLL_INTERVAL = 0.01          -- seconds between socket services
 -- already waiting, so a zero timeout would never read anything. Reads only happen while the
 -- protocol actually owes bytes, so an idle client costs nothing.
 Server.IO_TIMEOUT = 0.01
---- How long a held update request may block the client's other messages before the server sends
---- an empty update to get back to reading them.
+--- How long a *partially* received client message may sit before we give up on the connection and
+--- say so: half a message in hand means we are waiting for bytes that are never coming (a length
+--- we mis-read, so every later message is being swallowed as its payload). Waiting for a client's
+--- *next* message - and holding a request that has nothing to answer (@{Server.HOLD_DEADLINE}) -
+--- is normal and does not count, which is why the watchdog below requires bytes to be partially in
+--- hand.
 Server.STALL_TIMEOUT = 10
+--- How long an incremental request may be *held* before the client is sent an empty update as a
+--- sign of life (c.f., @{Server:_answer_held}). Measured from the client's latest request, so a
+--- client that keeps asking while nothing changes is never answered with an empty update at all -
+--- the client's own traffic is its sign of life - and one that has gone quiet with a request
+--- outstanding is answered within this long.
+---
+--- What it buys: a viewer asks again the moment it is answered, so an unconditional answer is a
+--- ping-pong at the poll rate - measured with TigerVNC, 97 round trips a second, ~9 kB/s on the
+--- wire, for as long as the screen does not change. Holding instead costs one 4-byte update and one
+--- 10-byte request per second at most, and the deadline is what keeps that from being zero: a
+--- client must never be left with a request outstanding and no answer ever (TigerVNC's own server
+--- holds indefinitely, which is safe for the viewers that were measured, but a bounded sign of life
+--- is cheap and cannot surprise a client we have not measured).
+---
+--- The hold itself is *not* released by that sign of life - only answering with the change the
+--- client asked for, or a non-incremental request, ends it (c.f., Server:_answer_held).
+Server.HOLD_DEADLINE = 1
 Server.MAX_CLIENTS = 4
 Server.DIRTY_LIMIT = 64              -- dirty rectangles kept before falling back to a full frame
 Server.READ_CHUNK = 65536
@@ -287,6 +308,27 @@ function Server:_record_dirty(mode, region)
     logger.dbg(string.format("vnc: recorded dirty region (mode %s): %d,%d %dx%d",
         tostring(mode), x, y, rw, rh))
     local dirty = self._dirty
+    -- KOReader records the same region more than once for a single interaction (`(mode nil)` then
+    -- `(mode full)`, both 0,0 600x800), and two records of the same rectangle buy nothing: a client
+    -- that has not been served in between would be handed the same tiles twice and pay to encode
+    -- them twice. Folding them into one record - moved to the end, stamped with the *newest*
+    -- generation - is what keeps that correct for every client: a client whose `sent_gen` is below
+    -- the newest generation is told about the change exactly as it would have been, and one that had
+    -- already taken the older record takes this one too, because the generation moved (so no client
+    -- can be left thinking it is up to date).
+    --
+    -- Only *identical* rectangles are folded. Merging overlapping ones would mean emitting their
+    -- union, and `_get_rects`'s "unsent_from" accounting (a record a client's region does not cover
+    -- must stay queued for later) cannot reason about that: a client whose request covered only part
+    -- of the union would have `sent_gen` advanced past the rest and be told "nothing new" forever
+    -- for a change it never received.
+    for i = #dirty, 1, -1 do
+        local d = dirty[i]
+        if d.x == x and d.y == y and d.w == rw and d.h == rh then
+            table.remove(dirty, i)
+            break
+        end
+    end
     dirty[#dirty + 1] = { gen = self._gen, x = x, y = y, w = rw, h = rh }
     while #dirty > Server.DIRTY_LIMIT do
         local dropped = table.remove(dirty, 1)
@@ -387,7 +429,9 @@ function Server:_get_rects(client, region, full)
     end
     client.sent_gen = unsent_from and (unsent_from - 1) or self._gen
     if #out == 0 then
-        logger.dbg("vnc: nothing new for this client, sending an empty update")
+        -- Not an empty update: the protocol holds an incremental request that has nothing to
+        -- answer, and the driver answers it when something changes (c.f., Server:_answer_held).
+        logger.dbg("vnc: nothing new for this client")
     else
         logger.dbg("vnc: sending", #out, "changed rect(s) to a client")
     end
@@ -492,9 +536,12 @@ function Server:_adopt_client(sock)
         tx = {},                 -- outgoing byte chunks
         tx_len = 0,
         pending = nil,           -- how many bytes the coroutine waits for
-        parked = false,          -- asked for an update while nothing had changed
     }
-    client.state = "fresh"       -- "fresh" | "reading" | "parked"
+    -- "fresh" (the state machine has not run yet) | "reading" (owed the next client message).
+    -- There is no third state: a request with nothing to answer is *held* by the protocol without
+    -- suspending the coroutine (c.f., Server:_answer_held), which is what keeps the client's later
+    -- messages being read while it is held.
+    client.state = "fresh"
     client.server = RfbServer.new({
         io = {
             read = function(n)
@@ -555,11 +602,7 @@ function Server:_client_step(client)
             self:_after_step(client, kind, arg)
         end
     elseif client.state == "fresh" then
-        -- Start the state machine. A *parked* client must not be resumed here: it is waiting for
-        -- the update logic in `_poll` to wake it (with new content, or to flush), and resuming it
-        -- from the socket loop on every poll would re-park it at once and keep resetting that
-        -- timer - which is exactly how a client's keystrokes ended up queued behind a held
-        -- update request forever.
+        -- Start the state machine.
         local kind, arg = step(client.server, nil)
         self:_after_step(client, kind, arg)
     end
@@ -578,9 +621,6 @@ function Server:_after_step(client, kind, arg)
                 self:_client_step(client)
             end
         end
-    elseif kind == "idle" then
-        client.state = "parked"
-        client.parked_at = socket.gettime()
     elseif kind == nil then
         self:_drop_client(client, tostring(arg))
     end
@@ -773,6 +813,79 @@ function Server:_push_continuous(client)
     client.server:push_update(region)
 end
 
+--[[--
+Answers the incremental request the protocol is holding, if there is one: as soon as something
+inside the region that request named has been recorded, or - when the client has gone quiet with it
+still outstanding - once @{Server.HOLD_DEADLINE} has passed since its latest request, with one empty
+update as a sign of life. The hold survives that sign of life: the request it stands for has not been
+answered with content, so the next change inside the region is still delivered to it.
+
+Why hold at all: a viewer asks again the moment it is answered, so answering an incremental request
+with an empty update makes a ping-pong at the poll rate. Measured against a real TigerVNC viewer,
+that is 97 round trips a second (~9 kB/s on the wire, 194 packets/s) for as long as the screen does
+not change. A real server holds the request instead.
+
+Why the driver, and not the protocol coroutine: the coroutine is one per client and *is* the
+message loop, so suspending it there also stops the client's later messages being read - its
+keystrokes queue behind the held request until the screen happens to change (c1e3806). Holding the
+request in the connection's state (`client.server.client.held`) and answering it from here keeps the
+loop reading: input is parsed and injected in the same tick it arrives, held request or not.
+
+Both this and @{Server:_push_continuous} answer from the same `_collect_rects`/`sent_gen`
+accounting, so a change is never sent twice and never dropped: whichever path runs first advances
+`sent_gen` past what it sent.
+]]
+function Server:_answer_held(client)
+    local state = client.server.client
+    local region = state.held
+    if not region then return end
+    -- A client with Continuous Updates on is answered by the same rules: it asked for the region it
+    -- holds, so what changed inside it goes out as the answer - and what changed inside the region
+    -- it *pushed* for but outside the held one still goes out from
+    -- @{Server:_push_continuous} right after. Both advance the same `sent_gen`, so no change is
+    -- sent twice, and a client that asked is never left with an unanswered request just because it
+    -- also enabled the extension.
+    --
+    -- The deadline runs from the client's latest request: its own traffic is its sign of life, so a
+    -- client that keeps asking while nothing changes gets no empty update at all, and one that has
+    -- gone quiet with a request outstanding is answered once the deadline passes.
+    state.held_at = state.held_at or socket.gettime()
+    local overdue = socket.gettime() - state.held_at >= Server.HOLD_DEADLINE
+    if not overdue then
+        if not state.pending_desktop and state.sent_gen and state.sent_gen >= self._gen then
+            -- Nothing has been recorded since this client was last served, so nothing can be inside
+            -- its region: the generation counter is the whole answer.
+            return
+        end
+        local inside = false
+        for _, d in ipairs(self._dirty) do
+            if d.gen > (state.sent_gen or 0) and Util.intersect_rect(d, region) then
+                inside = true
+                break
+            end
+        end
+        if not inside then return end
+    end
+    if client.server:push_update(region) > 0 then
+        -- The change answered the request, so nothing is held any more.
+        state.held = nil
+        state.held_at = nil
+        return
+    end
+    if overdue then
+        -- The deadline expired with nothing to report: one empty update is the sign of life, and
+        -- the hold *stays*. The client's request is still outstanding - what it asked for has not
+        -- been answered - so the next change inside its region must still be delivered. That is
+        -- what a viewer with several requests queued relies on: gtk-vnc asks a dozen at once and
+        -- would otherwise be left with nothing outstanding (and so nothing delivered) after the
+        -- first sign of life. The next sign of life is a deadline after this one, so the cost stays
+        -- one 4-byte update per second and not one per poll.
+        state.held_at = socket.gettime()
+        client.server:send_empty_update()
+        logger.dbg("vnc: a held request expired; sending an empty update as a sign of life")
+    end
+end
+
 function Server:_poll()
     self._poll_task_scheduled = false
     if not self.running then return end
@@ -782,7 +895,7 @@ function Server:_poll()
 
     self:_accept()
 
-    -- a screen change may un-park clients waiting for an update
+    -- a screen change (and a resize in particular) is answered by Server:_answer_held below
     local resized = false
     local sw, sh = self:_screen_size()
     if self._screen_at and (self._screen_at[1] ~= sw or self._screen_at[2] ~= sh) then
@@ -806,8 +919,11 @@ function Server:_poll()
         -- Continuous Updates: what a client asked to be kept up to date without asking has to be
         -- pushed to it, and flushed here so it leaves in this tick. Deliberately after the
         -- client's own messages have been serviced: a request it did send is answered first, and
-        -- the two paths share `sent_gen`, so the same change never goes out twice.
+        -- the two paths share `sent_gen`, so the same change never goes out twice. A request the
+        -- client left *held* is answered the same way, and first, since it is the older claim on
+        -- whatever changed.
         if not client.dropped then
+            self:_answer_held(client)
             self:_push_continuous(client)
             self:_flush_client(client)
         end

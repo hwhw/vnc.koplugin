@@ -922,15 +922,16 @@ check("server_serves_a_second_incremental_update", function()
                 if tostring(ev.handler) == "onKeyPress" then seen_key = true end
             end
             local ok_held, held_err = pcall(function()
-                -- Nothing dirty: the request is answered with an empty update at once (that is what
-                -- the next section drains), so the keystroke behind it is read in the same poll or
-                -- the next - which is what this waits for, by wall clock.
+                -- Nothing dirty: the request is *held* (not answered), so the keystroke behind it
+                -- is only acted on if the message loop keeps reading while it is held - which is
+                -- the whole point of holding it in the connection's state instead of suspending the
+                -- protocol coroutine (c1e3806). This waits for that by wall clock, not a poll count.
                 request(true)
                 cli:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))  -- KeyEvent Down
                 local acted, polls = pump_until(function() server:_poll() end, 2,
                     function() return seen_key end)
                 assert_true(acted, string.format(
-                    "a keystroke must be acted on without waiting for a screen change (%d poll(s) "
+                    "a keystroke must be acted on while an update request is held (%d poll(s) "
                     .. "in 2 s)", polls))
             end)
             UIManager.handleInputEvent = original_input_event
@@ -976,13 +977,9 @@ check("server_serves_a_second_incremental_update", function()
                 string.char(0, 0, 0, 1))                           -- flags
             cli:send(string.char(150, 1) .. string.char(0, 0, 0, 0, 0, 200, 0, 150))
             cli:send(string.char(6, 0, 0, 0) .. string.char(0, 0, 0, 2) .. "hi")
-            -- The request that was held a moment ago was answered with an empty update, which is
-            -- still in the socket (nothing has read it): take it out first, exactly, rather than
-            -- let a short read swallow it and shift the reads below.
-            local stale = recv_exact(cli, 4, server)
-            assert_true(stale == "\0\0\0\0",
-                "the held request must have been answered with an empty update, got byte "
-                .. tostring(stale:byte(1)))
+            -- The request this check left held must *not* have been answered: an answer would be
+            -- the first thing on the wire (four zero bytes), so reading the Fence reply first - and
+            -- asserting it is a Fence reply - is what says it was not.
             local fence = recv_exact(cli, 9, server)      -- type + 3 padding + flags + length
             assert_true(fence:byte(1) == 248, "a Fence request must be answered, got " .. fence:byte(1))
             -- Enabling Continuous Updates is not answered: from here on the server pushes what
@@ -1022,15 +1019,12 @@ check("server_serves_a_second_incremental_update", function()
         -- Both changes are recorded *first*, then the request is sent: what is asserted is that a
         -- request made after them is answered with both, in one update.
         --
-        -- The ordering used to be the other way round - ask, sleep a little, then change - and
-        -- that only passed because a ten-byte request needed several polls to be read, so the
-        -- changes were recorded before it had been parsed. An incremental request whose answer
-        -- has nothing to report is answered *at once* with an empty update (by design: a held
-        -- request would hold the client's later messages, its keystrokes, behind it), so that
-        -- ordering depended on the server's read latency and turned into "empty update first" as
-        -- soon as reading got cheaper. What reached the client earlier in this check - the answer
-        -- to the request in the input section above - is dropped before the change, so the update
-        -- read below can only be the one this change produced.
+        -- The ordering used to be the other way round - ask, sleep a little, then change - when an
+        -- incremental request with nothing to report was answered with an empty update at once, so
+        -- "empty update first" was as likely as the change. A request that has nothing to report is
+        -- held now (c.f. an_idle_incremental_request_is_held_until_something_changes), so the
+        -- request below is answered by exactly these two changes; the drain before them is what
+        -- makes sure nothing else (a sign of life from an earlier hold) can be mistaken for it.
         drain_socket(cli, 0.2, server)
         bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
         bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
@@ -1616,11 +1610,16 @@ check("a_large_client_message_is_consumed_in_one_poll", function()
     if not ok then error(err, 0) end
 end)
 
---- An incremental request whose answer has nothing to report is answered with an *empty* update,
---- and it is answered at once - in the poll that read the request. A client that had to wait for
---- that answer could not send its next message (a keystroke) until the screen happened to change,
---- which is what "input does nothing until I touch the screen" looks like from a viewer.
-check("an_incremental_request_with_nothing_changed_is_answered_at_once", function()
+--- An incremental request whose answer has nothing to report is *held*, not answered. Answering it
+--- with an empty update makes the client ask again at once - against a real TigerVNC viewer that is
+--- a ping-pong at the poll rate (measured: 97 round trips a second in both directions, ~9 kB/s on
+--- the wire, 194 packets/s) for as long as nothing on screen changes.
+---
+--- What must not regress while it is held: the request is answered the moment something changes,
+--- and a client asking again and again is never answered with an empty update at all (its own
+--- traffic is its sign of life). The deadline - the one case that *is* answered - has its own check
+--- below.
+check("an_idle_incremental_request_is_held_until_something_changes", function()
     local Server = require("vnc/server")
     local socket = require("socket")
 
@@ -1646,17 +1645,398 @@ check("an_incremental_request_with_nothing_changed_is_answered_at_once", functio
         assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
         plane:free()
 
-        -- nothing changed since: ask incrementally and pump exactly two polls (the answer is due
-        -- in the poll that reads the request, so the second is slack, not a speed budget)
+        -- nothing changed since: ask incrementally and pump two polls. Nothing may come back - not
+        -- in the poll that reads the request, and not in the next one either.
         cli:send(client.request(true, 0, 0, sw, sh))
         client.polls(2)
 
         local head, e = cli:receive(4)
+        assert_true(head == nil, string.format(
+            "an incremental request with nothing to report must be held, not answered (%s)",
+            tostring(e)))
+
+        -- ... and it is answered by the *change*, within the polls that follow it - not by a poll
+        -- count of waiting, and not only when the coalescing deadline expires.
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        client.polls(2)
+
+        head, e = cli:receive(4)
         assert_true(head ~= nil and head:byte(1) == 0, string.format(
-            "an incremental request must be answered in the poll that read it (%s)", tostring(e)))
+            "the change must answer the held request within a poll or two (%s)", tostring(e)))
+        local nrects = head:byte(3) * 256 + head:byte(4)
+        assert_true(nrects == 1, string.format(
+            "the change must arrive as one rectangle, got %d", nrects))
+        local r = recv_exact(cli, 12, server)
+        local rx, ry = r:byte(1) * 256 + r:byte(2), r:byte(3) * 256 + r:byte(4)
+        local rw, rh = r:byte(5) * 256 + r:byte(6), r:byte(7) * 256 + r:byte(8)
+        local enc = r:byte(9) * 16777216 + r:byte(10) * 65536 + r:byte(11) * 256 + r:byte(12)
+        assert_true(rx == 8 and ry == 8 and rw == 32 and rh == 24, string.format(
+            "the answered rectangle must be the one that changed, got %d,%d %dx%d", rx, ry, rw, rh))
+        if enc == 16 then
+            local len = recv_exact(cli, 4, server)
+            recv_exact(cli, len:byte(1) * 16777216 + len:byte(2) * 65536
+                + len:byte(3) * 256 + len:byte(4), server)
+        else
+            recv_exact(cli, rw * rh * 4, server)            -- the Raw payload
+        end
+
+        -- The request is done: asking again with nothing to report is held again, not answered
+        -- from what is left over.
+        cli:send(client.request(true, 0, 0, sw, sh))
+        client.polls(2)
+        local again = drain_socket(cli, 0.05, server)
+        assert_true(#again == 0, string.format(
+            "a request with nothing to report must be held, got %d byte(s)", #again))
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- A client that keeps asking while nothing changes must never be answered with an empty update -
+--- not "at most once a second", and not "one per request": the whole point of a hold is that the
+--- ping-pong stops. The deadline runs from the client's *latest* request, so its own traffic is
+--- what keeps it unanswered; a client that goes quiet with a request outstanding is answered by its
+--- own check below.
+---
+--- Measured against a real TigerVNC viewer, the ping-pong this replaces is 97 round trips a second
+--- (~9 kB/s) for as long as the screen does not change.
+check("a_client_that_keeps_asking_is_never_answered_while_nothing_changes", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5811, 5819 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        plane:free()
+
+        -- Two seconds of asking, faster than the deadline: nothing may come back at all. The wall
+        -- clock, not a poll count - how much of a message one poll gets through is the server's
+        -- business (c.f., pump_until).
+        local bytes = 0
+        for _ = 1, 14 do
+            cli:send(client.request(true, 0, 0, sw, sh))
+            bytes = bytes + #drain_socket(cli, 0.15, server)
+        end
+        assert_true(bytes == 0, string.format(
+            "a client that keeps asking while nothing changes must not be sent empty updates, got"
+            .. " %d byte(s)", bytes))
+
+        -- The session is still live and the held requests were not thrown away: a change answers
+        -- them (the regions the client named are unioned).
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        local head = recv_exact(cli, 4, server)
+        assert_true(head:byte(1) == 0, "the change must answer the held requests")
+        assert_true(head:byte(3) * 256 + head:byte(4) >= 1,
+            "and it must carry the change, not an empty update")
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- A client that goes quiet with a request outstanding must not be left with no answer ever: after
+--- @{vnc.server}'s Server.HOLD_DEADLINE one empty update goes out as a sign of life - one per
+--- deadline, not one per poll and not one per held request. The request stays held: what it asked
+--- for has not been answered, so the next change is still delivered to it (asserted at the end).
+---
+--- One second is the number because: a real server (TigerVNC's Xvnc) holds such a request
+--- indefinitely, so any deadline is already conservative; 1 s is 100x the poll interval, so it can
+--- never fire while content is flowing; it is far below any plausible viewer timeout (TigerVNC has
+--- none, and the gtk-vnc viewer this was measured with sat through 16 s of silence); and it costs
+--- at most one 4-byte update and one 10-byte request per second, against ~100 round trips a second
+--- if the request were answered at once.
+check("a_held_request_is_answered_by_the_deadline_as_a_sign_of_life", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    assert_true(Server.HOLD_DEADLINE >= 0.5 and Server.HOLD_DEADLINE <= 5, string.format(
+        "the coalescing deadline must be long enough not to fire while content flows and short"
+        .. " enough to be a sign of life, got %s", tostring(Server.HOLD_DEADLINE)))
+
+    local server, port
+    for candidate = 5801, 5809 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        plane:free()
+
+        -- A quiet client with a request held: asking nothing more, it is answered when the
+        -- deadline passes (wall clock: the deadline is a matter of time, not of polls).
+        cli:send(client.request(true, 0, 0, sw, sh))
+        step_for(function() server:_poll() end, Server.HOLD_DEADLINE + 0.3)
+
+        local head = recv_exact(cli, 4, server)
+        assert_true(head:byte(1) == 0, "the sign of life must be a FramebufferUpdate")
         local nrects = head:byte(3) * 256 + head:byte(4)
         assert_true(nrects == 0, string.format(
-            "with nothing changed the answer must be an empty update, got %d rectangle(s)", nrects))
+            "the sign of life must be an *empty* update (nothing changed), got %d rectangle(s)",
+            nrects))
+
+        -- ... and one per deadline, not one per poll or one per held request.
+        local more = drain_socket(cli, 0.3, server)
+        assert_true(#more == 0, string.format(
+            "one sign of life per deadline, got %d more byte(s)", #more))
+
+        -- The client is still served: its next request is answered by the next change.
+        cli:send(client.request(true, 0, 0, sw, sh))
+        bb:paintRect(8, 8, 32, 24, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 8, y = 8, w = 32, h = 24 })
+        head = recv_exact(cli, 4, server)
+        assert_true(head:byte(1) == 0 and head:byte(3) * 256 + head:byte(4) >= 1,
+            "the session must still deliver changes after a sign of life")
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- The c1e3806 bug must not come back: a request with nothing to answer is held, and the *next*
+--- message in the same write - a keystroke - must still be read and acted on in the same poll or the
+--- next one. Holding the request by suspending the protocol coroutine would stop the message loop
+--- reading it, and a viewer's input would look dead until the screen happened to change.
+---
+--- Deterministic by construction: the request and the keystroke are one write, and the suite already
+--- pins elsewhere that one poll reads a whole write - so two polls are slack, not a speed budget.
+check("server_holds_a_request_and_still_injects_the_message_behind_it", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5791, 5799 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        plane:free()
+
+        local seen_key = false
+        local original_input_event = UIManager.handleInputEvent
+        UIManager.handleInputEvent = function(_, ev)
+            if tostring(ev.handler) == "onKeyPress" then seen_key = true end
+        end
+        local ok_held, held_err = pcall(function()
+            -- One write: the request (which will be held) and the keystroke behind it.
+            cli:send(client.request(true, 0, 0, sw, sh)
+                .. string.char(4, 1, 0, 0) .. string.char(0, 0, 0xFF, 0x54))     -- KeyEvent Down
+            client.polls(2)
+            assert_true(seen_key, "the keystroke behind a held request must be acted on")
+            -- ... and the held request must still be unanswered.
+            local bytes = drain_socket(cli, 0.05, server)
+            assert_true(#bytes == 0, string.format(
+                "holding the request must not have answered it, got %d byte(s)", #bytes))
+        end)
+        UIManager.handleInputEvent = original_input_event
+        if not ok_held then error(held_err, 0) end
+        cli:close()
+    end)
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- The stall watchdog is for a *partially* received message - half a message in hand means we are
+--- waiting for bytes that are never coming (a length we mis-read, so every later message is being
+--- swallowed as its payload). A held update request leaves the connection in the "reading" state
+--- too, with bytes owed for the client's *next* message, so the watchdog must not touch it: that
+--- would drop an idle client after ten seconds of nothing changing.
+check("server_stall_watchdog_only_fires_on_a_partially_received_message", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5781, 5789 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local saved_stall = Server.STALL_TIMEOUT
+    -- Test-local, and it only shortens the wait: the check is about *which* state the watchdog
+    -- fires in, not about the ten seconds it waits.
+    Server.STALL_TIMEOUT = 0.25
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+        plane:free()
+
+        -- A *held* request: a whole request, nothing owed half-way, nothing changing - the
+        -- connection must survive much longer than the watchdog.
+        cli:send(client.request(true, 0, 0, sw, sh))
+        step_for(function() server:_poll() end, 3 * Server.STALL_TIMEOUT)
+        local alive, holding = false, false
+        for _, record in pairs(server.clients) do
+            if not record.dropped then
+                alive = true
+                if record.server.client.held then holding = true end
+            end
+        end
+        assert_true(alive, string.format(
+            "a held request must not be dropped by the stall watchdog: the client must survive"
+            .. " %.2fs of nothing changing", 3 * Server.STALL_TIMEOUT))
+        assert_true(holding, string.format(
+            "the request must still be held after %.2fs of nothing changing (the watchdog is for a"
+            .. " half-received message, not for a request with nothing to answer)",
+            3 * Server.STALL_TIMEOUT))
+
+        -- Half a request, and then silence: *that* is what the watchdog is for.
+        local msg = client.request(true, 0, 0, sw, sh)
+        cli:send(msg:sub(1, 3))
+        local function partial()
+            for _, record in pairs(server.clients) do
+                if record.rx_len > 0 and record.pending and record.rx_len < record.pending then
+                    return true
+                end
+            end
+            return false
+        end
+        local waiting = pump_until(function() server:_poll() end, 2, partial)
+        assert_true(waiting, "three bytes of a ten-byte request must leave the rest owed")
+        step_for(function() server:_poll() end, 3 * Server.STALL_TIMEOUT)
+        local still_there = false
+        for _, record in pairs(server.clients) do
+            if not record.dropped then still_there = true end
+        end
+        assert_true(not still_there, string.format(
+            "a message that never finishes arriving must be dropped after the watchdog's %.2fs",
+            Server.STALL_TIMEOUT))
+        cli:close()
+    end)
+    Server.STALL_TIMEOUT = saved_stall
+
+    server:stop()
+    if not ok then error(err, 0) end
+end)
+
+--- KOReader records the same region more than once for one interaction (`(mode nil)` then
+--- `(mode full)`, both 0,0 600x800), and two records of the same rectangle would hand a client that
+--- has not been served in between the same tiles twice - twice the encode, twice the bytes, for one
+--- change. Folding them into one record must not lose a change for a client that *was* served in
+--- between, though: the folded record carries the newest generation, so that client is told again.
+check("server_coalesces_one_region_recorded_twice", function()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+
+    local server, port
+    for candidate = 5771, 5779 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty("full", nil)
+
+        local client = connect_client(server, port, set_encodings_wire())
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)
+
+        cli:send(client.request(false, 0, 0, sw, sh))
+        assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+        -- What one full-screen record costs this encoding (ZRLE and friends tile a big rectangle,
+        -- so this is not always one).
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_WHITE)
+        server:_record_dirty("full", nil)
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local baseline, rects = client.read_update(plane)
+        assert_true(baseline >= 1, "a full-screen change must be delivered")
+        local r0, g0, b0 = get(plane, 16, 16)
+        assert_true(r0 > 200 and g0 > 200 and b0 > 200, "with the pixels it left behind")
+
+        -- One interaction, two records of the same region (what KOReader does for a click): the
+        -- client must pay for exactly one of them.
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+        server:_record_dirty(nil, nil)
+        server:_record_dirty("full", nil)
+        assert_true(#server._dirty == 1, string.format(
+            "the same region recorded twice must be one dirty record, got %d", #server._dirty))
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local nrects, rects2 = client.read_update(plane)
+        assert_true(nrects == baseline, string.format(
+            "the same region recorded twice must cost the same as one change, got %d rectangle(s)"
+            .. " against %d", nrects, baseline))
+        local area = 0
+        for _, rect in ipairs(rects2) do area = area + rect.w * rect.h end
+        assert_true(area == sw * sh, string.format(
+            "and the rectangles must cover the region that changed (%d of %d pixels)", area, sw * sh))
+        local r1, g1, b1 = get(plane, 16, 16)
+        assert_true(r1 < 60 and g1 < 60 and b1 < 60, "with the pixels the second record left behind")
+
+        -- A client served *between* two records of the same region must still be told about the
+        -- second one: folding them keeps the newest generation, so it is offered again (and a
+        -- version that folded them onto the *older* generation would leave this client black).
+        bb:paintRect(0, 0, sw, sh, BB.COLOR_WHITE)
+        server:_record_dirty("full", nil)
+        cli:send(client.request(true, 0, 0, sw, sh))
+        nrects = client.read_update(plane)
+        assert_true(nrects >= 1, string.format(
+            "a region recorded again after a client was served must be delivered again, got %d"
+            .. " rectangle(s)", nrects))
+        local r2, g2, b2 = get(plane, 16, 16)
+        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and it must carry the newer pixels")
+
+        plane:free()
         cli:close()
     end)
 
@@ -1810,7 +2190,8 @@ check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", func
         assert_true(r1 > 200 and g1 > 200 and b1 > 200, "and the changed pixels must come through")
 
         -- ... but asking for it again must not repeat it: the push advanced the same `sent_gen`
-        -- the request path reads, so the answer is an empty update.
+        -- the request path reads, so there is nothing to answer and the request is *held* - what
+        -- it gets is the deadline's sign of life (an empty update), not the change again.
         cli:send(client.request(true, 0, 0, sw, sh))
         local repeated = client.read_update(plane)
         assert_true(repeated == 0,
@@ -1824,9 +2205,18 @@ check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", func
         assert_true(eocu == string.char(150),
             "disabling continuous updates must be answered with EndOfContinuousUpdates, got byte "
             .. tostring(eocu:byte(1)))
-        -- ... and a later change is not pushed to it.
+        -- ... and the earlier request is still outstanding (its sign of life was not content), so
+        -- this change answers *it*: that is the request path, not a push.
         bb:paintRect(64, 64, 16, 16, BB.COLOR_WHITE)
         server:_record_dirty("partial", { x = 64, y = 64, w = 16, h = 16 })
+        local owed = client.read_update(plane)
+        assert_true(owed >= 1, "the change must answer the request the client left outstanding")
+        local r2, g2, b2 = get(plane, 68, 68)
+        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and its pixels must arrive")
+
+        -- Nothing is outstanding now, and the extension is off: a later change must not be pushed.
+        bb:paintRect(128, 128, 16, 16, BB.COLOR_WHITE)
+        server:_record_dirty("partial", { x = 128, y = 128, w = 16, h = 16 })
         local not_pushed = drain_socket(cli, 0.3, server)
         assert_true(#not_pushed == 0,
             "a client that disabled continuous updates must not be pushed to, got "
@@ -1836,8 +2226,8 @@ check("server_pushes_a_change_to_a_client_that_enabled_continuous_updates", func
         cli:send(client.request(true, 0, 0, sw, sh))
         local answered = client.read_update(plane)
         assert_true(answered >= 1, "a client that asks must be answered with the change")
-        local r2, g2, b2 = get(plane, 68, 68)
-        assert_true(r2 > 200 and g2 > 200 and b2 > 200, "and its pixels must arrive")
+        local r3, g3, b3 = get(plane, 132, 132)
+        assert_true(r3 > 200 and g3 > 200 and b3 > 200, "and its pixels must arrive")
         local twice = drain_socket(cli, 0.3, server)
         assert_true(#twice == 0,
             "the change must go out exactly once, got " .. #twice .. " more byte(s)")

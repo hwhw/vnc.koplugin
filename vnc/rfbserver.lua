@@ -6,10 +6,14 @@ yields whenever it wants bytes - `("need", n)` for input, which the driver satis
 many poll ticks it takes - and hands its outgoing messages to `io.write(s)` for the driver to
 flush.
 
-One extra yield exists on this side: a client may ask for an incremental update while nothing has
-changed. Instead of answering with an empty update (which would make the client ask again at once,
-i.e. busy-loop between two processes), the coroutine yields `("idle")` and the driver resumes it
-once the screen has actually changed - which is what a real RFB server does.
+A client may ask for an incremental update while nothing has changed. That request is answered by
+the *driver* rather than here: the connection's state carries it as `held` (the region it named,
+plus when the driver took it over) and @{vnc.server}'s Server:_answer_held sends the update from its
+poll - as soon as something inside that region has changed, or when the coalescing deadline passes
+with nothing to report. This coroutine never stops for it: it goes straight back to reading the
+client's next message, which is the point. Suspending it here (what an earlier version did) also
+stops it reading, so the client's keystrokes queue behind the held request until the screen happens
+to change - which reads as "input does nothing" (c1e3806).
 
 Normative reference: RFC 6143 (sections 7.1-7.7 and Appendix A).
 
@@ -115,6 +119,14 @@ function Server.new(opts)
             -- to date *without* asking, or nil while it is on the request/response path. The
             -- driver (@{vnc.server}) reads it and pushes what changed inside it.
             continuous = nil,
+            -- An incremental request that had nothing to answer, held for the driver to answer
+            -- later: the region it named (`{x, y, w, h}`), nil when nothing is held. `held_at` is
+            -- when the driver took it over, and is dropped on every new request so the coalescing
+            -- deadline runs from the client's latest one (c.f., vnc.server's Server:_answer_held
+            -- and Server:_handle_update_request). Only answering with a change - or a
+            -- non-incremental request - clears it; a sign-of-life empty update does not.
+            held = nil,
+            held_at = nil,
             -- Input state. Owned, and kept up to date, by the `on_pointer` callback - the message
             -- loop passes a PointerEvent through untouched so the callback can see the button mask
             -- *change* (c.f., the msg == 5 branch in _message_loop, and Server:_on_pointer).
@@ -326,17 +338,34 @@ function Server:_handle_update_request()
     local incremental = r:u8() ~= 0
     local x, y, w, h = r:u16(), r:u16(), r:u16(), r:u16()
 
+    local client = self.client
     local rects = self:_collect_rects(x, y, w, h, not incremental)
     if #rects == 0 and incremental then
-        -- Nothing changed. Answer with an *empty* update instead of holding the request: the
-        -- state machine is one coroutine per client, so holding a request would also hold every
-        -- message the client sends afterwards - its keystrokes - until the screen happened to
-        -- change, which reads as "input does nothing". An empty update costs a few bytes, and the
-        -- client simply asks again.
-        self:_send_update({})
+        -- Nothing to answer. *Hold* the request instead - and hold it here, in the connection's
+        -- state, not by suspending this coroutine: suspending it was what queued a client's later
+        -- messages, its keystrokes, behind the held request until the screen changed (c1e3806). The
+        -- driver answers it from its poll (c.f., @{vnc.server}'s Server:_answer_held), so this loop
+        -- is back reading the client's next message immediately.
+        --
+        -- Requests already held are folded into one: the regions are unioned (a change anywhere
+        -- either request named must still be delivered) and `held_at` is dropped so the driver
+        -- restamps the deadline - the client's own traffic is its sign of life, so a client that
+        -- keeps asking is answered by the next real change rather than by an empty update per
+        -- request, which is the ping-pong this exists to remove.
+        local held = client.held
+        client.held = held and Util.union_rect(held, { x = x, y = y, w = w, h = h })
+            or { x = x, y = y, w = w, h = h }
+        client.held_at = nil
+        logger.dbg(string.format("vnc: holding an incremental request for %d,%d %dx%d",
+            client.held.x, client.held.y, client.held.w, client.held.h))
         return
     end
+    -- Answered: a non-incremental request always is, and an incremental one is as soon as there is
+    -- something to report. Either way nothing is left held.
+    client.held = nil
+    client.held_at = nil
     self:_send_update(rects)
+    logger.dbg(string.format("vnc: answering a request with %d changed rect(s)", #rects))
 end
 
 --- Rectangles to send for a request covering `(x, y, w, h)`, including any pending desktop resize.
@@ -415,6 +444,16 @@ function Server:push_update(region)
     if #rects == 0 then return 0 end
     self:_send_update(rects)
     return #rects
+end
+
+--[[--
+The sign of life for a request the driver has held for the whole coalescing deadline with nothing to
+report: one empty FramebufferUpdate (`nrects = 0`), the same four bytes an unconditional answer used
+to send - except that a client asking once a second gets one a second, not one per request
+(c.f., @{vnc.server}'s Server:_answer_held). The request itself stays held.
+]]
+function Server:send_empty_update()
+    self:_send_update({})
 end
 
 function Server:_message_loop()

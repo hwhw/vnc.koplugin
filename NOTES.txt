@@ -45,10 +45,12 @@ vnc/settings.lua    LuaSettings wrapper: profiles + global settings + the server
 
 The server half (the plugin can also serve KOReader's own screen):
 vnc/rfbserver.lua   RFB 3.8 *server* state machine, transport agnostic. The mirror of
-                          protocol.lua: coroutine, ("need", n) yields, plus an ("idle") yield
-                          when a client asks for an update while nothing has changed (so the
-                          request is held instead of answered with an empty update, which would
-                          make the client ask again at once and busy-loop).
+                          protocol.lua: coroutine, ("need", n) yields. A client's incremental
+                          request with nothing to answer is recorded as `held` (its region) and the
+                          driver (vnc/server.lua) answers it - when something changed, or when the
+                          coalescing deadline passes. The coroutine never suspends for it: that
+                          would stop it reading, and the client's keystrokes would queue behind
+                          the held request (c1e3806).
 vnc/serverenc.lua   Server-side encoders (Raw, RRE, Hextile, ZRLE) and the conversion from
                           whatever BlitBuffer type the screen is to whatever pixel format a
                           client asks for.
@@ -136,6 +138,21 @@ never pays for a client's bandwidth. Rectangles carry a generation and each clie
 one it was served with, so a client that lagged behind the eviction window is simply given a full
 frame instead of a partial one. A screen-size change (rotation) sends every client a DesktopSize
 rectangle (-223) and then a full update.
+
+A request that has nothing to answer is *held*, not answered. Answering it with an empty update
+looks harmless, but a viewer asks again the moment it is answered: measured with TigerVNC that is a
+ping-pong at the poll rate - 97 round trips a second in both directions, ~9 kB/s on the wire, 194
+packets/s - for as long as nothing on screen changes. The hold lives in the connection's state
+(`client.held`), never in the protocol coroutine: suspending the coroutine would also stop it
+reading, and the client's keystrokes would queue behind the held request (c1e3806). The driver
+answers it from its poll, when something inside the region changed, and sends one empty update per
+Server.HOLD_DEADLINE (1 s) as a sign of life if the client has gone quiet with the request
+outstanding - the deadline runs from the client's *latest* request, so a client that keeps asking
+while nothing changes is not answered at all. The hold survives that sign of life (the request has
+not been answered with content), which is what keeps a viewer that queues several requests - gtk-vnc
+sends a dozen at once - receiving changes afterwards. Measured after: 0.91 round trips a second
+either way with TigerVNC, a change delivered in ~19 ms while a request was held, and a keystroke
+injected in ~9 ms while a request was held.
 
 Client input is injected at the level KOReader's own device backends use: EV_ABS/EV_SYN events
 into Device.input:handleTouchEv for pointer events (press/release becomes a tap, a tap-and-move a
