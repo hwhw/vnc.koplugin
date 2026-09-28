@@ -130,13 +130,23 @@ what ffi/zlib_h.lua does not (that one has compressBound/compress2/crc32/uncompr
 hand-rolled FFI, so there is no libcrypto/OpenSSL dependency, and LuaSocket is used for raw TCP
 only (no TLS, so LuaSec is not needed).
 
-Serving KOReader's screen. Two hooks make this cheap: the listener and per-client coroutines run
-from a UIManager:scheduleIn poll task (the same discipline as the client's socket), and dirty
-rectangles come from wrapping UIManager._refresh - the one place where a frame is complete, hence
-tear-free. Only rectangles are recorded there; encoding happens in the poll task, so a repaint
-never pays for a client's bandwidth. Rectangles carry a generation and each client remembers the
-one it was served with, so a client that lagged behind the eviction window is simply given a full
-frame instead of a partial one. A screen-size change (rotation) sends every client a DesktopSize
+Serving KOReader's screen. The listener and the per-client coroutines run from a
+UIManager:scheduleIn poll task (the same discipline as the client's socket), and dirty rectangles
+come from wrapping a pair of UIManager hooks: `_refresh`, which is where a frame's region becomes
+known, and `_repaint`, which is where its pixels reach Screen.bb (it calls every dirty widget's
+paintTo and then drains the queue `_refresh` filled). A rectangle is *recorded* only at the end of
+the outermost `_repaint` after the `_refresh` that named it - a rectangle is a claim about pixels,
+and recording it when `_refresh` is called stamps a generation whose pixels are not in the
+framebuffer yet. That is not a theoretical race: input the server injects is delivered from inside
+the poll task, so the `_repaint` that paints what it caused runs only after that poll has already
+answered the client - the answer carried the frame from *before* the change while sent_gen moved
+past it, and the change was lost until a later event recorded another generation (a
+keyboard-driven repaint reaching the client one event late; a click escaped it only because the
+widgets a click lands on repaint through forceRePaint, which paints inside the injection). Only
+rectangles are recorded in either hook; encoding happens in the poll task, so a repaint never pays
+for a client's bandwidth. Rectangles carry a generation and each client remembers the one it was
+served with, so a client that lagged behind the eviction window is simply given a full frame
+instead of a partial one. A screen-size change (rotation) sends every client a DesktopSize
 rectangle (-223) and then a full update.
 
 A conversion may be shared only while it is still the encoder's latest. Only `pixels` - an immutable

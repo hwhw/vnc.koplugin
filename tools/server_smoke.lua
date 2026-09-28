@@ -3132,6 +3132,221 @@ local function live_input_stage()
     }
 end
 
+-- ---------------------------------------------------------------- a key-driven repaint
+
+--- The stage the three key-repaint checks below share: a real widget that repaints itself when the
+--- UI sends it a key, a client that holds an incremental request, and the real UI loop, driven step
+--- by step with the budgeted headless `waitForEvent` the live input stages above use.
+---
+--- Unlike their widget, which only records what it is told, this one *paints*: `paintTo` writes a
+--- 64x64 patch into the framebuffer the server captures from, and a key press flips the patch's
+--- colour and asks for it with `UIManager:setDirty` - a widget's own repaint, with the painting left
+--- to the `UIManager:_repaint` that follows the handler, which is the shape of the reported bug. The
+--- pixels the client gets can therefore be compared against the screen's, so "the frame carried the
+--- repaint" is a claim about pixels and not about bookkeeping.
+---
+--- Returned: the server and its client (already past its first full update), `plane` (what the
+--- client has assembled) and `reference` (the screen), `ui_step`, `snapshot()` (re-reads the screen
+--- into `reference`), `hold_a_request()` (leaves the client with a request the server has *nothing*
+--- to answer, i.e. held), `take_frame(budget)` (reads the next update, allowing the loop at most
+--- `budget` more iterations and failing if it needs more), the patch's `rect` and the widget's
+--- counters, `queue_local_key()` (a raw EV_KEY a local keyboard would have waiting, delivered by the
+--- loop's own `Input:waitEvent` on its next step), `describe()` and `restore()`.
+local function live_repaint_stage()
+    local Server = require("vnc/server")
+    local socket = require("socket")
+    local time = require("ui/time")
+    require("ffi/linux_input_h")        -- EV_KEY / SYN_REPORT (and ETIME)
+    local C = ffi.C
+    local InputContainer = require("ui/widget/container/inputcontainer")
+
+    local server, port
+    for candidate = 5931, 5939 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local bb = Screen.bb
+    local sw, sh = bb:getWidth(), bb:getHeight()
+    assert_true(sw >= 128 and sh >= 128, "the screen must hold this stage's patch")
+    local RECT, RX, RY = 64, 16, 16
+
+    -- A black screen, recorded as one full-frame change: whatever the client reads first is *this*
+    -- screen, so any later pixel that differs from the reference is a change this stage made.
+    bb:paintRect(0, 0, sw, sh, BB.COLOR_BLACK)
+    server:_record_dirty("full", nil)
+
+    local Input = Device.input
+    local WEDGE_BUDGET = time.s(3)
+    local step_deadline
+    local queued = {}
+    local real_wait = Input.input.waitForEvent
+    -- A headless local input device: it reports a timeout after a short sleep (so the loop can be
+    -- driven by hand) and hands over whatever local events have been queued for it - the same array
+    -- of Linux input events a real backend's `waitForEvent` returns. A local key therefore goes
+    -- through `Input:waitEvent` and `UIManager:handleInputEvent` exactly as a device's own keyboard
+    -- does, with no client message anywhere near it.
+    Input.input.waitForEvent = function()
+        if step_deadline and time.now() > step_deadline then
+            error("the UI loop is stuck inside Input:waitForEvent", 0)
+        end
+        socket.sleep(0.002)
+        if #queued > 0 then
+            local evs = queued
+            queued = {}
+            return true, evs
+        end
+        return false, C.ETIME
+    end
+
+    -- The device's own input code for the key the widget listens for: the far end of the server's
+    -- keysym -> KOReader key name -> input code mapping, and what a local keyboard delivers.
+    local key_code
+    for code, name in pairs(Input.event_map or {}) do
+        if name == "Down" then key_code = code break end
+    end
+    assert_true(key_code ~= nil, "this device has no key named Down")
+
+    local stage = { bright = false, paints = 0, keys = 0 }
+    local widget = InputContainer:new{
+        dimen = Geom:new{ x = RX, y = RY, w = RECT, h = RECT },
+        key_events = { KeyPress = { { "Down" } } },
+    }
+    --- A real repaint: the patch goes into the framebuffer the server captures from, at the
+    --- coordinates the handler below asks to be refreshed.
+    function widget:paintTo(target)
+        stage.paints = stage.paints + 1
+        target:paintRect(RX, RY, RECT, RECT, stage.bright and BB.COLOR_WHITE or BB.COLOR_BLACK)
+    end
+    function widget:onKeyPress()
+        stage.keys = stage.keys + 1
+        if stage.handler_delay then
+            -- A handler that takes longer than one poll interval - a page turn that has to render is
+            -- the ordinary case - so that by the time the loop comes back to its task pass the poll
+            -- is already due. That is the state a *local* key press finds itself in when the
+            -- reported bug loses its repaint (c.f., the check that sets this).
+            socket.sleep(stage.handler_delay)
+        end
+        stage.bright = not stage.bright
+        UIManager:setDirty(widget, "ui", Geom:new{ x = RX, y = RY, w = RECT, h = RECT })
+        return true
+    end
+    UIManager:show(widget)
+
+    -- One iteration of the real loop, the way UIManager:run drives it.
+    local function ui_step()
+        step_deadline = time.now() + WEDGE_BUDGET
+        local ok, err = pcall(UIManager.handleInput, UIManager)
+        if not ok then error(err, 0) end
+    end
+
+    -- How many UI iterations a read in progress may drive before the frame has to be there: a key
+    -- repaints the widget in one iteration (the `_repaint` at its end) and the poll that follows
+    -- records and answers it in the next, so a budget of two is "within a poll or two" - and nothing
+    -- more, so a frame that never came cannot hide behind a longer wait.
+    local pump_budget
+    local function pump()
+        if pump_budget then
+            pump_budget = pump_budget - 1
+            assert_true(pump_budget >= 0,
+                "the client's update must arrive within a poll or two of the repaint it answers")
+        end
+        ui_step()
+    end
+
+    local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)       -- what the client has assembled
+    local reference = BB.new(sw, sh, BB.TYPE_BBRGB24)   -- what the screen holds
+    local client = connect_client(server, port, set_encodings_wire(), pump)
+    local cli = client.sock
+    local server_client
+    for _, record in pairs(server.clients) do server_client = record.server.client end
+    assert_true(server_client ~= nil, "the client's connection state must exist")
+    cli:send(client.request(false, 0, 0, sw, sh))
+    assert_true(client.read_update(plane) >= 1, "the first full update must carry the screen")
+
+    local function snapshot()
+        reference:blitFrom(bb, 0, 0, 0, 0, sw, sh)
+    end
+    snapshot()
+
+    --- Leaves the client holding a request that has nothing to answer, so the only thing that can
+    --- produce the next frame is a change recorded *after* this point. Client messages are read by
+    --- the poll task, so this pumps the loop until it has - with `held` as the proof - and fails
+    --- both if it never does and if the request was answered instead (which would mean something
+    --- was recorded that this stage did not make).
+    local function hold_a_request()
+        cli:send(client.request(true, 0, 0, sw, sh))
+        local sent_before = server_client.sent_gen
+        local deadline = socket.gettime() + 2
+        while server_client.held == nil and server_client.sent_gen == sent_before
+                and socket.gettime() < deadline do
+            ui_step()
+        end
+        assert_true(server_client.held ~= nil and server_client.sent_gen == sent_before,
+            string.format("the stage needs the server to hold an incremental request that has"
+                .. " nothing to answer (gen=%d sent_gen=%s, was %s; evicted=%d dirty=%d)",
+                server._gen, tostring(server_client.sent_gen), tostring(sent_before),
+                server._evicted_gen, #server._dirty))
+    end
+
+    --- The frame that answers the held request, with at most `budget` further UI iterations allowed
+    --- to produce it. Anything else - nothing ever arriving, or arriving only after the loop was
+    --- pumped further - fails in the read rather than passing on a longer wait.
+    local function take_frame(budget)
+        pump_budget = budget
+        local nrects, rects = client.read_update(plane)
+        pump_budget = nil
+        return nrects, rects
+    end
+
+    --- A key press from the *local* device: queued for the loop's own `Input:waitEvent`, with no
+    --- client message and no poll task involvement in delivering it.
+    local function queue_local_key()
+        local sec, usec = time.split_s_us(time.monotonic_coarse())
+        queued[#queued + 1] = { type = C.EV_KEY, code = key_code, value = 1,
+                                time = { sec = sec, usec = usec } }
+    end
+
+    --- One-line account of what happened, for the failure messages: what the client holds at the
+    --- patch, what the screen holds there, and how the widgets and the request got there.
+    local function describe(what)
+        local r, g, b = get(plane, RX + 4, RY + 4)
+        local wr, wg, wb = get(reference, RX + 4, RY + 4)
+        return string.format("%s: %d key(s), %d paint(s), client pixel at %d,%d = %d,%d,%d,"
+            .. " screen holds %d,%d,%d (%s)", what, stage.keys, stage.paints, RX + 4, RY + 4,
+            r, g, b, wr, wg, wb, server_client.held and "request still held" or "request answered")
+    end
+
+    local function restore()
+        Input.input.waitForEvent = real_wait
+        UIManager:close(widget)
+        cli:close()
+        server:stop()
+        plane:free()
+        reference:free()
+    end
+
+    return {
+        server = server, client = client, client_state = server_client, plane = plane,
+        reference = reference, ui_step = ui_step, snapshot = snapshot, describe = describe,
+        hold_a_request = hold_a_request, take_frame = take_frame, queue_local_key = queue_local_key,
+        restore = restore, stage = stage, rect = { x = RX, y = RY, w = RECT, h = RECT },
+    }
+end
+
+--- The reported defect, end to end: a keyboard event makes a widget repaint, a client is holding a
+--- request, and the frame answering it must carry the pixels of that repaint - within a poll or two,
+--- with no following event to push it along.
+---
+--- It cannot, if the rectangle is recorded when `UIManager:_refresh` is called: that only *enqueues*
+--- the refresh, and the widget is painted by the `UIManager:_repaint` the UI loop runs next - while a
+--- key the *server* injects is delivered from the poll task, i.e. inside the loop's own task pass, so
+--- the poll answers the held request before that `_repaint` has painted anything. The frame then
+--- carries the pixels from *before* the key, and `sent_gen` has moved past a change the client never
+--- saw: it shows the old screen until a later event records another generation, which is the "a
+--- keyboard-driven repaint arrives one event late" of the report. A click looked immune only because
+--- the widgets a click lands on repaint through `forceRePaint`, which paints inside the injection.
 check("a_client_click_in_the_live_loop_is_a_tap", function()
     -- The reported defect: a client *click* (press, then release ~100 ms later) is delivered as a
     -- *hold*. Once any contact is down, core arms its hold timer (`Contact:handleNonTap` ->
@@ -3423,6 +3638,127 @@ check("a_client_drag_in_the_live_loop_is_a_pan", function()
         end
         print(string.format("   [drag] by the end: %d motion frame(s), lift injected %d ms after the down",
             motions, down_at and lift_at and time.to_ms(lift_at - down_at) or -1))
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
+check("a_key_driven_repaint_reaches_a_client_within_a_poll_of_its_paint", function()
+    local stage = live_repaint_stage()
+    local ok, err = pcall(function()
+        stage.hold_a_request()
+        local paints_before = stage.stage.paints
+
+        -- One key, through the wire (XK_Down, which this device maps to the key the widget listens
+        -- for). Nothing follows it: no second event, no click, no local input.
+        stage.client.sock:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xff, 0x54))
+        local nrects, rects = stage.take_frame(2)
+        stage.snapshot()
+
+        assert_true(stage.stage.keys == 1, "the widget must have been sent the key")
+        assert_true(stage.stage.paints > paints_before,
+            "the key's repaint must have been painted (" .. stage.describe("after the key") .. ")")
+
+        local rx, ry = stage.rect.x + 4, stage.rect.y + 4
+        local got_r, got_g, got_b = get(stage.plane, rx, ry)
+        local want_r, want_g, want_b = get(stage.reference, rx, ry)
+        assert_true(want_r == 255 and want_g == 255 and want_b == 255,
+            "the key's repaint must have left the patch white ("
+            .. stage.describe("after the key") .. ")")
+        print(string.format("   [key] one key press, no further event: %d rectangle(s) %s,"
+            .. " %d paint(s) of the widget", nrects, rect_list(rects),
+            stage.stage.paints - paints_before))
+        assert_true(got_r == want_r and got_g == want_g and got_b == want_b,
+            string.format("the frame answering the key must carry the pixels of the repaint it caused:"
+                .. " the client holds %d,%d,%d at %d,%d where the screen holds %d,%d,%d"
+                .. " (the answer was encoded before the repaint was painted) (%s)",
+                got_r, got_g, got_b, rx, ry, want_r, want_g, want_b,
+                stage.describe("after the key")))
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
+--- The same invariant with no client message anywhere: a key pressed on the *local* device, whose
+--- handler takes longer than one poll interval (a page turn that has to render is the ordinary
+--- case). By the time the loop reaches its next task pass the poll is due, so the poll runs *before*
+--- the `UIManager:_repaint` that paints the widget - the state the reported bug loses the repaint
+--- in, and the one that made it look as if keyboard input was never recorded at all.
+check("a_local_key_repaint_reaches_a_client_within_a_poll_of_its_paint", function()
+    local stage = live_repaint_stage()
+    local ok, err = pcall(function()
+        stage.stage.handler_delay = 0.02          -- longer than Server.POLL_INTERVAL
+        stage.hold_a_request()
+        local paints_before = stage.stage.paints
+
+        -- No client message at all: a key on the device, delivered by the loop's own wait. The loop
+        -- then needs one iteration to deliver it (its `waitEvent` runs after that iteration's
+        -- `_repaint`), the next to paint the repaint it asked for - which is where the change is
+        -- recorded - and the poll after that to answer the request with it: three iterations, two
+        -- of them polls. Losing the repaint would need a further event and there is none.
+        stage.queue_local_key()
+        local nrects, rects = stage.take_frame(3)
+        stage.snapshot()
+
+        assert_true(stage.stage.keys == 1, "the widget must have been sent the local key")
+        assert_true(stage.stage.paints > paints_before,
+            "the local key's repaint must have been painted ("
+            .. stage.describe("after the local key") .. ")")
+
+        local rx, ry = stage.rect.x + 4, stage.rect.y + 4
+        local got_r, got_g, got_b = get(stage.plane, rx, ry)
+        local want_r, want_g, want_b = get(stage.reference, rx, ry)
+        assert_true(want_r == 255 and want_g == 255 and want_b == 255,
+            "the local key's repaint must have left the patch white ("
+            .. stage.describe("after the local key") .. ")")
+        print(string.format("   [local key] one key press, no client message: %d rectangle(s) %s,"
+            .. " %d paint(s) of the widget", nrects, rect_list(rects),
+            stage.stage.paints - paints_before))
+        assert_true(got_r == want_r and got_g == want_g and got_b == want_b,
+            string.format("the frame answering a local key must carry the pixels of the repaint it"
+                .. " caused: the client holds %d,%d,%d at %d,%d where the screen holds %d,%d,%d"
+                .. " (the answer was encoded before the repaint was painted) (%s)",
+                got_r, got_g, got_b, rx, ry, want_r, want_g, want_b,
+                stage.describe("after the local key")))
+    end)
+    stage.restore()
+    if not ok then error(err, 0) end
+end)
+
+--- The half of the invariant that is not about one frame: the change must not be *lost*. Recording
+--- a rectangle while the poll is running has to leave the client's request outstanding, so a later
+--- poll answers it - if the generation accounting had moved past the change instead, the second key
+--- would be answered with nothing at all, and a record encoded from stale pixels would leave the
+--- client showing a colour the screen no longer holds. The patch flips colour on every press, so
+--- each frame is checked against a different expected pixel.
+check("a_second_key_repaint_reaches_a_client_too", function()
+    local stage = live_repaint_stage()
+    local ok, err = pcall(function()
+        for press = 1, 2 do
+            local what = "press " .. press
+            stage.hold_a_request()
+            local paints_before = stage.stage.paints
+            stage.client.sock:send(string.char(4, 1, 0, 0) .. string.char(0, 0, 0xff, 0x54))
+            local nrects = stage.take_frame(2)
+            stage.snapshot()
+
+            assert_true(stage.stage.keys == press,
+                what .. ": the widget must have been sent " .. press .. " key(s) ("
+                .. stage.describe(what) .. ")")
+            assert_true(stage.stage.paints > paints_before,
+                what .. ": the repaint must have been painted (" .. stage.describe(what) .. ")")
+
+            local rx, ry = stage.rect.x + 4, stage.rect.y + 4
+            local got_r, got_g, got_b = get(stage.plane, rx, ry)
+            local want_r, want_g, want_b = get(stage.reference, rx, ry)
+            print(string.format("   [press %d] %d rectangle(s): the patch is %d,%d,%d on the screen"
+                .. " and %d,%d,%d at the client", press, nrects, want_r, want_g, want_b,
+                got_r, got_g, got_b))
+            assert_true(got_r == want_r and got_g == want_g and got_b == want_b,
+                string.format("%s: the frame must carry the patch that press painted, not the one"
+                    .. " before it: client %d,%d,%d vs screen %d,%d,%d (%s)", what,
+                    got_r, got_g, got_b, want_r, want_g, want_b, stage.describe(what)))
+        end
     end)
     stage.restore()
     if not ok then error(err, 0) end

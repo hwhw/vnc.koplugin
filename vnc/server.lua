@@ -121,17 +121,37 @@ function Server.new(opts)
         _screen_at = nil,       -- screen size the last update was built for
         _conv_cache = {},       -- conversions shared by the clients served in one tick
         _orig_refresh = nil,
+        _orig_repaint = nil,
+        _refresh_pending = {},  -- what the refresh hook saw since the last completed frame
+        _repaint_depth = 0,     -- nested UIManager:_repaint calls (forceRePaint inside a paint)
         _poll_task = nil,
     }, Server)
     self._inject_client = {}                 -- button state for Server:inject_pointer
-    -- Records the frame's dirty region and then does the refresh it wrapped. `_orig_refresh` is
+    -- Notes the frame's dirty region and then does the refresh it wrapped; the region is *recorded*
+    -- by Server._repaint_hook below, once the frame that paints it is complete. `_orig_refresh` is
     -- always the *original* UIManager._refresh - never our own hook - so however the chain around
     -- us is rearranged (a start after a stop somebody else wrapped, an unhook that could not
     -- restore), this can neither call a nil nor call itself.
     self._refresh_hook = function(mgr, mode, region, dither)
-        self:_record_dirty(mode, region)
+        self:_note_refresh(mode, region)
         local orig = self._orig_refresh
         if orig then return orig(mgr, mode, region, dither) end
+    end
+    -- Records what the refresh hook has noted, at the one point where the pixels of those refreshes
+    -- are in the framebuffer: after `UIManager:_repaint` has painted the widgets and drained the
+    -- refresh queue it built them from (c.f., @{Server:_note_refresh}).
+    self._repaint_hook = function(mgr, ...)
+        local orig = self._orig_repaint
+        if not orig then return end
+        self._repaint_depth = self._repaint_depth + 1
+        -- `UIManager:_repaint` takes no arguments of its own, so there is nothing to forward (and
+        -- none of the allocations a vararg-forwarding wrapper would make on every frame).
+        local ok, err = pcall(orig, mgr)
+        self._repaint_depth = self._repaint_depth - 1
+        if ok and self._repaint_depth == 0 then
+            self:_flush_frame_records()
+        end
+        if not ok then error(err, 0) end
     end
     self._poll_task = function() self:_poll() end
     return self
@@ -253,31 +273,94 @@ function Server:_screen_size()
 end
 
 --[[--
-Wraps `UIManager._refresh`, KOReader's single "this frame is done" point.
+Wraps `UIManager._refresh` and `UIManager._repaint`, the pair that makes a frame observable.
 
-Only records rectangles here: encoding happens in the poll task, so a repaint never pays for a
-client's bandwidth. Other plugins may wrap the same function, so `_orig_refresh` is captured once
-(the real `_refresh`) and kept across stop/start cycles: re-capturing it after somebody wrapped us
-would chain our hook to itself and recurse on every frame.
+`_refresh` is where a frame's dirty region becomes known; `_repaint` is where its pixels appear in
+@{ffi.blitbuffer} `Screen.bb` - it is the function that calls every dirty widget's `paintTo` and then
+drains the refresh queue `_refresh` filled. A change is therefore only recorded *after* a `_repaint`
+that followed its `_refresh` has returned (c.f., @{Server:_note_refresh}); this hook pair is what
+puts the record there.
+
+Both hooks are captured the same way: the originals are taken once and kept across stop/start
+cycles, so however the chain around us is rearranged (a start after a stop somebody else wrapped, an
+unhook that could not restore), neither hook can end up calling itself.
 ]]
 function Server:_hook_refresh()
     if not self._orig_refresh then
         self._orig_refresh = UIManager._refresh
     end
+    if not self._orig_repaint then
+        self._orig_repaint = UIManager._repaint
+    end
     if UIManager._refresh ~= self._refresh_hook then
         UIManager._refresh = self._refresh_hook
+    end
+    if UIManager._repaint ~= self._repaint_hook then
+        UIManager._repaint = self._repaint_hook
     end
 end
 
 function Server:_unhook_refresh()
-    if not self._orig_refresh then return end
+    if not self._orig_refresh and not self._orig_repaint then return end
+    self._refresh_pending = {}
+    -- The refresh hook first: it is the one that fills the pending list.
     if UIManager._refresh == self._refresh_hook then
         UIManager._refresh = self._orig_refresh
         self._orig_refresh = nil
-    else
-        -- Somebody wrapped us: their hook still reaches ours, and ours still reaches the real
-        -- `_refresh`, so leave the chain alone (and keep `_orig_refresh` for a later start).
-        logger.warn("vnc: UIManager._refresh was wrapped by somebody else; leaving it alone")
+    end
+    if UIManager._repaint == self._repaint_hook then
+        UIManager._repaint = self._orig_repaint
+        self._orig_repaint = nil
+    end
+    if self._orig_refresh or self._orig_repaint then
+        -- Somebody wrapped one of them: their hook still reaches ours, and ours still reaches the
+        -- real function, so leave the chain alone (and keep the originals for a later start).
+        logger.warn("vnc: UIManager._refresh or _repaint was wrapped by somebody else;"
+            .. " leaving the chain alone")
+    end
+end
+
+--- Notes the region a refresh is about to make dirty, *without* recording it yet.
+---
+--- `UIManager._refresh` only *enqueues* a refresh in this KOReader: the widgets are painted, and the
+--- queue drained into `Screen:refresh*`, by `UIManager:_repaint`, which the UI loop calls first
+--- thing on every iteration and which `UIManager:forceRePaint` calls directly. Recording here
+--- instead would stamp a rectangle with a generation at a moment when @{ffi.blitbuffer} `Screen.bb`
+--- still holds the *previous* frame - and a rectangle is a claim about pixels, so whoever encodes it
+--- has to be able to read them. That is exactly what went wrong for input the *server* injects: the
+--- injection happens inside the poll task, i.e. inside UIManager's task pass, so the `_repaint` that
+--- paints the widget reacting to it runs only after the poll has already answered the client with
+--- the pixels from before it, and `sent_gen` has moved past a change the client never saw. The
+--- client then shows the old screen until a later event records another generation - the "a
+--- keyboard-driven repaint arrives one event late" report (a click was not immune: it only looked
+--- prompt because the widgets a click lands on repaint through `forceRePaint`, which paints inside
+--- the injection).
+---
+--- Keeping the note until @{Server:_flush_frame_records} runs - at the end of the outermost
+--- `_repaint` after it - makes the pixels in the framebuffer and the record of them inseparable: a
+--- rectangle cannot exist before the frame it describes has been painted. Input is still answered as
+--- soon as the change is recorded, i.e. one poll (10 ms) plus one paint later.
+---
+--- The numbers are copied out of the caller's region: it belongs to `UIManager`'s refresh queue,
+--- which we do not own, and a rectangle that has to survive until the end of the frame must not be
+--- read through a table somebody else may still be holding.
+function Server:_note_refresh(mode, region)
+    local note = { mode = mode }
+    if region then
+        note.x, note.y, note.w, note.h = region.x, region.y, region.w, region.h
+    end
+    local pending = self._refresh_pending
+    pending[#pending + 1] = note
+end
+
+--- Records everything noted since the last completed frame: called at the end of the outermost
+--- `UIManager:_repaint`, i.e. once the widgets that a refresh asked for have been painted.
+function Server:_flush_frame_records()
+    local pending = self._refresh_pending
+    if #pending == 0 then return end
+    self._refresh_pending = {}
+    for _, note in ipairs(pending) do
+        self:_record_dirty(note.mode, note)
     end
 end
 
