@@ -260,11 +260,12 @@ end)
 -- ---------------------------------------------------------------- a real viewer widget
 
 --- Builds a shown viewer app with a fake session and plugin (no network involved).
+--- @tparam[opt] number plane_w, plane_h the remote plane's size (400x300 by default)
 --- @treturn table, table, table the app, its remote plane and a record of what it sent
-local function new_app()
+local function new_app(plane_w, plane_h)
     local ViewerApp = require("vnc/app")
     local Remote = require("vnc/framebuffer")
-    local remote = Remote.new(400, 300)
+    local remote = Remote.new(plane_w or 400, plane_h or 300)
     local sent = { pointer = {}, key = {} }
     local app = ViewerApp:new{
         plugin = {
@@ -289,7 +290,8 @@ local function new_app()
             get_profile = function() return { name = "test" } end,
         },
     }
-    UIManager:show(app)
+    -- Shown the way main.lua shows it: a full-screen widget asks for its own refresh.
+    UIManager:show(app, "full")
     return app, remote, sent
 end
 
@@ -830,6 +832,263 @@ check("keys_forward_to_the_remote", function()
     assert_true(left, "without a keyboard, Back must leave the viewer")
 
     app:onCloseWidget()
+    remote:free()
+end)
+
+-- ---------------------------------------------------------------- the panel: what a refresh reaches
+
+--[=[--
+An e-ink panel, modelled.
+
+A panel is a physical medium: a pixel only changes where a refresh asked for it, no matter what was
+painted into `Screen.bb` in between. That is precisely the difference the viewer has to respect (and
+the reason a full-screen widget must ask for the refresh it needs), so these checks compare the panel
+against the framebuffer after every step.
+
+Every kind of refresh ends up in `Screen:refreshFullImp` on the emulator too (the base class routes
+them all there), so one hook sees them all.
+]=]
+local bb = require("ffi/blitbuffer")
+local Widget = require("ui/widget/widget")
+local panel, refresh_log
+local real_refresh_full_imp = Screen.refreshFullImp
+function Screen:refreshFullImp(x, y, w, h, dither)
+    if panel then
+        local bx, by, bw, bh = self.bb:getBoundedRect(x, y, w, h)
+        refresh_log[#refresh_log + 1] = { x = bx, y = by, w = bw, h = bh }
+        panel:blitFrom(self.bb, bx, by, bx, by, bw, bh)
+    end
+    return real_refresh_full_imp(self, x, y, w, h, dither)
+end
+
+--[[--
+A blank panel, an empty paint/refresh queue (a fresh screen), and the "home screen" the viewer is
+shown over: a full-screen widget with a pattern, so a panel that missed an update is recognisable.
+]]
+local function fresh_screen()
+    local size = Screen:getSize()
+    UIManager._window_stack = {}
+    UIManager._dirty = {}
+    UIManager._refresh_stack = {}
+    UIManager._refresh_func_stack = {}
+    panel = bb.new(size.w, size.h, Screen.bb:getType())
+    refresh_log = {}   -- the hook may run before fresh_screen() is done
+    panel:paintRect(0, 0, size.w, size.h, bb.COLOR_WHITE)
+    local Home = Widget:extend{ covers_fullscreen = true }
+    function Home:paintTo(target, x, y)
+        target:paintRect(x, y, self.dimen.w, self.dimen.h, bb.COLOR_WHITE)
+        for i = 0, 15 do
+            target:paintRect(x, y + i * math.floor(self.dimen.h / 16), self.dimen.w,
+                math.max(1, math.floor(self.dimen.h / 32)), bb.COLOR_GRAY_5)
+        end
+    end
+    local home = Home:new{}
+    home.dimen = Geom:new{ x = 0, y = 0, w = size.w, h = size.h }
+    UIManager:show(home)
+    UIManager:forceRePaint()
+    refresh_log = {}   -- only what the viewer does from here on is asserted
+end
+
+--- A pixel as an independent value. `getPixel` hands back a *reference* into the buffer (LuaJIT
+--- allows holding on to `p[0]`), so a value kept across a repaint would follow the repaint instead
+--- of remembering it; `getColorRGB32()` builds a fresh one.
+local function pixel_at(target, x, y)
+    return target:getPixel(x, y):getColorRGB32()
+end
+
+--- Pixels the panel never received, i.e. what a user would still be seeing from before.
+local function stale_pixels()
+    local n = 0
+    for py = 0, panel:getHeight() - 1 do
+        for px = 0, panel:getWidth() - 1 do
+            if pixel_at(panel, px, py) ~= pixel_at(Screen.bb, px, py) then n = n + 1 end
+        end
+    end
+    return n
+end
+
+--- True when one of the refreshes applied since the last `refresh_log = {}` covered the screen.
+local function flushed_full_screen()
+    local size = Screen:getSize()
+    for _, r in ipairs(refresh_log) do
+        if r.w >= size.w and r.h >= size.h then return true end
+    end
+    return false
+end
+
+check("showing_the_viewer_pushes_the_whole_screen", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0,
+        string.format("showing the viewer must reach the panel, %d px never arrived", stale_pixels()))
+    assert_true(flushed_full_screen(), "and it must be a full-screen refresh, not a regional one")
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("a_wholesale_change_repaints_the_panel", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "a frame must reach the panel")
+
+    -- a zoom changes the whole canvas at once
+    refresh_log = {}
+    app:zoom_to(0.5)
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "a zoom must leave the panel matching the framebuffer")
+    assert_true(flushed_full_screen(), "a zoom is a wholesale change: it has to flash the screen")
+    -- ...and the first frame after it carries the new geometry, so it is flashed too
+    refresh_log = {}
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the first frame after a zoom must reach the panel")
+    assert_true(flushed_full_screen(), "and it is flashed, not blitted region by region")
+
+    -- the keyboard appearing and going away is the same kind of change
+    refresh_log = {}
+    app:set_keyboard_visible(true)
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "showing the keyboard must not leave the panel behind")
+    assert_true(flushed_full_screen(), "nor push it region by region")
+    refresh_log = {}
+    app:set_keyboard_visible(false)
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "and the same when it goes away again")
+
+    -- a remote desktop resize
+    refresh_log = {}
+    remote:resize(800, 600)
+    app:on_remote_resized()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "a remote resize must leave the panel matching the framebuffer")
+    assert_true(flushed_full_screen(), "a remote resize is a wholesale change as well")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("the_menu_lands_on_the_panel", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    app:zoom_to(1)                    -- 1:1, so a pixel probe below means what it says
+    UIManager:forceRePaint()
+    local dx, dy = remote:rect_to_canvas({ x = 0, y = 0, w = 400, h = 300 }, app.canvas.x, app.canvas.y)
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the frame must reach the panel")
+    local desktop = pixel_at(panel, dx + 5, dy + 5)
+
+    refresh_log = {}
+    app:open_menu()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0,
+        string.format("opening the menu must flush the whole screen, %d px are stale", stale_pixels()))
+    assert_true(flushed_full_screen(), "a menu over a framebuffer is a wholesale change")
+    assert_true(pixel_at(panel, dx + 5, dy + 5) ~= desktop,
+        "and the panel has to show the menu, not the desktop")
+    assert_true(app.menu.covers_fullscreen == true,
+        "the menu must declare that it covers the screen, so the viewer underneath is not repainted")
+
+    refresh_log = {}
+    app:close_menu()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "closing the menu must give the whole screen back to the viewer")
+    assert_true(pixel_at(panel, dx + 5, dy + 5) == desktop,
+        "and the panel has to show the desktop again")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("a_popup_leaves_the_panel_alone_but_not_the_plane", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    app:zoom_to(1)
+    UIManager:forceRePaint()
+    local dx, dy = remote:rect_to_canvas({ x = 0, y = 0, w = 400, h = 300 }, app.canvas.x, app.canvas.y)
+    local plane = remote:get_plane()
+    plane:paintRect(0, 0, 400, 300, bb.COLOR_GRAY_7)
+    remote:mark_dirty()
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the frame must reach the panel")
+
+    app:open_menu()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the menu must reach the panel")
+    local menu_px = pixel_at(panel, dx + 5, dy + 5)
+    local flushes = #refresh_log
+
+    -- the server changes the desktop while the menu is up
+    local plane_before = pixel_at(plane, 5, 5)
+    plane:paintRect(0, 0, 400, 300, bb.COLOR_GRAY_3)
+    remote:mark_dirty()
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(#refresh_log == flushes, "a popup above us must leave the panel alone")
+    assert_true(pixel_at(panel, dx + 5, dy + 5) == menu_px, "so the panel still shows the menu")
+    assert_true(pixel_at(plane, 5, 5) ~= plane_before, "but the plane itself must stay current")
+
+    -- and the flash that closing the menu asks for carries that change to the panel
+    app:close_menu()
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "closing the menu must flush the whole screen")
+    assert_true(pixel_at(panel, dx + 5, dy + 5) ~= menu_px,
+        "and the panel must show the change that arrived while the menu was up")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("closing_the_viewer_shows_the_home_screen", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the viewer must be on the panel")
+    local viewer_px = pixel_at(panel, 10, 10)
+
+    -- Leave it with nothing but the viewer's own close path, with the keyboard up: closing the
+    -- keyboard queues a refresh of just its own area, and that regional request used to be the last
+    -- word on the whole screen (`UIManager:close` refreshes nothing by itself).
+    app:set_keyboard_visible(true)
+    UIManager:forceRePaint()
+    refresh_log = {}
+    UIManager:close(app)              -- the plain close: no refreshtype at all
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0,
+        string.format("the home screen must reach the panel, %d px never arrived", stale_pixels()))
+    assert_true(flushed_full_screen(), "and it must be a full-screen refresh")
+    assert_true(pixel_at(panel, 10, 10) ~= viewer_px, "the panel must have moved on from the viewer")
+end)
+
+check("leaving_the_viewer_through_the_plugin_restores_the_home_screen", function()
+    fresh_screen()
+    local app, remote = new_app()
+    UIManager:forceRePaint()
+    app:on_framebuffer_dirty({ x = 0, y = 0, w = 400, h = 300 })
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0, "the viewer must be on the panel")
+    local viewer_px = pixel_at(panel, 10, 10)
+
+    app:set_keyboard_visible(true)
+    UIManager:forceRePaint()
+    plugin.sessions = {}
+    plugin.app = app                  -- as VNC:_open_app leaves it
+    plugin:leave_app()                -- main.lua's own path
+    plugin.app = nil
+    UIManager:forceRePaint()
+    assert_true(stale_pixels() == 0,
+        string.format("leave_app must leave the home screen on the panel, %d px never arrived", stale_pixels()))
+    assert_true(flushed_full_screen(), "leave_app must ask for a full-screen refresh")
+    assert_true(pixel_at(panel, 10, 10) ~= viewer_px, "the panel must have moved on from the viewer")
     remote:free()
 end)
 
