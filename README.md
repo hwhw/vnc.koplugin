@@ -31,7 +31,7 @@ Current version: **v0.5**.
 2. Unpack the ZIP.
 3. Move the plugin folder into the `plugins` directory in your KOReader folder (create the
    `plugins` directory if it is not there yet). GitHub names the unpacked folder after the
-   repository and the branch — `vnc.koplugin-main` — so rename it to **`vnc.koplugin`**
+   repository and the branch — `vncviewer.koplugin-main` — so rename it to **`vnc.koplugin`**
    while you are at it: KOReader only loads plugin directories whose name ends in `.koplugin`.
 4. Restart KOReader.
 
@@ -41,8 +41,8 @@ only what KOReader already ships.
 ## Using it
 
 Open the file browser menu in KOReader, then **More tools** ▸ **VNC viewer**. You get the
-connection list; start with **New connection…** and enter the host, the port (5900 by default) and
-the password your VNC server uses. Tap a connection to connect.
+connection list; start with **New connection…** and give it a name, the host, the port (5900 by
+default) and the password your VNC server uses. Tap a connection to connect.
 
 There is no permanent toolbar: the remote desktop owns the whole screen.
 
@@ -102,6 +102,28 @@ Connect with any VNC viewer — `x11vnc`'s viewer, TigerVNC, Remmina, a phone ap
 Everything KOReader can do is therefore remote-controllable, so treat the password as important and
 prefer a tunnel (SSH, WireGuard) if the network is not yours. **The server is only reachable while
 it is started**, and KOReader must be running.
+
+The server uses the viewer's own choice of encoding: it can produce **Raw, RRE, Hextile and ZRLE**
+and takes the first entry of the client's preference list it can do, falling back to Raw when the
+client asks for something else (Tight, TRLE, CopyRect). A large changed region is carried as several
+rectangles of at most 256 px a side for the encoders that walk every pixel, so a full-screen change
+cannot hold up the reader's UI; a Raw client is not tiled.
+
+An incremental update request with nothing to answer is **held**, not answered with an empty update:
+a viewer asks again the moment it is answered, so answering every time would be a ping-pong at the
+poll rate. The hold ends as soon as something inside the region the request named has changed; a
+client that has gone quiet with a request outstanding is sent one empty update a second as a sign of
+life, and that sign of life deliberately does not release the hold, so the change still reaches it
+afterwards. Viewers that keep their picture up to date without asking (the Continuous Updates
+extension, client message 150) are supported too: whatever changes inside the region they enabled is
+pushed to them. The community extensions real viewers send are handled rather than fatal — a Fence
+ping is answered, and a client asking the server to resize the desktop is declined, because the
+picture follows the reader's own screen.
+
+A client's click is injected as a click: a press is buffered until it is known what it is — the
+release (a click), motion of 4 px or more with the button down (a drag), or the reader's own
+long-press interval (a long press). Both halves also set `TCP_NODELAY` on the socket, so a reply
+that leaves as several small writes is not delayed by Nagle's algorithm.
 
 What a client sees is KOReader's logical screen: the e-ink panel's own flash/ghosting is not
 reproduced, and the on-screen keyboard, dialogs and rotations are simply part of the picture.
@@ -165,4 +187,34 @@ welcome.
 ## For developers
 
 `NOTES.txt` has the architecture, the internals, the test setup and what has and has not been
-verified.
+verified. The three suites it describes live in `tools/` and are run from the KOReader root with
+KOReader's own LuaJIT:
+
+    PLUGIN=~/.config/koreader/plugins/vnc.koplugin
+    cd /usr/lib/koreader
+
+    # the client protocol stack, over a real socket, against tools/mock_vnc_server.py
+    LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/proto_smoke.lua" --tmp "$HOME/vnc-smoke"   # --tmp=<dir> works as well
+
+    # the dialogs and the viewer widget against KOReader's widget stack, headless
+    KO_HOME="$HOME/vnc-smoke/ui" SDL_VIDEODRIVER=dummy \
+      LUA_PATH="$PLUGIN/?.lua;;" LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/ui_smoke.lua"
+
+    # the server half: pixel formats, encoders, protocol, the real socket path, input injection
+    KO_HOME="$HOME/vnc-smoke/server" SDL_VIDEODRIVER=dummy \
+      LUA_PATH="$PLUGIN/?.lua;./common/?.lua;./common/?/init.lua;;" LUA_CPATH="./common/?.so;;" \
+      ./luajit "$PLUGIN/tools/server_smoke.lua"
+
+`tools/mock_vnc_server.py` is the RFB fixture the client suite talks to — deterministic patterns in
+every encoding, both security types, and every client message logged — and
+`tools/tight_jpeg.b64` is the fixed 32×32 JPEG it serves for its Tight JPEG rectangle.
+`tools/mock_vnc_client.py` is the independent Python client the server is proved against, so the
+server is checked by something that is not this plugin's own code.
+
+Keep the scratch directories on the home filesystem: a quota-limited `/tmp` makes the suites fail
+(its default locations are under `/tmp`). The UI suite needs a **fresh** `KO_HOME` — it reuses fixed
+paths under it — and `SDL_VIDEODRIVER=dummy` keeps the SDL emulator from opening a window without
+changing what the checks see. `NOTES.txt` has the rest of the pitfalls, the live end-to-end recipe
+(mock server plus a real KOReader driven through its HTTP inspector) and the open ends.
