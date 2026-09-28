@@ -223,12 +223,19 @@ function MenuBuilder.open(app)
         is_borderless = true,
         is_popout = false,
         title_bar_fm_style = true,
+        -- The menu covers the framebuffer view, so UIManager must composite from us instead of
+        -- repainting the viewer underneath on every tick. Every full-screen menu in core says so
+        -- (c.f. frontend/ui/widget/booklist.lua, keyvaluepage.lua, filemanagercollection.lua).
+        covers_fullscreen = true,
         close_callback = function()
             app.menu = nil
             app:_sync_keyboard_later()
         end,
     }
-    UIManager:show(menu)
+    -- A menu over a framebuffer view is a wholesale change: without a flash the panel would keep
+    -- the desktop where the menu belongs, and the viewer's per-rectangle refreshes would only ever
+    -- push a band of it. Core's TouchMenu flashes its first popup for exactly this reason.
+    UIManager:show(menu, "flashui")
     return menu
 end
 

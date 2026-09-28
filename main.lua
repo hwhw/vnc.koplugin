@@ -89,7 +89,9 @@ Shows the viewer, reusing the running session when there is one.
 ]]
 function VNC:show(profile_name)
     if self.app then
-        UIManager:show(self.app)
+        -- A re-shown viewer: `UIManager:show` refreshes nothing by itself, and a viewer is a
+        -- wholesale change (c.f. ViewerApp:_wholesale_change).
+        UIManager:show(self.app, "full")
         return
     end
     if profile_name then
@@ -138,11 +140,14 @@ end
 function VNC:_open_app(session)
     if not self.app then
         self.app = ViewerApp:new{ plugin = self, session = session }
-        UIManager:show(self.app)
+        -- A full-screen widget must ask for the refresh it needs: `UIManager:show` only queues
+        -- what the caller passed, and the viewer replaces the whole screen (c.f. ReaderUI, which
+        -- is shown the same way).
+        UIManager:show(self.app, "full")
         -- After showing: the app records the pre-existing rotation mode first.
         self.app:apply_default_orientation()
     else
-        UIManager:show(self.app)
+        UIManager:show(self.app, "full")
     end
     session:attach(self.app)
 end
@@ -211,7 +216,9 @@ end
 function VNC:_close_app_if(session)
     if self.app and self.app.session == session then
         self.app:restore_rotation()
-        UIManager:close(self.app)
+        -- Coming back from a full-screen widget is a wholesale change: `UIManager:close` refreshes
+        -- nothing on its own, so the file browser would stay off the panel (c.f. ReaderUI's close).
+        UIManager:close(self.app, "full")
         self.app = nil
     end
 end
@@ -220,7 +227,9 @@ end
 function VNC:leave_app()
     if self.app then
         self.app:restore_rotation()
-        UIManager:close(self.app)
+        -- `UIManager:close` refreshes nothing on its own: without an explicit full refresh the
+        -- file browser is repainted into the framebuffer but never pushed to an e-ink panel.
+        UIManager:close(self.app, "full")
         self.app = nil
     end
     for _, session in pairs(self.sessions) do

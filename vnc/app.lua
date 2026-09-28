@@ -58,6 +58,7 @@ function ViewerApp:init()
     self.canvas = nil
     self.vk_visible = false
     self.vk_wanted = false           -- the user's wish, independent of what is on top of us
+    self._needs_flash = false        -- the next remote frame must be flashed, not blitted region by region
     self._keyboard_sync_pending = false
     self._keyboard_watch_pending = false
     self.vk = Keyboard.new(self.session, function() self:on_keyboard_height_changed() end)
@@ -268,6 +269,8 @@ function ViewerApp:onScreenResize(dimen)
     self:_reflow()
     self:_refresh_keyboard()
     self:updateTouchZonesOnScreenResize(self.dimen)
+    -- new geometry: the whole canvas changed, and nothing else here would refresh it
+    self:_wholesale_change()
     return false
 end
 
@@ -312,23 +315,58 @@ function ViewerApp:paintTo(bb, x, y)
 end
 
 --[[--
-Repaints just the part of the canvas a remote rect landed on.
---- @tparam table rect `{x, y, w, h}` in remote coordinates
+Declares that the *whole* canvas changed at once: a new connection, a remote resize, a zoom, the
+on-screen keyboard appearing or going away. Such a change needs a flashing full-screen refresh, not
+the regional "ui" update a remote rectangle gets: on e-ink a partial waveform cannot render a
+wholesale change, and KOReader's own promotion counter only ever promotes "partial"
+(`UIManager:_refresh`), which a viewer drawing a live framebuffer must not use (on a REAGL Kindle
+"partial" is the REAGL waveform, i.e. a flash per rectangle - c.f. ImageViewer's note on why it
+uses "ui").
+
+`_needs_flash` additionally flashes the *next* remote frame, which is the first one carrying the
+new geometry's content; it is consumed by the first rectangle to arrive after the change.
+]]
+function ViewerApp:_wholesale_change()
+    self._needs_flash = true
+    UIManager:setDirty(self, "full")
+end
+
+--[[--
+Repaints the parts of the canvas the remote rectangles landed on.
+
+While a popup of ours is above us the plane is still written (the session decodes straight into
+it), but the panel is left alone: the popup owns the screen, and the flash that closing it asks
+for covers the whole canvas again.
+--- @tparam table rect `{x, y, w, h}` in remote coordinates, or a list of such rectangles
 ]]
 function ViewerApp:on_framebuffer_dirty(rect)
     if not self.canvas or not self.remote then return end
-    local x, y, w, h = self.remote:rect_to_canvas(rect, self.canvas.x, self.canvas.y)
-    local clipped = Util.intersect_rect(
-        { x = x, y = y, w = w, h = h },
-        { x = self.canvas.x, y = self.canvas.y, w = self.canvas.w, h = self.canvas.h })
-    if clipped then
-        UIManager:setDirty(self, "ui", Geom:new(clipped))
+    if self:_modal_above() then
+        -- Nothing of ours is visible: keep the plane current, and flash the next frame that is.
+        self._needs_flash = true
+        return
+    end
+    if self._needs_flash then
+        -- One full-screen flash covers every rectangle of this batch.
+        self._needs_flash = false
+        UIManager:setDirty(self, "flashui")
+        return
+    end
+    local rects = rect.x and { rect } or rect
+    for _i, r in ipairs(rects) do
+        local x, y, w, h = self.remote:rect_to_canvas(r, self.canvas.x, self.canvas.y)
+        local clipped = Util.intersect_rect(
+            { x = x, y = y, w = w, h = h },
+            { x = self.canvas.x, y = self.canvas.y, w = self.canvas.w, h = self.canvas.h })
+        if clipped then
+            UIManager:setDirty(self, "ui", Geom:new(clipped))
+        end
     end
 end
 
 function ViewerApp:on_remote_resized()
     self:_reflow()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
 end
 
 function ViewerApp:on_bell()
@@ -346,6 +384,10 @@ function ViewerApp:onCloseWidget()
     end
     UIManager:unschedule(self._watch_keyboard_tick)
     self._keyboard_watch_pending = false
+    -- Take the keyboard down first: closing it queues a refresh of just its own area
+    -- (VirtualKeyboard:onCloseWidget), and that regional request would otherwise be the last word
+    -- on what the panel hears about - it even suppresses UIManager:_repaint's "something was
+    -- painted but nothing was queued" fallback.
     if self.vk then
         self.vk:hideKeyboard()
         self.vk_visible = false
@@ -353,6 +395,10 @@ function ViewerApp:onCloseWidget()
     end
     Keyboard.restore_layout()
     self.canvas = nil
+    -- ...then hand the whole screen back ourselves: `UIManager:close` refreshes nothing on its own,
+    -- a nil widget with no region means the full screen, and it merges with (and dominates) the
+    -- keyboard's regional request. This is what makes the widgets underneath reach the panel.
+    UIManager:setDirty(nil, "flashui")
 end
 
 -- ---------------------------------------------------------------- input plumbing
@@ -488,7 +534,7 @@ function ViewerApp:onPinch()
     self._zoom_start_span = nil
     -- the new zoom may put the view above the keyboard (or back on the whole screen)
     self:update_canvas()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
     return nil
 end
 
@@ -497,7 +543,7 @@ function ViewerApp:onSpread()
     self._zoom_start_span = nil
     -- the new zoom may put the view above the keyboard (or back on the whole screen)
     self:update_canvas()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
     return nil
 end
 
@@ -549,6 +595,9 @@ function ViewerApp:onShow()
     self:_ensure_text_input()
     self:evaluate_keyboard()
     self:_watch_keyboard_state()
+    -- A (re-)shown viewer is a wholesale change: whoever showed us may have passed no refreshtype
+    -- (`UIManager:show` refreshes nothing by itself), and our first paint is the whole canvas.
+    self:_wholesale_change()
 end
 
 --[[--
@@ -657,7 +706,7 @@ function ViewerApp:evaluate_keyboard()
     -- above the keyboard still spans the screen and is panned, as before.
     self:_fit_zoom_mode()
     self:update_canvas()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
 end
 
 --- Asks for a keyboard state for as long as the framebuffer view is the topmost window.
@@ -722,7 +771,7 @@ function ViewerApp:on_keyboard_height_changed()
     -- "fit (with keyboard)" fits into and whether a view fits above it.
     self:_fit_zoom_mode()
     self:update_canvas()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
 end
 
 -- ---------------------------------------------------------------- zoom / orientation
@@ -734,7 +783,7 @@ function ViewerApp:zoom_to(mode)
     end
     -- the new scale may put the view above the keyboard (or back on the whole screen)
     self:update_canvas()
-    UIManager:setDirty(self, "ui")
+    self:_wholesale_change()
 end
 
 function ViewerApp:rotate(delta)
@@ -779,7 +828,9 @@ function ViewerApp:close_menu()
     if self.menu then
         local menu = self.menu
         self.menu = nil
-        UIManager:close(menu)
+        -- The menu owned the screen: ask for a full-screen flash, so the panel gets the framebuffer
+        -- view back instead of keeping whatever the menu left (a menu is a wholesale change too).
+        UIManager:close(menu, "flashui")
         -- `UIManager:close` does not run the menu's `close_callback`; hand the screen back to the
         -- framebuffer view (and its keyboard) ourselves.
         self:_sync_keyboard_later()

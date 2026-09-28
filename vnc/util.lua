@@ -136,6 +136,38 @@ function Util.union_rect(a, b)
     return { x = x1, y = y1, w = x2 - x1, h = y2 - y1 }
 end
 
+--[=[--
+Adds `rect` to the list `list` (creating nothing else), merging it with every rectangle it
+touches; sharing an edge counts as touching, which is what the EPDC does too (c.f. the "open
+range" merge in `UIManager:_refresh`).
+
+The result is a set of *disjoint* rectangles, i.e. an exact description of what changed, rather
+than one bounding box: two small changes at opposite corners must not refresh the band between
+them. Returns `list` for convenience.
+]=]
+function Util.add_rect(list, rect)
+    rect = { x = rect.x, y = rect.y, w = rect.w, h = rect.h }
+    local i = 1
+    while i <= #list do
+        local other = list[i]
+        if rect.x <= other.x + other.w and other.x <= rect.x + rect.w
+            and rect.y <= other.y + other.h and other.y <= rect.y + rect.h then
+            local x1 = math.min(rect.x, other.x)
+            local y1 = math.min(rect.y, other.y)
+            local x2 = math.max(rect.x + rect.w, other.x + other.w)
+            local y2 = math.max(rect.y + rect.h, other.y + other.h)
+            rect = { x = x1, y = y1, w = x2 - x1, h = y2 - y1 }
+            table.remove(list, i)
+            -- the merged rectangle may now touch one we have already walked past
+            i = 1
+        else
+            i = i + 1
+        end
+    end
+    list[#list + 1] = rect
+    return list
+end
+
 --[[--
 Intersection of a `{x, y, w, h}` rect with another; nil when they do not overlap.
 ]]

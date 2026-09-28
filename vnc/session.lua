@@ -70,7 +70,7 @@ function Session.new(opts)
         done = false,
         attached = false,
         app = nil,
-        dirty = nil,       -- accumulated dirty rect, in remote coordinates
+        dirty = nil,       -- accumulated dirty rects, in remote coordinates (a list of disjoint rects)
         wifi_was_on = nil, -- nil until we know
         _connect_cb = nil,
         _network_mgr = opts.network_mgr,
@@ -206,7 +206,10 @@ function Session:_do_connect()
                 self_ref:_set_state("connected")
             end,
             on_rect = function(x, y, w, h)
-                self_ref.dirty = Util.union_rect(self_ref.dirty, { x = x, y = y, w = w, h = h })
+                -- One tick of rectangles is handed to the app as a set of *disjoint* rectangles:
+                -- merging only the ones that touch keeps a couple of small changes far apart from
+                -- turning into one huge (but mostly unchanged) refresh region.
+                self_ref.dirty = Util.add_rect(self_ref.dirty or {}, { x = x, y = y, w = w, h = h })
                 -- A payload larger than one poll tick is decoded across ticks, so a repaint
                 -- can happen while the plane is only half written. Invalidate the scale cache
                 -- *after* the write, or that half-written frame would be reused forever.
@@ -398,10 +401,10 @@ function Session:_poll()
         self.attached = false
         return
     end
-    if self.dirty and self.app then
-        local rect = self.dirty
+    if self.dirty and self.dirty[1] and self.app then
+        local rects = self.dirty
         self.dirty = nil
-        self.app:on_framebuffer_dirty(rect)
+        self.app:on_framebuffer_dirty(rects)
     end
     UIManager:scheduleIn(Session.POLL_INTERVAL, self._poll, self)
 end
@@ -419,6 +422,9 @@ function Session:_teardown_connection()
         self.proto = nil
     end
     self.tx, self.rx, self.need, self.done = {}, "", nil, false
+    -- Rectangles a dead connection never got to report: a reconnect requests the whole screen again,
+    -- so they would only be redundant (and they may be in the old desktop's coordinates).
+    self.dirty = nil
 end
 
 --- Restores Wi-Fi if we were the ones who turned it on.

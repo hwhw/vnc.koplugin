@@ -121,6 +121,32 @@ the topmost full-screen widget, so a widget appearing *above* the viewer never r
 the 250 ms re-check (_watch_keyboard_state). That is also why a toast (a Bell notification) is
 explicitly flagged `toast = true`: it is allowed to share the screen with the keyboard.
 
+Refreshes, and why a full-screen widget has to ask for them. UIManager:show/close only queue the
+refresh the *caller* passed; with no refreshtype they queue nothing at all (`_refresh(nil, ...)`
+returns), and the widgets they uncover are merely flagged for repaint. On an LCD that is
+invisible - a repaint is the screen - but an e-ink panel only changes where a refresh asked it to,
+which is what made the viewer (a full-screen InputContainer that owns a live image) render in
+bands, keep the desktop where a menu should be, and leave the file browser off the panel after a
+disconnect. The viewer is therefore shown and closed with an explicit `"full"` (main.lua),
+onShow() asks for `"full"`, onCloseWidget() ends with `UIManager:setDirty(nil, "flashui")` (a nil
+widget and no region mean the whole screen, and it merges with - and dominates - any regional
+request queued in the same tick), and every wholesale change (a new connection, a remote resize, a
+zoom, the keyboard appearing, a menu opening) goes through ViewerApp:_wholesale_change(): a
+full-screen flash, plus `_needs_flash` so the *next* remote frame - the first one carrying the new
+geometry's content - is flashed rather than blitted rectangle by rectangle.
+
+Two traps are worth remembering, both verified against core. UIManager:_repaint *does* have a
+safety net - if a widget was painted and nothing was queued, it enqueues one full-screen
+`"partial"` - but it is skipped whenever *any* refresh is already in the queue; the on-screen
+keyboard closing on its own (VirtualKeyboard:onCloseWidget) queues a refresh of just its own area,
+and that regional request was enough to leave the freshly painted home screen unpushed (measured:
+60 % of the screen; 75 % with a VNC rectangle pending at the same moment). And KOReader's
+promotion counter (FULL_REFRESH_COUNT, c.f. UIManager:_refresh) only ever promotes `"partial"`, so
+a viewer that refreshes its rectangles with `"ui"` never gets a periodic flash however long it
+runs - hence the explicit flush above. `"partial"` itself is deliberately *not* used for the
+rectangles: on a REAGL Kindle it is the REAGL waveform, i.e. a flash per rectangle, which is why
+ImageViewer uses `"ui"` for the same job.
+
 Platform. Nothing in the plugin is SDL specific: the only input-platform calls are
 Device:startTextInput/stopTextInput, and Device:isTouchDevice()/hasKeyboard() are asked rather than
 assumed. The single external interface in the whole plugin is zlib: zstream.lua declares z_stream
@@ -259,7 +285,11 @@ canvas follows rotations, the keyboard neither rescales nor moves a view that do
 it, the fitted zoom modes and the keyboard-aware placement behave, the keyboard yields to popups,
 platform text input is enabled exactly while the viewer is shown, typed text and physical keys
 reach the remote (through KOReader's own SDL event handler), and the settings store survives a
-hand-edited or empty file. `KO_HOME` is needed because KOReader's widget cache lives under it.
+hand-edited or empty file. The viewer checks at the end model the *panel* as well: an e-ink panel
+is a medium that only changes where a refresh asked it to, so a screen buffer that was painted but
+never refreshed is caught as stale pixels (that is the check the missing `"full"`/`"flashui"` on
+show/close and the missing flash on a wholesale change used to fail, with 60 % of the screen left
+over in the close case). `KO_HOME` is needed because KOReader's widget cache lives under it.
 
 Server half (headless):
 
@@ -326,7 +356,11 @@ Not verified, and where to look first if something is wrong:
   the implementation follows libvncclient, cross-checked against noVNC. Flip the
   ["enable_tight"] default only after a real server has been verified.
 - Real e-ink hardware: the BB8/rotation/NetworkMgr paths exist and are exercised in their emulated
-  forms only.
+  forms only. The emulator cannot show the *effect of a refresh kind* at all - every mode falls
+  through to the same refresh implementation there - so "the panel receives a full-screen, flashing
+  refresh whenever the whole canvas changes" is asserted by the panel model in ui_smoke.lua, while
+  how a given Kindle's EPDC renders that refresh (a partial waveform mishandling a wholesale change
+  is what the flicker and the ghosted strips looked like) still needs the device.
 - Suspend: while KOReader is suspended the poll task simply does not run and the single
   outstanding update request is buffered by the kernel. If a connection turns out to die across
   suspend, re-requesting a full update on resume is the fix - not implemented.
