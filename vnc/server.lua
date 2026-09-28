@@ -417,6 +417,20 @@ function Server:_encode(client, rect)
     -- (a per-pixel pass over it, 6-7 ms for the full 600x800 screen), so the second client of a
     -- tick re-uses what the first one converted. The cache is dropped on every refresh and at the
     -- start of every tick, so a conversion can never outlive the pixels it was made from.
+    --
+    -- What a conversion produces is two very different things: `pixels`, an immutable copy of the
+    -- rectangle's bytes, and `values`, which is the *encoder's one* per-pixel array. The array is
+    -- overwritten by the encoder's next conversion - that is what makes it cheap, and it is also
+    -- why an entry that holds it (or that holds the rectangle's `values` at all, c.f.
+    -- `need_values`) may only be handed out while that conversion is still the encoder's latest:
+    -- `convert_serial` says which conversion `values` holds now, so an entry whose owner has
+    -- converted something else since is stale, and is re-converted. Otherwise a rectangle whose
+    -- geometry appears twice in one update (the refresh hook records the same region as a "nil"
+    -- and a "full" refresh, so a click's full-screen change arrives as the same tiles twice) would
+    -- be encoded from the *last* rectangle converted - the bottom-right tile - and the client
+    -- would paint that tile over the whole change. The sharing that is worth having - two clients
+    -- of one format asking about the same rectangle in one poll - is exactly the case in which
+    -- nothing has been converted since, so it still costs one conversion.
     local cache = self._conv_cache
     if cache then
         -- `need_values` is part of the key: a conversion made for a Raw client does not carry the
@@ -427,10 +441,13 @@ function Server:_encode(client, rect)
         local key = table.concat({ fmt_signature(fmt), rect.x, rect.y, rect.w, rect.h,
                                    need_values and 1 or 0 }, ":")
         local converted = cache[key]
-        if not converted then
+        local live = converted
+            and (converted.values == nil or converted.owner.convert_serial == converted.serial)
+        if not live then
             local pixels, count = enc:convert(Screen.bb, rect, need_values)
             converted = { pixels = pixels, count = count,
-                          values = need_values and enc.values or nil }
+                          values = need_values and enc.values or nil,
+                          owner = enc, serial = enc.convert_serial }
             cache[key] = converted
         end
         return enc:encode(Screen.bb, rect, converted)

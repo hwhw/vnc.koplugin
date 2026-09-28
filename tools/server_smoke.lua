@@ -1050,10 +1050,13 @@ end)
 -- ---------------------------------------------------------------- a client that asks incrementally
 
 --- The SetEncodings message announcing the one encoding these checks use: Raw, or ZRLE under
---- VNC_TEST_ZRLE=1 like the other socket checks.
-local function set_encodings_wire()
-    return string.char(2, 0, 0, 1) ..
-        string.char(0, 0, 0, os.getenv("VNC_TEST_ZRLE") == "1" and 16 or 0)
+--- VNC_TEST_ZRLE=1 like the other socket checks. `encoding` names a specific one for a check that
+--- has to pin an encoder (all four are single-byte encoding numbers).
+local function set_encodings_wire(encoding)
+    if encoding == nil then
+        encoding = os.getenv("VNC_TEST_ZRLE") == "1" and 16 or 0
+    end
+    return string.char(2, 0, 0, 1) .. string.char(0, 0, 0, encoding)
 end
 
 --- Connects a raw socket client, completes the handshake (No security) and announces
@@ -1081,22 +1084,31 @@ local function connect_client(server, port, encodings_wire, pump)
         -- read with a short socket timeout: at the session's 0.2 s the loop would spend most of its
         -- deadline asleep inside `receive`, so how many times it got to pump in five seconds (and
         -- so whether it got through a slower reader's messages) would depend on that timeout
-        -- rather than on the server.
+        -- rather than on the server. A timed-out read still hands back the bytes it did get (its
+        -- third value) and they are kept: a payload bigger than one receive's worth - a full-screen
+        -- Raw rectangle is megabytes - arrives over several of them, and dropping them would shift
+        -- every later read by the number of bytes lost.
         local timeout = cli:gettimeout()
         cli:settimeout(0.02)
         local deadline = socket.gettime() + 5
-        local polls, data, e = 0, nil, nil
+        local polls, parts, got, e = 0, {}, 0, nil
         while socket.gettime() < deadline do
-            data, e = cli:receive(n)
-            if data then break end
-            if e ~= "timeout" then break end
+            local data, err, partial = cli:receive(n - got)
+            data = data or partial
+            if data and #data > 0 then
+                parts[#parts + 1] = data
+                got = got + #data
+            end
+            e = err
+            if got >= n then break end
+            if err and err ~= "timeout" then break end
             step()
             polls = polls + 1
         end
         cli:settimeout(timeout)
-        assert_true(data ~= nil, string.format(
-            "short read of %d after %d poll(s) in 5 s: %s", n, polls, tostring(e)))
-        return data
+        assert_true(got == n, string.format(
+            "short read of %d after %d poll(s) in 5 s, got %d: %s", n, polls, got, tostring(e)))
+        return table.concat(parts)
     end
 
     assert_true(pump_and_read(12) == "RFB 003.008\n", "the server must announce 3.8")
@@ -1135,25 +1147,34 @@ local function connect_client(server, port, encodings_wire, pump)
                 h = r:byte(7) * 256 + r:byte(8),
                 enc = r:byte(9) * 16777216 + r:byte(10) * 65536 + r:byte(11) * 256 + r:byte(12),
             }
-            local payload
-            if rect.enc == 16 then
-                local len_field = pump_and_read(4)
-                local n = len_field:byte(1) * 16777216 + len_field:byte(2) * 65536
-                    + len_field:byte(3) * 256 + len_field:byte(4)
-                assert_true(n > 0, "a ZRLE rectangle must carry compressed data")
-                payload = len_field .. pump_and_read(n)
-            else
-                assert_true(rect.enc == 0, "unexpected rectangle encoding " .. rect.enc)
-                payload = pump_and_read(rect.w * rect.h * 4)
-            end
-            local decoded, derr = Encodings.decode{
-                encoding = rect.enc, r = Util.mem_reader(payload), plane = plane,
+            local ctx = {
+                encoding = rect.enc, plane = plane,
                 -- the decoders write at the origin of the viewport they are given, so it is the
                 -- rectangle itself (this is how the client's own protocol.lua drives them)
                 vp = plane:viewport(rect.x, rect.y, rect.w, rect.h),
                 x = rect.x, y = rect.y, w = rect.w, h = rect.h, streams = streams,
             }
-            assert_true(decoded, "decoding a rectangle failed: " .. tostring(derr))
+            local called, decoded, derr
+            if rect.enc == 16 then
+                local len_field = pump_and_read(4)
+                local n = len_field:byte(1) * 16777216 + len_field:byte(2) * 65536
+                    + len_field:byte(3) * 256 + len_field:byte(4)
+                assert_true(n > 0, "a ZRLE rectangle must carry compressed data")
+                ctx.r = Util.mem_reader(len_field .. pump_and_read(n))
+            elseif rect.enc == 0 then
+                ctx.r = Util.mem_reader(pump_and_read(rect.w * rect.h * 4))
+            elseif rect.enc == 2 or rect.enc == 5 then
+                -- RRE and Hextile carry no length field: their payload ends exactly where the
+                -- decoder has consumed the rectangle (its subrectangles, its tiles). So the
+                -- decoder reads the payload straight off the socket, through the same reader
+                -- interface the client's protocol hands it.
+                ctx.r = Util.reader{ read = pump_and_read }
+            else
+                assert_true(false, "unexpected rectangle encoding " .. rect.enc)
+            end
+            called, decoded, derr = pcall(Encodings.decode, ctx)
+            assert_true(called and decoded,
+                "decoding a rectangle failed: " .. tostring(called and derr or decoded))
             rects[i] = rect
         end
         return nrects, rects
@@ -1333,6 +1354,162 @@ check("server_keeps_a_change_a_client_did_not_ask_about", function()
 
     server:stop()
     if not ok then error(err, 0) end
+end)
+
+-- ---------------------------------------------------------------- a tiled change carries its own pixels
+
+--- Paints a black/white pattern of `cw` x `ch` cells over `(x0, y0, w, h)`.
+---
+--- Black and white survive every framebuffer the suite runs on (e-ink emulation included), so what
+--- the client assembles can be compared byte for byte with a blit of the screen. The cell sizes
+--- are picked so that they do not divide the encoders' 256 px rectangle limit: a 256 px rectangle
+--- never repeats its neighbour's phase, so a rectangle that arrived carrying another rectangle's
+--- pixels cannot look right by accident.
+local function paint_wire_pattern(bb, x0, y0, w, h, seed)
+    local cw = seed == 1 and 100 or (seed == 2 and 37 or 23)
+    local ch = seed == 1 and 100 or (seed == 2 and 53 or 29)
+    for y = 0, h - 1, ch do
+        for x = 0, w - 1, cw do
+            local color = ((math.floor(x / cw) + math.floor(y / ch)) % 2 == 0)
+                and BB.COLOR_WHITE or BB.COLOR_BLACK
+            bb:paintRect(x0 + x, y0 + y, math.min(cw, w - x), math.min(ch, h - y), color)
+        end
+    end
+end
+
+local function rect_list(rects)
+    local out = {}
+    for i, r in ipairs(rects) do
+        out[i] = string.format("%d,%d %dx%d e%d", r.x, r.y, r.w, r.h, r.enc)
+    end
+    return table.concat(out, " | ")
+end
+
+--- The wire-level check for the mosaic artefact, for one encoder.
+---
+--- A change larger than @{Server.ENCODE_RECT_LIMIT} reaches a tiled client as several rectangles
+--- (that tiling is what keeps a full-screen Hextile/ZRLE/RRE encode from holding the whole tick),
+--- and KOReader records the *same* region more than once for one interaction: a click's screen
+--- update is a "nil" and a "full" refresh of the same rectangle (c.f., the debug log's
+--- "recorded dirty region (mode nil): 0,0 600x800" followed by "(mode full): 0,0 600x800"), so
+--- one update can carry the same geometry several times. Every rectangle on the wire must still
+--- carry the pixels of its own region - which is what the encoders' per-pixel input has to make
+--- true - and the client's assembled framebuffer must equal the screen.
+local function wire_change_carries_its_own_pixels(encoding, name, first_port)
+    local Server = require("vnc/server")
+
+    local server, port
+    for candidate = first_port, first_port + 8 do
+        local s = Server.new{ settings = { ip = "127.0.0.1", port = candidate, password = "" } }
+        if s:start() then server, port = s, candidate break end
+    end
+    assert_true(server ~= nil, "could not bind a test port")
+
+    local ok, err = pcall(function()
+        local bb = Screen.bb
+        local sw, sh = bb:getWidth(), bb:getHeight()
+        assert_true(sw >= 300 and sh >= 200,
+            string.format("the screen face (%dx%d) must hold the check's change", sw, sh))
+        paint_wire_pattern(bb, 0, 0, sw, sh, 1)
+
+        local client = connect_client(server, port, set_encodings_wire(encoding))
+        local cli = client.sock
+        local plane = BB.new(sw, sh, BB.TYPE_BBRGB24)       -- what the client has assembled
+        local reference = BB.new(sw, sh, BB.TYPE_BBRGB24)   -- what the screen holds
+
+        -- The client's first frame: a non-incremental request is answered with the whole screen.
+        cli:send(client.request(false, 0, 0, sw, sh))
+        local nrects, rects = client.read_update(plane)
+        assert_true(nrects >= 1, "the first update must carry the screen")
+        reference:blitFrom(bb, 0, 0, 0, 0, sw, sh)
+        local same, why = pixels_equal(plane, reference, sw, sh)
+        assert_true(same, "the first frame must match the screen: " .. tostring(why))
+        print(string.format("   [wire %s] first frame: %d rectangle(s) (%s)",
+            name, nrects, rect_list(rects)))
+
+        -- A change wider than Server.ENCODE_RECT_LIMIT, then the whole screen; each recorded
+        -- twice, the first with an explicit region and the second as the full-screen "nil"/"full"
+        -- pair the refresh hook records.
+        local changes = {
+            { what = "300x200", rect = { x = 0, y = 0, w = 300, h = 200 }, seed = 2 },
+            { what = string.format("%dx%d (the whole screen)", sw, sh), rect = nil, seed = 3 },
+        }
+        for _, change in ipairs(changes) do
+            local r = change.rect
+            paint_wire_pattern(bb, r and r.x or 0, r and r.y or 0, r and r.w or sw, r and r.h or sh,
+                change.seed)
+            server:_record_dirty("nil", r)
+            server:_record_dirty("full", r)
+
+            cli:send(client.request(true, 0, 0, sw, sh))
+            local got, got_rects = client.read_update(plane)
+            reference:blitFrom(bb, 0, 0, 0, 0, sw, sh)
+            local equal, detail = pixels_equal(plane, reference, sw, sh)
+            print(string.format("   [wire %s] %s change: %d rectangle(s): %s -> %s",
+                name, change.what, got, rect_list(got_rects),
+                equal and "the frame matches the screen" or "THE FRAME DIFFERS"))
+            assert_true(equal, string.format(
+                "%s: a %s change must arrive with the pixels of each rectangle's own region,"
+                .. " but the frame the client assembled differs: %s", name, change.what,
+                tostring(detail)))
+            for i, got_rect in ipairs(got_rects) do
+                assert_true(got_rect.enc == encoding,
+                    string.format("%s: rectangle %d of %d came as encoding %d, not %d",
+                        name, i, #got_rects, got_rect.enc, encoding))
+            end
+        end
+
+        cli:close()
+        plane:free()
+        reference:free()
+    end)
+    server:stop()
+    if not ok then error(err, 0) end
+end
+
+--- The conversion cache hands the *immutable* part of a conversion to the next client of the same
+--- pixel format, never the encoder's per-pixel `values` array: that array is one mutable buffer,
+--- so a cache entry that kept a reference to it would hand the second client whatever rectangle
+--- was converted last. This is the same bug as the wire checks above through the other door
+--- (a second client, rather than the same geometry twice).
+check("a_cached_conversion_carries_no_other_rectangles_pixels", function()
+    local Server = require("vnc/server")
+
+    local server = Server.new{ settings = { ip = "127.0.0.1", port = 5899, password = "" } }
+    local bb = Screen.bb
+    local sw = bb:getWidth()
+    paint_wire_pattern(bb, 0, 0, sw, bb:getHeight(), 2)
+
+    local first = { pixel_format = CLIENT_FORMAT, encodings = { ServerEnc.ZRLE } }
+    local second = { pixel_format = CLIENT_FORMAT, encodings = { ServerEnc.ZRLE } }
+    local rect_a = { x = 0, y = 0, w = 256, h = 256 }
+    local rect_b = { x = 256, y = 0, w = 256, h = 256 }
+
+    -- Both clients ask for `rect_a`; the first one's tick also converts `rect_b` in between.
+    local _, payload_a1 = server:_encode(first, rect_a)
+    local _, payload_b1 = server:_encode(first, rect_b)
+    local _, payload_a2 = server:_encode(second, rect_a)
+    assert_true(payload_a1 ~= payload_b1,
+        "the check needs the two rectangles to differ (the pattern must cover the whole screen)")
+    assert_true(payload_a2 == payload_a1,
+        "the second client's rectangle must be encoded from that rectangle's pixels, not from"
+        .. " another rectangle's conversion")
+end)
+
+check("wire_zrle_change_carries_its_own_pixels", function()
+    wire_change_carries_its_own_pixels(ServerEnc.ZRLE, "ZRLE", 5851)
+end)
+
+check("wire_hextile_change_carries_its_own_pixels", function()
+    wire_change_carries_its_own_pixels(ServerEnc.HEXTILE, "Hextile", 5841)
+end)
+
+check("wire_rre_change_carries_its_own_pixels", function()
+    wire_change_carries_its_own_pixels(ServerEnc.RRE, "RRE", 5831)
+end)
+
+check("wire_raw_change_carries_its_own_pixels", function()
+    wire_change_carries_its_own_pixels(ServerEnc.RAW, "Raw", 5821)
 end)
 
 -- ---------------------------------------------------------------- what one poll must read

@@ -77,6 +77,7 @@ function Enc.new()
         values = nil,
         pixel_buf = ffi.new("uint8_t[8]"),
         zstream = nil,
+        convert_serial = 0,          -- which conversion `values`/`out` currently hold
         values_size = 0,             -- pixels the buffer holds (0 = nothing allocated yet)
         out_len = 0,                 -- bytes the packed-pixel buffer holds
         cpixel_bytes = nil,          -- which of the 4 bytes of a 32bpp pixel carry the channels
@@ -254,6 +255,12 @@ encoding that does not need it never reads it, and the array is not even allocat
 --- @treturn string pixels, number count
 function Enc:convert(source, rect, need_values)
     if need_values == nil then need_values = true end
+    -- Bumped for every conversion, and it identifies which rectangle `values` holds from now on.
+    -- `out`/`values` are this one encoder's reusable buffers, so a conversion another caller stored
+    -- away is only still *this* rectangle's pixels while the encoder has not converted anything
+    -- since (c.f., @{Server:_encode}, which shares a conversion between clients of one pixel
+    -- format only under exactly that condition).
+    self.convert_serial = self.convert_serial + 1
     local w, h = rect.w, rect.h
     local bpp = ensure_buffers(self, w, h, need_values)
     local fmt = self.fmt
