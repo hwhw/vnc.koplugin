@@ -128,6 +128,34 @@ that leaves as several small writes is not delayed by Nagle's algorithm.
 What a client sees is KOReader's logical screen: the e-ink panel's own flash/ghosting is not
 reproduced, and the on-screen keyboard, dialogs and rotations are simply part of the picture.
 
+## Power consumption
+
+The two halves behave very differently.
+
+**The viewer** costs nothing while it is not connected: with no session open there is no timer, no
+socket and no work of any kind. While a session is up, expect the usual power use of a network
+connection and — mostly — of screen updates, because every frame has to be received, decoded and
+drawn. A picture that does not change costs very little; a moving one costs what the update rate
+implies.
+
+**The server**:
+
+- **Installed but not started**: no runtime overhead worth mentioning — nothing is scheduled, and
+  nothing listens.
+- **Started, nobody connected**: a small, steady overhead. The server keeps a lightweight check
+  running about a hundred times a second so it can notice a connection as soon as one arrives — the
+  network does not wake it up by itself. It is a constant, low-level cost, and you can expect it to
+  show only as slightly shorter runtime on a battery-powered device.
+- **A client connected**: a little more, because that is when the per-connection work and the
+  network traffic happen. With a still screen even that stays very small — about one tiny
+  keep-alive-sized packet a second, and no frame work at all until something on the screen actually
+  changes.
+
+One caveat matters more than the above on an e-reader: the server does not manage Wi-Fi itself — it
+neither turns it on nor keeps it on — so a device that goes to sleep drops the connection. And
+while Wi-Fi is up it is usually the **larger** part of the power bill, bigger than the server's own
+periodic check.
+
 ## Settings
 
 Connection profiles live in a plain Lua file inside KOReader's settings directory,
