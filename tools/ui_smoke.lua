@@ -40,6 +40,7 @@ local Device = require("device")
 require("document/canvascontext"):init(Device)
 local Screen = Device.screen
 local Geom = require("ui/geometry")
+local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 
 package.path = plugin_dir .. "/?.lua;" .. package.path
@@ -126,6 +127,12 @@ local function slurp(path)
     local content = f:read("*a")
     f:close()
     return content
+end
+
+--- Delivers a gesture the way `Device.input` does: through the real widget stack, so whatever is
+--- on top gets the first chance to consume it.
+local function dispatch_gesture(ges)
+    UIManager:sendEvent(Event:new("Gesture", ges))
 end
 
 -- ---------------------------------------------------------------- a plugin with two profiles
@@ -843,6 +850,113 @@ check("menu_opens_on_swipe_only", function()
     assert_true(#sent.pointer == 3, "a tap below the zone must click the remote")
     assert_true(app.menu == nil, "and must not open the menu")
 
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keyboard_shows_on_a_swipe_up_from_the_bottom", function()
+    local app, remote, sent = new_app()
+    -- the same quick upward swipe the menu uses at the top, started in the canvas' bottom strip
+    local function bottom()
+        local canvas = app:canvas_geom()
+        return Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = canvas.y + canvas.h - 2 }
+    end
+    local function middle()
+        local canvas = app:canvas_geom()
+        return Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = math.floor(canvas.y + canvas.h / 2) }
+    end
+
+    dispatch_gesture{ ges = "swipe", direction = "north", pos = bottom() }
+    assert_true(app.vk_visible, "a swipe up from the bottom edge must show the keyboard")
+    assert_true(app:is_keyboard_wanted(), "and it must be remembered as the user's wish")
+
+    app:set_keyboard_visible(false)
+    assert_true(not app.vk_visible, "the keyboard must hide again for the next case")
+
+    -- the same swipe higher up is an ordinary canvas gesture: the strip is not the whole screen
+    dispatch_gesture{ ges = "swipe", direction = "north", pos = middle() }
+    assert_true(not app.vk_visible, "a swipe up away from the bottom strip must not show the keyboard")
+
+    -- and only an upward swipe is the keyboard gesture
+    dispatch_gesture{ ges = "swipe", direction = "south", pos = bottom() }
+    assert_true(not app.vk_visible, "a swipe down in the bottom strip must not show the keyboard")
+    dispatch_gesture{ ges = "swipe", direction = "east", pos = bottom() }
+    assert_true(not app.vk_visible, "nor must a horizontal one")
+
+    -- the strip stays a live part of the canvas: a tap there is still a click on the remote
+    sent.pointer = {}
+    dispatch_gesture{ ges = "tap", pos = bottom() }
+    assert_true(#sent.pointer == 3,
+        "a tap in the bottom strip must click the remote, got " .. #sent.pointer .. " pointer events")
+    assert_true(not app.vk_visible, "and must not show the keyboard")
+
+    -- the strip follows a rotation (it is recomputed from the canvas, not cached)
+    local mode = Screen:getRotationMode()
+    app:set_rotation_mode((mode + 1) % 4)
+    dispatch_gesture{ ges = "swipe", direction = "north", pos = bottom() }
+    assert_true(app.vk_visible, "the gesture must still work after a rotation")
+
+    -- ...and a keyboard height change, which reflows the canvas under the strip
+    app:on_keyboard_height_changed()
+    app:set_keyboard_visible(false)
+    dispatch_gesture{ ges = "swipe", direction = "north", pos = bottom() }
+    assert_true(app.vk_visible, "and after the keyboard height changed")
+
+    app:set_rotation_mode(mode)
+    app:set_keyboard_visible(false)
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keyboard_swipe_honours_the_always_visible_setting", function()
+    local app, remote = new_app()
+    app.settings.keyboard_always_visible = true
+    app:set_keyboard_visible(true)
+    assert_true(app.vk_visible, "with the setting on the keyboard is up")
+
+    -- the showing swipe cannot make it "more visible", and must not touch the setting
+    local canvas = app:canvas_geom()
+    dispatch_gesture{ ges = "swipe", direction = "north",
+        pos = Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = canvas.y + canvas.h - 2 } }
+    assert_true(app.vk_visible and app:is_keyboard_wanted(),
+        "a swipe up must leave the always-visible keyboard up")
+    assert_true(app.settings.keyboard_always_visible, "and must not change the setting")
+
+    -- and the hiding swipe must lose against it
+    canvas = app:canvas_geom()
+    dispatch_gesture{ ges = "swipe", direction = "south",
+        pos = Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = math.floor(canvas.y + canvas.h / 2) } }
+    assert_true(app.vk_visible, "the setting wins over a swipe that would hide the keyboard")
+    assert_true(app.settings.keyboard_always_visible, "and it stays on")
+
+    -- the menu's toggle is what turns it off, exactly as before
+    app:toggle_keyboard()
+    assert_true(not app.settings.keyboard_always_visible and not app.vk_visible,
+        "toggling from the menu must still turn it off")
+
+    app:onCloseWidget()
+    remote:free()
+end)
+
+check("keyboard_hides_on_a_swipe_down_above_it", function()
+    local app, remote = new_app()
+    app:set_keyboard_visible(true)
+    assert_true(app.vk_visible, "the keyboard must be up")
+
+    -- the canvas above the keyboard is the space a hiding swipe can start in
+    local canvas = app:canvas_geom()
+    dispatch_gesture{ ges = "swipe", direction = "south",
+        pos = Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = math.floor(canvas.y + canvas.h / 2) } }
+    assert_true(not app.vk_visible, "a swipe down above the keyboard must hide it")
+    assert_true(not app:is_keyboard_wanted(), "and the wish must follow it")
+
+    app:set_keyboard_visible(true)
+    canvas = app:canvas_geom()
+    dispatch_gesture{ ges = "swipe", direction = "north",
+        pos = Geom:new{ x = math.floor(canvas.x + canvas.w / 2), y = math.floor(canvas.y + canvas.h / 2) } }
+    assert_true(app.vk_visible, "only a downward swipe hides the keyboard")
+
+    app:set_keyboard_visible(false)
     app:onCloseWidget()
     remote:free()
 end)
