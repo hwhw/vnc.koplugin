@@ -41,15 +41,41 @@ function VNC:init()
     self.settings = Settings.open(self.settings_file)
 
     -- The VNC server (serving KOReader's own screen). It is off until the user starts it from
-    -- the Network menu; nothing here listens on its own.
+    -- the Network menu or the autostart below asks for it; nothing here listens on its own.
+    -- `server_for_run()` is the stored settings with the environment overrides merged in for this
+    -- run (the overrides never reach the settings file).
     self.server = Server.new{
-        settings = self.settings:server(),
+        settings = self.settings:server_for_run(),
         name = "KOReader" .. (Device.model and (" on " .. Device.model) or ""),
     }
 
     -- File manager only (we have nothing to show inside a document).
     if self.ui and self.ui.menu and not self.ui.document then
         self.ui.menu:registerToMainMenu(self)
+    end
+
+    -- Not started here: at init() the screen and input may not be ready, and starting the server
+    -- hooks UIManager. Defer it to the next UI loop turn, once.
+    self:schedule_autostart()
+end
+
+--- Schedules the boot start when the settings (or the environment) ask for it.
+---
+--- Runs once per KOReader start and never re-arms, so a manual stop afterwards stays a stop until
+--- the next start. The deferral is what lets main.lua's init() stay free of screen/input work.
+function VNC:schedule_autostart()
+    if not self.settings:should_autostart() then return end
+    UIManager:nextTick(function() self:start_server_at_boot() end)
+end
+
+--- Starts the server for the boot start. A failure is logged and left in the server's own state
+--- (`last_error`), which is what the Network menu's status line shows; boot pops no dialog.
+function VNC:start_server_at_boot()
+    local server = self.server
+    if not server or server:is_running() then return end
+    local ok, err = server:start()
+    if not ok then
+        logger.warn("vnc: could not start the VNC server at boot:", tostring(err))
     end
 end
 

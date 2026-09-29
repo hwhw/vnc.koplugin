@@ -119,6 +119,19 @@ function ServerMenu.register(plugin, menu_items)
                 separator = true,
             },
             {
+                text = _("Start with KOReader"),
+                keep_menu_open = true,
+                checked_func = function()
+                    return server_settings().autostart == true
+                end,
+                callback = function(touchmenu_instance)
+                    local settings = server_settings()
+                    settings.autostart = not (settings.autostart == true)
+                    plugin.settings:flush()
+                    touchmenu_instance:updateItems()
+                end,
+            },
+            {
                 text_func = function()
                     return T(_("IP address: %1"), server_settings().ip)
                 end,
