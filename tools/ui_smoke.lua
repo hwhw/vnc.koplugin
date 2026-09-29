@@ -802,9 +802,30 @@ check("server_autostart_starts_once_the_tick_runs", function()
         plugin.server:stop()
         UIManager:_checkTasks()
         assert_true(not plugin.server:is_running(), "and it stops again")
+
+        -- a boot start that cannot bind is warned about and left in the server's state
+        local holder = assert(socket.bind("127.0.0.1", 0))
+        server_settings.port = select(2, holder:getsockname())
+        server_settings.autostart = true
+        plugin.settings.env = {}
+        local logger = require("logger")
+        local real_warn, warned = logger.warn, 0
+        logger.warn = function() warned = warned + 1 end
+        local started, start_err = pcall(function()
+            plugin:schedule_autostart()
+            UIManager:_checkTasks()
+        end)
+        logger.warn = real_warn
+        holder:close()
+        if not started then error(start_err) end
+        assert_true(not plugin.server:is_running(), "a start that cannot bind must not report running")
+        assert_true(plugin.server.last_error ~= nil,
+            "the failure must be visible in the server state (the menu's status line)")
+        assert_true(warned >= 1, "a failed boot start must be logged as a warning")
     end)
 
     if plugin.server:is_running() then plugin.server:stop() end
+    plugin.server.last_error = nil
     server_settings.ip, server_settings.port = saved.ip, saved.port
     server_settings.password, server_settings.autostart = saved.password, saved.autostart
     plugin.settings.env = saved.env
