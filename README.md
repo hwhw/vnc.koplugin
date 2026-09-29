@@ -82,15 +82,30 @@ Wi-Fi if the plugin turned it on.
 The plugin can also serve the other way round: KOReader's own screen as a VNC desktop, so a
 computer elsewhere can watch what your reader is showing and drive it with its mouse and keyboard.
 
-It is **off by default and never starts on its own**. Turn it on in KOReader's *Network* menu:
-**VNC server** — the entry is checked while it runs and opens a submenu with
+It is **off by default**. Turn it on in KOReader's *Network* menu: **VNC server** — the entry is
+checked while it runs and opens a submenu with
 
 - **Start/Stop VNC server**,
 - a status line (the address it listens on, and how many clients are connected),
+- **Start with KOReader** — off by default; when on, the server starts by itself when KOReader
+  starts (a manual stop still stops it, and it stays stopped until the next start),
 - **IP address** — `0.0.0.0` (the default) serves every interface, `127.0.0.1` only this device,
 - **Port** — 5900 by default,
 - **Password** — clients must then authenticate (VNC Authentication); leave it empty and anybody
   who can reach the port gets in.
+
+For scripted or headless setups a few environment variables override the server settings. They
+apply to that run only and are **never written to the settings file** (the menu always shows and
+edits the stored values):
+
+| Variable | Effect |
+| --- | --- |
+| `VNC_KOPLUGIN_ENABLE_SERVER` | Start at boot. Any non-empty value except `0`, `no`, `false` (trimmed, case-insensitive) starts the server; empty or unset means "use the stored setting". |
+| `VNC_KOPLUGIN_SERVER_HOST` | Bind address for this run; empty or unset leaves the stored one. |
+| `VNC_KOPLUGIN_SERVER_PORT` | Port for this run (an integer 1–65535); anything else is ignored with a warning. |
+| `VNC_KOPLUGIN_SERVER_PASSWORD` | Password for this run; set it empty for "no password". |
+
+Setting the password by environment keeps it out of `settings/vnc.lua`.
 
 On Kindles the plugin opens the port in the device's firewall while it runs (the same thing
 KOReader's own HTTP inspector does) and closes it again when you stop the server.
@@ -174,6 +189,7 @@ return {
         ["ip"] = "0.0.0.0",
         ["port"] = 5900,
         ["password"] = "",                 -- empty = no authentication at all
+        ["autostart"] = false,             -- start the server with KOReader
     },
 }
 ```

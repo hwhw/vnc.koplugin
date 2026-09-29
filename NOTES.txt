@@ -41,7 +41,8 @@ vnc/app.lua         The full-screen viewer widget: canvas, gestures, on-screen k
 vnc/menu.lua        The in-app menu.
 vnc/dialogs.lua     Connection list, per-connection actions, profile editor.
 vnc/keyboard.lua    KOReader's VirtualKeyboard wired to RFB key events via a stub inputbox.
-vnc/settings.lua    LuaSettings wrapper: profiles + global settings + the server section.
+vnc/settings.lua    LuaSettings wrapper: profiles + global settings + the server section,
+                          including the environment overrides (read once, never persisted).
 
 The server half (the plugin can also serve KOReader's own screen):
 vnc/rfbserver.lua   RFB 3.8 *server* state machine, transport agnostic. The mirror of
@@ -235,9 +236,27 @@ fault - it was a syscall per field and a poll interval per message. And a test m
 the server being slow: an incremental request with nothing changed is answered at once, so a check
 that "worked" only because the answer took 50 ms is a bug.
 
-The server is off by default; it is started from the Network menu, and the menu carries the only
-UI it has. Its Kindle firewall hole follows httpinspector.koplugin (there is no sshd plugin in this
-KOReader to follow).
+The server is off by default; it is started from the Network menu (or at boot by the menu's "Start
+with KOReader"), and the menu carries the only UI it has. The boot start is *deferred* to the next
+UI loop turn (`UIManager:nextTick`, scheduled from main.lua's init): at init() the screen and input
+may not be ready, and starting the server hooks UIManager. It is also scheduled exactly once, so
+nothing re-arms it and a manual stop stays a stop until the next KOReader start. A failed boot start
+is logged (warn) and left in the server's `last_error`, which the menu's status line shows; boot
+pops no dialog.
+
+The environment overrides (`VNC_KOPLUGIN_ENABLE_SERVER`, `_SERVER_HOST`, `_SERVER_PORT`,
+`_SERVER_PASSWORD`) are parsed once at load in `vnc/settings.lua:read_env`, behind a lookup seam
+(a function, `os.getenv` by default) so they are testable without touching the real environment.
+They take precedence over the stored server settings for the run but live outside `data.server`:
+the running server is built from `Settings:server_for_run()` - the stored table merged with the
+overrides (and the stored table itself when there are none) - while `data.server`, which the menu
+edits and `flush()` writes, never sees them, so the file stays byte-identical across an exit-time
+flush. `VNC_KOPLUGIN_ENABLE_SERVER` decides the boot start in place of the stored `autostart`: empty
+is no opinion, the trimmed words `0`/`no`/`false` mean do not start, anything else means start. An
+empty `VNC_KOPLUGIN_SERVER_PASSWORD` is a meaningful "no password", so it is kept.
+
+Its Kindle firewall hole follows httpinspector.koplugin (there is no sshd plugin in this KOReader to
+follow).
 
 KOReader internals relied on (could change under us): UIManager._window_stack (for "is a popup
 above us"), UIManager:scheduleIn/unschedule/nextTick/setDirty, VirtualKeyboard's inputbox protocol
@@ -285,11 +304,15 @@ canvas follows rotations, the keyboard neither rescales nor moves a view that do
 it, the fitted zoom modes and the keyboard-aware placement behave, the keyboard yields to popups,
 platform text input is enabled exactly while the viewer is shown, typed text and physical keys
 reach the remote (through KOReader's own SDL event handler), and the settings store survives a
-hand-edited or empty file. The viewer checks at the end model the *panel* as well: an e-ink panel
-is a medium that only changes where a refresh asked it to, so a screen buffer that was painted but
-never refreshed is caught as stale pixels (that is the check the missing `"full"`/`"flashui"` on
-show/close and the missing flash on a wholesale change used to fail, with 60 % of the screen left
-over in the close case). `KO_HOME` is needed because KOReader's widget cache lives under it.
+hand-edited or empty file. It also covers the server menu's autostart toggle, the environment
+overrides' parsing rules and precedence (through read_env's lookup seam), that a flush after them
+leaves the settings file byte-identical, and that the deferred tick starts the server exactly once
+when the setting (or the environment) asks for it. The viewer checks at the end model the *panel*
+as well: an e-ink panel is a medium that only changes where a refresh asked it to, so a screen
+buffer that was painted but never refreshed is caught as stale pixels (that is the check the
+missing `"full"`/`"flashui"` on show/close and the missing flash on a wholesale change used to
+fail, with 60 % of the screen left over in the close case). `KO_HOME` is needed because KOReader's
+widget cache lives under it.
 
 Server half (headless):
 
