@@ -265,6 +265,315 @@ check("failed_connect_returns_to_list", function()
     assert_true(count(is_list) == 1, "no stacked lists: " .. stack_desc())
 end)
 
+-- ---------------------------------------------------------------- auto connect on start
+
+check("autoconnect_flag_round_trips", function()
+    local Settings = require("vnc/settings")
+    local path = data_dir .. "/ui_smoke_autoconnect_roundtrip.lua"
+    os.remove(path)
+    os.remove(path .. ".old")
+
+    -- off by default
+    local s = Settings.open(path)
+    s:save_profile{ name = "a", host = "h1", port = 5900 }
+    s:save_profile{ name = "b", host = "h2", port = 5901 }
+    assert_true(s:get_profile("a").autoconnect == false, "a profile defaults to no autoconnect")
+    assert_true(s:autoconnect_profile() == nil, "and nothing is flagged")
+
+    -- set it on one profile and write the file
+    s:save_profile({ name = "a", host = "h1", port = 5900, autoconnect = true }, "a")
+    s:flush()
+    assert_true(s:autoconnect_profile().name == "a", "the store reports the flagged profile")
+    local on_disk = dofile(path)
+    assert_true(on_disk.profiles[1].autoconnect == true, "the flag is written to the settings file")
+    assert_true(on_disk.profiles[2].autoconnect == false, "the other profile is written without it")
+end)
+
+check("autoconnect_flag_is_kept_by_an_edit_and_cleared_by_another", function()
+    -- on the shared store, so the UI checks below can rely on its profiles
+    store:set_autoconnect(nil)
+    store:save_profile({ name = "good", host = "127.0.0.1", port = 5900, autoconnect = true }, "good")
+    assert_true(store:get_profile("good").autoconnect == true, "good is flagged")
+
+    -- an editor that does not know the field must not clear it
+    store:save_profile({ name = "good", host = "127.0.0.1", port = 5900 }, "good")
+    assert_true(store:get_profile("good").autoconnect == true,
+        "an edit that does not mention autoconnect must keep the flag")
+
+    -- flagging another profile clears the first (only one may carry it)
+    store:save_profile({ name = "dead", host = "127.0.0.1", port = 1, autoconnect = true }, "dead")
+    assert_true(store:get_profile("dead").autoconnect == true, "the new profile is flagged")
+    assert_true(store:get_profile("good").autoconnect == false, "and the old one is cleared")
+
+    -- and the file agrees
+    store:flush()
+    local on_disk = dofile(store.ls.file)
+    for _, p in ipairs(on_disk.profiles) do
+        if p.name == "dead" then assert_true(p.autoconnect == true, "dead is flagged on disk") end
+        if p.name == "good" then assert_true(p.autoconnect == false, "good is clear on disk") end
+    end
+
+    store:set_autoconnect(nil)
+    store:flush()
+end)
+
+check("settings_normalise_keeps_a_single_autoconnect", function()
+    -- A hand-edited file may flag several profiles; loading must normalise it down to one.
+    local Settings = require("vnc/settings")
+    local writeToFile = require("util").writeToFile
+    local path = data_dir .. "/ui_smoke_autoconnect_normalise.lua"
+    os.remove(path)
+    os.remove(path .. ".old")
+    writeToFile([==[
+{
+    ["profiles"] = {
+        { ["name"] = "first", ["host"] = "h1", ["port"] = 5900, ["autoconnect"] = true },
+        { ["name"] = "second", ["host"] = "h2", ["port"] = 5901, ["autoconnect"] = true },
+        { ["name"] = "third", ["host"] = "h3", ["port"] = 5902, ["autoconnect"] = "yes" },
+    },
+}
+]==], path, true, true)
+
+    local s = Settings.open(path)
+    assert_true(s.data.profiles[1].autoconnect == true, "the first flagged profile keeps the flag")
+    assert_true(s.data.profiles[2].autoconnect == false, "a second one is cleared on load")
+    assert_true(s.data.profiles[3].autoconnect == false, "a hand-written non-boolean is not a flag")
+    assert_true(s:autoconnect_profile().name == "first", "exactly one profile is flagged")
+
+    s:set_autoconnect("second")
+    assert_true(s:autoconnect_profile().name == "second", "setting one moves the flag")
+    assert_true(s.data.profiles[1].autoconnect == false, "clearing the previous one")
+    s:flush()
+    local on_disk = dofile(path)
+    assert_true(on_disk.profiles[2].autoconnect == true and on_disk.profiles[1].autoconnect == false,
+        "and the single flag is what gets written")
+end)
+
+check("actions_toggle_autoconnect_and_list_marks_it", function()
+    store:set_autoconnect(nil)
+    plugin:show_connection_list()
+    local function open_actions()
+        find_item(find_item(plugin.connection_list.item_table, "Manage connections…").sub_item_table,
+            "good").callback()
+    end
+    local function listed(name)
+        for _, item in ipairs(plugin.connection_list.item_table) do
+            if item.text == name or item.text == name .. " (auto connect)" then return item.text end
+        end
+    end
+
+    assert_true(listed("good") == "good", "an unflagged profile is listed by its name")
+    open_actions()
+    expect_top(is_actions, "the actions dialog")
+    find_button(top(), "Auto connect on start: off").callback()
+    assert_true(store:get_profile("good").autoconnect == true, "the toggle must flag the profile")
+    expect_top(is_actions, "the actions dialog reopened after the toggle")
+    find_button(top(), "Auto connect on start: on")   -- its label must reflect the new state
+    find_button(top(), "Back").callback()
+    expect_top(is_list, "the list after the toggle")
+    assert_true(listed("good") == "good (auto connect)",
+        "the list must mark the flagged profile, got " .. tostring(listed("good")))
+    assert_true(listed("dead") == "dead", "and leave an unflagged one alone")
+
+    -- toggling off clears it and the marker
+    open_actions()
+    find_button(top(), "Auto connect on start: on").callback()
+    assert_true(store:get_profile("good").autoconnect == false, "toggling off must clear it")
+    find_button(top(), "Back").callback()
+    assert_true(listed("good") == "good", "the marker must be gone, got " .. tostring(listed("good")))
+    plugin:close_connection_list()
+    UIManager._window_stack = {}
+end)
+
+check("boot_autoconnect_connects_only_the_flagged_profile", function()
+    -- The network is stubbed (this is the boot *decision*, not a dial-out).
+    store:set_autoconnect(nil)
+    local real_connect = plugin.connect_profile
+    local calls = {}
+    plugin.connect_profile = function(_, name) calls[#calls + 1] = name end
+    local ok, err = pcall(function()
+        -- nothing flagged: the deferred tick must connect to nothing
+        plugin:schedule_autoconnect()
+        UIManager:_checkTasks()
+        assert_true(#calls == 0, "with nothing flagged the boot must not connect")
+
+        -- flagged: one attempt, for that profile, deferred to the tick
+        store:set_autoconnect("good")
+        plugin:schedule_autoconnect()
+        assert_true(#calls == 0, "the connect must be deferred, not immediate")
+        UIManager:_checkTasks()
+        assert_true(#calls == 1 and calls[1] == "good",
+            "the tick must connect the flagged profile once, got: " .. table.concat(calls, ","))
+
+        -- and it does not re-arm
+        UIManager:_checkTasks()
+        assert_true(#calls == 1, "a second tick must not connect again")
+    end)
+    plugin.connect_profile = real_connect
+    store:set_autoconnect(nil)
+    store:flush()
+    if not ok then error(err, 0) end
+end)
+
+check("boot_autoconnect_failure_is_reported_like_a_manual_one", function()
+    -- "dead" points at a closed port, so the attempt fails deterministically (and locally).
+    plugin.sessions = {}
+    plugin.app = nil
+    store:set_autoconnect("dead")
+    local ok, err = pcall(function()
+        plugin:schedule_autoconnect()
+        UIManager:_checkTasks()
+    end)
+    store:set_autoconnect(nil)
+    store:flush()
+    assert_true(ok, "a failed boot connect must not raise: " .. tostring(err))
+    local message
+    for _, w in ipairs(stack()) do
+        if type(w.text) == "string" and w.text:find("Could not connect to dead", 1, true) then
+            message = w.text
+        end
+    end
+    assert_true(message ~= nil, "the boot failure must be reported: " .. stack_desc())
+    assert_true(plugin.app == nil, "no viewer may be opened on a failed boot connect")
+    assert_true(plugin.sessions["dead"] == nil, "a session that never connected must be dropped")
+    UIManager:close(top())
+    UIManager._window_stack = {}
+end)
+
+check("start_with_entry_lands_in_the_submenu_only_while_flagged", function()
+    -- The extension point is `sorting_hint = "start_with"`: KOReader's own MenuSorter nests such an
+    -- item into the "Start with" submenu (whose id comes from ui/elements/filemanager_menu_order).
+    local FileManagerMenu = require("apps/filemanager/filemanagermenu")
+    local MenuSorter = require("ui/menusorter")
+    local order = require("ui/elements/filemanager_menu_order")
+
+    local function built_menu()
+        local menu_items = {
+            ["KOMenu:menu_buttons"] = {},
+            filemanager_settings = { icon = "appbar.filebrowser" },
+            setting = { icon = "appbar.settings" },
+            tools = { icon = "appbar.tools" },
+            search = { icon = "appbar.search" },
+            main = { icon = "appbar.menu" },
+            start_with = FileManagerMenu.getStartWithMenuTable({}),
+        }
+        plugin:addToMainMenu(menu_items)
+        -- this scoped probe only has ids for the file-manager menus; drop the plugin's other items
+        menu_items.vnc = nil
+        menu_items.vnc_server = nil
+        return menu_items, MenuSorter:mergeAndSort("filemanager", menu_items, order)
+    end
+    local function find_start_with(tbl)
+        for _, it in pairs(tbl) do
+            if type(it) == "table" then
+                if it.id == "start_with" then return it end
+                -- merged tabs are plain arrays of their items; items may nest via sub_item_table
+                local found = find_start_with(it.sub_item_table or it)
+                if found then return found end
+            end
+        end
+    end
+    local function texts(item)
+        local items = item.sub_item_table_func and item.sub_item_table_func() or item.sub_item_table
+        local out = {}
+        for _, i in ipairs(items) do out[#out + 1] = i.text or (i.text_func and i.text_func()) end
+        return out, items
+    end
+    local function index_of(list, text)
+        for i, t in ipairs(list) do if t == text then return i end end
+    end
+
+    -- nothing flagged: KOReader's own five entries, and no VNC one
+    store:set_autoconnect(nil)
+    G_reader_settings:saveSetting("start_with", "filemanager")
+    local _mi, built = built_menu()
+    local sw = find_start_with(built)
+    assert_true(sw ~= nil, "the core Start with submenu must still be there")
+    local names = texts(sw)
+    assert_true(#names == 5, "the core offers its five entries, got: " .. table.concat(names, ", "))
+    assert_true(index_of(names, "VNC auto connect") == nil,
+        "with nothing flagged the entry must be absent, got: " .. table.concat(names, ", "))
+
+    -- flagged: the sorter nests the item at the end of the submenu, and it is offered
+    store:set_autoconnect("good")
+    local _mi2, built2 = built_menu()
+    sw = find_start_with(built2)
+    local sorted = sw.sub_item_table
+    assert_true(sorted[#sorted].text == "VNC auto connect",
+        "MenuSorter must nest the entry inside the submenu (last), got: "
+        .. tostring(sorted[#sorted].text))
+    local entry = sorted[#sorted]
+    assert_true(entry.sorting_hint == "start_with", "it carries the documented sorting hint")
+    names = texts(sw)
+    assert_true(index_of(names, "VNC auto connect") == #names,
+        "and it is offered last: " .. table.concat(names, ", "))
+
+    -- the tick/callback: on records the choice, off clears the flag and the choice together
+    assert_true(entry.checked_func() == false, "unticked while the stored setting is not ours")
+    entry.callback()
+    assert_true(G_reader_settings:readSetting("start_with") == plugin.START_WITH,
+        "toggling on must store the plugin's value")
+    assert_true(store:autoconnect_profile() ~= nil and store:autoconnect_profile().name == "good",
+        "and keep the profile flagged")
+    assert_true(entry.checked_func() == true, "so it reads as ticked")
+    entry.callback()
+    assert_true(G_reader_settings:readSetting("start_with") ~= plugin.START_WITH,
+        "toggling off must clear the stored choice")
+    assert_true(store:autoconnect_profile() == nil, "and the profile flag")
+    assert_true(index_of(texts(sw), "VNC auto connect") == nil,
+        "and the entry must then be gone from the submenu")
+
+    -- the label: core cannot name our value, the additive wrapper can; the core values still work
+    local core_item = FileManagerMenu.getStartWithMenuTable({})
+    G_reader_settings:saveSetting("start_with", plugin.START_WITH)
+    assert_true(core_item.text_func() == nil,
+        "core alone labels our value as nothing (hence the wrapper)")
+    assert_true(sw.text_func() == "Start with: VNC auto connect",
+        "the wrapper names it, got: " .. tostring(sw.text_func()))
+    G_reader_settings:saveSetting("start_with", "history")
+    assert_true(sw.text_func() == "Start with: history",
+        "and every core value still goes to the core label, got: " .. tostring(sw.text_func()))
+    G_reader_settings:saveSetting("start_with", "filemanager")
+    store:set_autoconnect(nil)
+    store:flush()
+end)
+
+check("start_with_naming_us_without_a_flag_is_a_normal_start", function()
+    -- KOReader's core only special-cases its own values; our sentinel is not one of them, so a
+    -- stale `start_with` leaves it starting in the file browser. The plugin must then do nothing
+    -- but log it.
+    assert_true(plugin.START_WITH ~= "filemanager" and plugin.START_WITH ~= "last"
+        and plugin.START_WITH ~= "history" and plugin.START_WITH ~= "favorites"
+        and plugin.START_WITH ~= "folder_shortcuts",
+        "our value must be one reader.lua does not know, so it falls back to the file browser")
+
+    store:set_autoconnect(nil)
+    G_reader_settings:saveSetting("start_with", plugin.START_WITH)
+    local logger = require("logger")
+    local real_warn, warned = logger.warn, {}
+    logger.warn = function(...) warned[#warned + 1] = table.concat({ ... }, " ") end
+    local real_connect = plugin.connect_profile
+    local calls = 0
+    plugin.connect_profile = function() calls = calls + 1 end
+    local ok, err = pcall(function()
+        plugin:schedule_autoconnect()
+        UIManager:_checkTasks()
+    end)
+    logger.warn = real_warn
+    plugin.connect_profile = real_connect
+    G_reader_settings:saveSetting("start_with", "filemanager")
+    store:flush()
+    assert_true(ok, "a stale start_with must not raise: " .. tostring(err))
+    assert_true(calls == 0, "and must not connect anything")
+    local named = false
+    for _, message in ipairs(warned) do
+        if message:find("start_with", 1, true) and message:find(plugin.START_WITH, 1, true) then
+            named = true
+        end
+    end
+    assert_true(named, "the stale setting must be logged: " .. table.concat(warned, " | "))
+end)
+
 -- ---------------------------------------------------------------- a real viewer widget
 
 --- Builds a shown viewer app with a fake session and plugin (no network involved).
