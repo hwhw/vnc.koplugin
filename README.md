@@ -66,9 +66,16 @@ There is no permanent toolbar: the remote desktop owns the whole screen.
 | two-finger drag | pan the view (does not move the remote pointer) |
 | pinch / spread | zoom the view, keeping the point between the fingers fixed |
 | two-finger rotate | change the screen orientation |
-| swipe up from the bottom | show the on-screen keyboard |
-| swipe down | hide it again |
+| swipe up from the bottom strip | show the on-screen keyboard |
+| swipe down above the keyboard | hide it again |
 | swipe down in the top menu zone | open the menu |
+
+The two keyboard swipes have to start in the space the keyboard leaves free: a swipe **up from the
+bottom strip** shows the keyboard, a swipe down **above** it hides it again. Swipes that begin on
+the keys themselves belong to KOReader's keyboard, where a swipe on a key inserts one of its
+alternate characters — so there is no "swipe down on the keyboard to put it away". The menu's
+**Hide keyboard** entry does that from anywhere, and **keyboard always visible** keeps the keyboard
+up regardless of either swipe.
 
 A tap is *always* a click on the remote — including in the top menu zone — so there is never a
 dead spot on the screen. That is why the menu opens on a **swipe down** in KOReader's menu zone at

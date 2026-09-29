@@ -124,6 +124,37 @@ the topmost full-screen widget, so a widget appearing *above* the viewer never r
 the 250 ms re-check (_watch_keyboard_state). That is also why a toast (a Bell notification) is
 explicitly flagged `toast = true`: it is allowed to share the screen with the keyboard.
 
+Keyboard gestures, and why the keyboard's own rectangle cannot host one. ViewerApp:init_gestures()
+declares the two keyboard swipes in `ges_events`: a swipe *north* starting in the canvas' bottom
+strip (`bottom_strip`, the bottom 15 % of the canvas, recomputed from `canvas_geom()` at match time
+so it follows a rotation and a keyboard height change) shows the keyboard, and a swipe *south* in
+the canvas above it hides it again. A tap, or an ordinary drag, never matches: a swipe has to finish
+within KOReader's `ges_swipe_interval` (900 ms) or the detector reports a pan instead. The viewer is
+registered `is_always_active` (c.f. ViewerApp's prototype), which is what makes this reachable:
+`UIManager:sendEvent` offers a gesture to the topmost widget first and then to the always-active
+ones, so the on-screen keyboard does not hide the canvas from the gesture machinery - and
+`_input_target()` likewise ignores the viewer's own keyboard, so canvas gestures keep working
+underneath it.
+
+That offer order is what blocks a "swipe down over the keyboard to put it away". KOReader's keyboard
+consumes swipes itself: every `VirtualKey` carries a `SwipeKey` ges_event over its own rectangle
+whose handler (`VirtualKey:onSwipeKey`) always returns true and runs the key's core
+`swipe_callback` - the per-key swipe characters (a south swipe on `q` inserts its variant `q̃`) and,
+on the layout key, the layout switch. `WidgetContainer:handleEvent` propagates to the *children*
+first, so a touch zone (`registerTouchZones` with `overrides`) or a ges_event on the VirtualKeyboard
+we construct can only run *after* the keys declined; zone priority does not reach into a child.
+Hiding the keyboard on a south swipe that begins on a key therefore means overriding the keys' own
+gesture handling (their `swipe_callback`/ges_events, the keyboard's event dispatch, or input at the
+UIManager level). Deliberately not done. Widening the viewer's hiding range instead would only cover
+the keyboard frame's padding between keys: it would insert a character where the swipe lands on a
+key and hide the keyboard where it lands in a gap.
+
+A swipe reaches the viewer *after* the pans that led up to it and *instead of* a pan_release
+(`Contact:panState`), so a swipe-driven menu or keyboard action also sends the leading press+drag to
+the remote and leaves `_drag_active` set; the button is released by the next pointer event with a
+zero mask (e.g. the next tap). Not changed: withholding the press until a gesture is known not to be
+a swipe would delay every canvas drag.
+
 Refreshes, and why a full-screen widget has to ask for them. UIManager:show/close only queue the
 refresh the *caller* passed; with no refreshtype they queue nothing at all (`_refresh(nil, ...)`
 returns), and the widgets they uncover are merely flagged for repaint. On an LCD that is
@@ -331,12 +362,15 @@ checks the flows that are hard to reach by hand: every menu/dialog returns to wh
 a failed connection returns to the connection list with exactly one dismissable message, the
 canvas follows rotations, the keyboard neither rescales nor moves a view that does not fit above
 it, the fitted zoom modes and the keyboard-aware placement behave, the keyboard yields to popups,
-platform text input is enabled exactly while the viewer is shown, typed text and physical keys
-reach the remote (through KOReader's own SDL event handler), and the settings store survives a
-hand-edited or empty file. It also covers the server menu's autostart toggle, the environment
-overrides' parsing rules and precedence (through read_env's lookup seam), that a flush after them
-leaves the settings file byte-identical, and that the deferred tick starts the server exactly once
-when the setting (or the environment) asks for it. The client half gets the same treatment: the
+the keyboard swipes behave (a swipe up from the bottom strip shows the keyboard - after a rotation
+and a keyboard height change too - a swipe down above it hides it again, and the always-visible
+setting wins over both), platform text input is enabled exactly while the viewer is shown, typed
+text and physical keys reach the remote (through KOReader's own SDL event handler), and the
+settings store survives a hand-edited or empty file. It also covers the server menu's autostart
+toggle, the environment overrides' parsing rules and precedence (through read_env's lookup seam),
+that a flush after them leaves the settings file byte-identical, and that the deferred tick starts
+the server exactly once when the setting (or the environment) asks for it. The client half gets
+the same treatment: the
 `autoconnect` flag round-trips through the file, survives an edit that does not mention it, clears
 any other flagged profile (and a hand-edited file with two is normalised to the first on load), the
 actions dialog's switch and the list's marker work, the deferred tick connects the flagged profile
