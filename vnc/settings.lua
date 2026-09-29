@@ -18,7 +18,7 @@ local Settings = {}
 Settings.__index = Settings
 
 --- Profile field names.
-Settings.PROFILE_FIELDS = { "name", "host", "port", "password" }
+Settings.PROFILE_FIELDS = { "name", "host", "port", "password", "autoconnect" }
 
 --- The only top-level keys of the file.
 Settings.DATA_KEYS = { "profiles", "settings", "server" }
@@ -155,6 +155,8 @@ local function clean_profile(p)
         host = type(p.host) == "string" and p.host or "",
         port = port,
         password = type(p.password) == "string" and p.password or "",
+        -- Only the boolean true counts: a hand-edited `"yes"` (or anything else) means "no".
+        autoconnect = p.autoconnect == true,
     }
 end
 
@@ -208,6 +210,20 @@ function Settings:normalise()
         end
     end
     data.profiles = cleaned
+
+    -- At most one profile may auto-connect: keep the first flagged one and clear the rest, so a
+    -- hand-edited file cannot break the invariant the UI and the boot start rely on.
+    local autoconnect_seen = false
+    for _, p in ipairs(cleaned) do
+        if p.autoconnect then
+            if autoconnect_seen then
+                logger.dbg("vnc: clearing a second autoconnect profile:", p.name)
+                p.autoconnect = false
+            else
+                autoconnect_seen = true
+            end
+        end
+    end
 end
 
 --- @treturn table array of connection profiles
@@ -222,6 +238,27 @@ function Settings:get_profile(name)
         if p.name == name then return p end
     end
     return nil
+end
+
+--- The one profile flagged to auto-connect at start, if any.
+---
+--- At most one profile ever carries the flag (@{Settings:normalise} and @{Settings:save_profile}
+--- both enforce it), so the first match is the only match.
+--- @treturn table|nil
+function Settings:autoconnect_profile()
+    for _, p in ipairs(self:profiles()) do
+        if p.autoconnect then return p end
+    end
+    return nil
+end
+
+--- Makes `name` the auto-connect profile, clearing the flag on every other one (or clears it
+--- everywhere when `name` is nil).
+--- @tparam string|nil name
+function Settings:set_autoconnect(name)
+    for _, p in ipairs(self:profiles()) do
+        p.autoconnect = name ~= nil and p.name == name
+    end
 end
 
 --- Adds or updates a profile, keyed by name.
@@ -269,11 +306,20 @@ function Settings:save_profile(p, existing_name)
 
     local cleaned = clean_profile({
         name = name, host = p.host, port = port, password = p.password,
+        -- An editor that does not know about `autoconnect` must not clear the flag: an omitted
+        -- field means "keep what this profile had".
+        autoconnect = p.autoconnect == nil and (found and found.autoconnect or false) or p.autoconnect,
     })
     if idx then
         profiles[idx] = cleaned
     else
         profiles[#profiles + 1] = cleaned
+    end
+    if cleaned.autoconnect then
+        -- Only one profile may carry it: saving it here clears it on every other profile.
+        for _, other in ipairs(profiles) do
+            if other ~= cleaned then other.autoconnect = false end
+        end
     end
     return true
 end

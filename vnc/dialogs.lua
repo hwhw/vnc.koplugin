@@ -57,9 +57,10 @@ function Dialogs.connection_list(plugin, opts)
 
     local profiles = plugin.settings:profiles()
     local item_table = {}
-    for _, profile in ipairs(profiles) do
+    for _i, profile in ipairs(profiles) do
         item_table[#item_table + 1] = {
-            text = profile.name,
+            -- The marker is how the list shows which connection starts with KOReader.
+            text = profile.autoconnect and T(_("%1 (auto connect)"), profile.name) or profile.name,
             mandatory = string.format("%s:%d", profile.host, profile.port),
             callback = function()
                 plugin:close_connection_list()
@@ -129,6 +130,23 @@ function Dialogs.profile_actions(plugin, profile, opts)
                 callback = function()
                     UIManager:close(dialog)
                     plugin:connect_profile(profile.name, back)
+                end,
+            } },
+            { {
+                -- A per-connection switch for the boot start. Turning it on for one connection
+                -- turns it off everywhere else (only one profile may carry it), which is why the
+                -- dialog is reopened afterwards: the label has to reflect the new state.
+                text = profile.autoconnect and _("Auto connect on start: on")
+                    or _("Auto connect on start: off"),
+                callback = function()
+                    if profile.autoconnect then
+                        plugin.settings:set_autoconnect(nil)
+                    else
+                        plugin.settings:set_autoconnect(profile.name)
+                    end
+                    plugin.settings:flush()
+                    UIManager:close(dialog)
+                    reopen_actions()
                 end,
             } },
             { {
