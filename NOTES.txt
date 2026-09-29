@@ -91,7 +91,9 @@ closes the socket and restores Wi-Fi, and only Wi-Fi that the plugin turned on i
 Settings. There is no schema version and no migration - the plugin has no released file format to
 be compatible with. vnc/settings.lua:normalise() just keeps the file in shape on load:
 missing global settings get their defaults, unknown keys are dropped, profiles without a usable
-name are dropped. Never add migration code "just in case" before a format has actually shipped.
+name are dropped. One invariant is enforced there too: at most one profile may carry
+`autoconnect` (see below), so the first flagged one keeps it and the rest are cleared.
+Never add migration code "just in case" before a format has actually shipped.
 
 Taps always click the remote. The plugin ignores KOReader's "activate menu on tap" preference and
 opens the menu on a swipe down in KOReader's menu zone instead; under "tap only" the menu would be
@@ -244,6 +246,32 @@ nothing re-arms it and a manual stop stays a stop until the next KOReader start.
 is logged (warn) and left in the server's `last_error`, which the menu's status line shows; boot
 pops no dialog.
 
+The client's own "connect at start" is a per-profile `autoconnect` flag with the same deferral
+(`VNC:schedule_autoconnect` -> `UIManager:nextTick` -> `VNC:autoconnect_at_boot`, scheduled once
+from init()). Only one profile may carry it: `Settings:save_profile` and `Settings:set_autoconnect`
+clear it on every other profile when it is set, and `Settings:normalise()` keeps the first flagged
+profile and clears the rest on load, so the invariant holds for a hand-edited file too. A failed
+boot connect reports itself through `connect_profile` - the same "Could not connect to ..." message
+a manual attempt shows - and leaves the normal UI in place; there is no retry. If `start_with`
+still names us but no profile is flagged, the boot does nothing and logs a warning.
+
+"Start with". KOReader builds that submenu from a hard-coded list of five values and has no boot
+hook and no registry for it: reader.lua's if/elseif chain knows only its own values, and an unknown
+one silently opens the file manager. A plugin can still get an entry in, through the generic
+`sorting_hint` orphan mechanism - an item carrying `sorting_hint = "start_with"` is nested by
+MenuSorter into the submenu whose id is `start_with` (ui/elements/filemanager_menu_order.lua).
+Presence has to follow the flag *after* the menu is built (the file-manager menu is cached), so a
+`sub_item_table_func` filters the entry out when nothing is flagged - it is absent, not disabled -
+and the core label function is wrapped additively, because core's `text_func` returns nil for a
+value it does not know and would leave "Start with" with nothing after it. (TouchMenu resolves that
+function; the legacy non-touch `Menu` path reads the static table the sorter filled, so there the
+entry is unconditional - that path is only for a device with neither touch nor a d-pad.) The
+choice itself is stored as `start_with = "vnc_autoconnect"`. Core's boot branch cannot be
+intercepted (external plugins are not loaded before FileManager:init), so selecting the entry makes
+KOReader open the file manager first and the deferred autoconnect then shows the viewer over it;
+that first frame is inherent to doing this without shipping a userpatch. With nothing flagged the
+entry is absent, and a stale `start_with` is only logged.
+
 The environment overrides (`VNC_KOPLUGIN_ENABLE_SERVER`, `_SERVER_HOST`, `_SERVER_PORT`,
 `_SERVER_PASSWORD`) are parsed once at load in `vnc/settings.lua:read_env`, behind a lookup seam
 (a function, `os.getenv` by default) so they are testable without touching the real environment.
@@ -307,7 +335,14 @@ reach the remote (through KOReader's own SDL event handler), and the settings st
 hand-edited or empty file. It also covers the server menu's autostart toggle, the environment
 overrides' parsing rules and precedence (through read_env's lookup seam), that a flush after them
 leaves the settings file byte-identical, and that the deferred tick starts the server exactly once
-when the setting (or the environment) asks for it. The viewer checks at the end model the *panel*
+when the setting (or the environment) asks for it. The client half gets the same treatment: the
+`autoconnect` flag round-trips through the file, survives an edit that does not mention it, clears
+any other flagged profile (and a hand-edited file with two is normalised to the first on load), the
+actions dialog's switch and the list's marker work, the deferred tick connects the flagged profile
+(and nothing when none is flagged, with the network stubbed), a failed boot connect is reported
+like a manual one, and the **VNC auto connect** entry is nested into KOReader's **Start with**
+submenu by the real MenuSorter only while a profile is flagged (and the stale-setting fallback is
+logged). The viewer checks at the end model the *panel*
 as well: an e-ink panel is a medium that only changes where a refresh asked it to, so a screen
 buffer that was painted but never refreshed is caught as stale pixels (that is the check the
 missing `"full"`/`"flashui"` on show/close and the missing flash on a wholesale change used to

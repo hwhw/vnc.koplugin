@@ -19,6 +19,8 @@ TightVNC, RealVNC in compatibility mode, Remmina, phone apps, ...) all understan
   modifiers, arrows, function keys and auto-repeat. Keys the on-screen keyboard does not have
   (Enter, Tab, Esc, Delete) are in the menu.
 - Connection profiles (name, host, port, password) you can add, edit and delete from KOReader.
+- One connection can be flagged to connect by itself at KOReader's start (and to appear as
+  **VNC auto connect** in KOReader's **Start with** menu).
 - Wi-Fi is turned on when a connection needs it and switched back off when you disconnect.
 - **Leave** the viewer and the connection survives: reopen it and the picture is resynchronised.
   Only **Disconnect** closes the session.
@@ -41,6 +43,18 @@ only what KOReader already ships.
 Open the file browser menu in KOReader, then **More tools** ▸ **VNC viewer**. You get the
 connection list; start with **New connection…** and give it a name, the host, the port (5900 by
 default) and the password your VNC server uses. Tap a connection to connect.
+
+**Manage connections…** opens each saved connection's own actions (Connect, Edit, Delete), plus an
+**Auto connect on start** switch. Turning it on dials that connection by itself on KOReader's next
+start and shows it in the viewer; the connection list then marks it (**name (auto connect)**).
+Only one connection can carry it — turning it on for another clears the first. While a connection
+carries it, KOReader's own **Start with** menu also offers **VNC auto connect**, so the choice shows
+up where KOReader keeps its own startup choices.
+
+KOReader cannot be told about the viewer before it opens the file browser — it has no boot hook for
+plugins — so with **VNC auto connect** selected the file browser appears for a moment and the
+viewer opens over it. If the connection cannot be made, the failure is reported exactly as a manual
+connect's is, and you are left in the normal KOReader UI; there is no retry.
 
 There is no permanent toolbar: the remote desktop owns the whole screen.
 
@@ -177,7 +191,8 @@ Connection profiles live in a plain Lua file inside KOReader's settings director
 ```lua
 return {
     ["profiles"] = {
-        [1] = { ["name"] = "desktop", ["host"] = "10.0.0.5", ["port"] = 5900, ["password"] = "" },
+        [1] = { ["name"] = "desktop", ["host"] = "10.0.0.5", ["port"] = 5900, ["password"] = "",
+                ["autoconnect"] = true },  -- connect here at start (at most one profile may)
     },
     ["settings"] = {
         ["orientation"] = 0,               -- default screen orientation (0 = upright)
@@ -196,7 +211,8 @@ return {
 
 You never have to edit it by hand (the editor in the viewer writes it), but it is a good place to
 keep a password out of the dialog. Unknown keys are dropped and missing ones defaulted when it is
-loaded, so a broken file does not keep the plugin from starting.
+loaded, so a broken file does not keep the plugin from starting; if a hand-edited file flags more
+than one profile for `autoconnect`, the first keeps the flag and the rest are cleared.
 
 > **Passwords are stored in clear text**, like KOReader itself does for OPDS and progress sync.
 > VNC Authentication is a weak, DES-based scheme anyway, and **nothing in a VNC session is
