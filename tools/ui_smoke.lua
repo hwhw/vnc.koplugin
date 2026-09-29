@@ -120,6 +120,14 @@ local function answer_confirm(confirm, yes)
     UIManager:close(confirm)
 end
 
+--- Reads a whole file as bytes (for the settings-file identity checks).
+local function slurp(path)
+    local f = assert(io.open(path, "rb"))
+    local content = f:read("*a")
+    f:close()
+    return content
+end
+
 -- ---------------------------------------------------------------- a plugin with two profiles
 
 local plugin_module = assert(dofile(plugin_dir .. "/main.lua"))
@@ -569,6 +577,238 @@ check("server_section_is_in_the_network_menu", function()
         and plugin.settings:server().port == 5900
         and plugin.settings:server().password == "",
         "and the defaults it shows are the stored ones")
+end)
+
+check("server_menu_offers_autostart", function()
+    -- The entry is a checkbox over the stored setting, and toggling it persists to the file.
+    local menu_items = {}
+    plugin:addToMainMenu(menu_items)
+    local item = find_item(menu_items.vnc_server.sub_item_table, "Start with KOReader")
+    assert_true(type(item.checked_func) == "function", "the autostart entry must be a checkbox")
+
+    store.data.server.autostart = false
+    assert_true(item.checked_func() == false, "the item must show the stored setting (off by default)")
+
+    item.callback({ updateItems = function() end })
+    assert_true(store.data.server.autostart == true, "toggling must set the stored setting")
+    assert_true(item.checked_func() == true, "and the item must then show it")
+    local persisted = dofile(store.ls.file)
+    assert_true(persisted.server.autostart == true,
+        "the toggle must have been flushed to the settings file")
+
+    item.callback({ updateItems = function() end })
+    assert_true(store.data.server.autostart == false, "and toggling again clears it")
+    persisted = dofile(store.ls.file)
+    assert_true(persisted.server.autostart == false, "which is flushed too")
+end)
+
+check("server_environment_rules", function()
+    -- The parsing seam: a lookup function stands in for os.getenv, so every documented rule can be
+    -- exercised without touching the real environment.
+    local Settings = require("vnc/settings")
+    local E = Settings.ENV
+    local function read(map)
+        return Settings.read_env(function(name) return map[name] end)
+    end
+
+    -- enable: unset, set-but-empty and whitespace-only all mean "no opinion"
+    for _, map in ipairs({ {}, { [E.enable] = "" }, { [E.enable] = "   " } }) do
+        assert_true(read(map).enable == nil, "an empty enable variable must mean no opinion")
+    end
+    -- the disable words, trimmed and case-insensitive
+    for _, word in ipairs({ "0", "no", "false", " NO ", "False" }) do
+        assert_true(read({ [E.enable] = word }).enable == false,
+            string.format("enable=%q must mean do not start", word))
+    end
+    -- anything else non-empty means start
+    for _, word in ipairs({ "1", "yes", "true", "anything", " no! " }) do
+        assert_true(read({ [E.enable] = word }).enable == true,
+            string.format("enable=%q must mean start", word))
+    end
+
+    -- host: empty/unset leave the stored value; otherwise the trimmed address
+    assert_true(read({}).host == nil and read({ [E.host] = "" }).host == nil
+        and read({ [E.host] = "  " }).host == nil, "an empty host must mean no opinion")
+    assert_true(read({ [E.host] = " 10.0.0.9 " }).host == "10.0.0.9", "the host is trimmed")
+
+    -- port: an integer in range, else ignored (and warned about, never applied)
+    assert_true(read({ [E.port] = "5901" }).port == 5901, "a valid port is applied")
+    assert_true(read({ [E.port] = " 5902 " }).port == 5902, "surrounding space is tolerated")
+    assert_true(read({ [E.port] = "1" }).port == 1 and read({ [E.port] = "65535" }).port == 65535,
+        "the ends of the range are valid")
+    local logger = require("logger")
+    local real_warn, warned = logger.warn, {}
+    logger.warn = function(...) warned[#warned + 1] = table.concat({ ... }, " ") end
+    local ok, err = pcall(function()
+        for _, value in ipairs({ "0", "65536", "70000", "abc", "5900.5", "" }) do
+            assert_true(read({ [E.port] = value }).port == nil,
+                string.format("port=%q must be ignored", value))
+        end
+    end)
+    logger.warn = real_warn
+    if not ok then error(err) end
+    assert_true(#warned == 6, "each invalid port must be warned about, got " .. #warned)
+    for _, message in ipairs(warned) do
+        assert_true(message:find("VNC_KOPLUGIN_SERVER_PORT", 1, true) ~= nil,
+            "the warning must name the variable: " .. message)
+    end
+
+    -- password: set-but-empty is a meaningful "no password", kept verbatim
+    assert_true(read({}).password == nil, "an unset password must mean no opinion")
+    assert_true(read({ [E.password] = "" }).password == "",
+        "an empty password must be kept as an override")
+    assert_true(read({ [E.password] = " with space " }).password == " with space ",
+        "a password must not be trimmed")
+
+    -- all four variables at once
+    local all = read({ [E.enable] = "1", [E.host] = "10.0.0.9", [E.port] = "5999", [E.password] = "pw" })
+    assert_true(all.enable == true and all.host == "10.0.0.9" and all.port == 5999
+        and all.password == "pw", "the four variables are read together")
+end)
+
+check("server_environment_overrides_the_stored_settings", function()
+    local Settings = require("vnc/settings")
+    local E = Settings.ENV
+    local function env(map) return function(name) return map[name] end end
+    local path = data_dir .. "/ui_smoke_env_precedence.lua"
+    os.remove(path)
+    os.remove(path .. ".old")
+
+    -- stored: do not autostart, listen on 127.0.0.1:5901 with a password
+    local s = Settings.open(path)
+    s.data.server.ip, s.data.server.port = "127.0.0.1", 5901
+    s.data.server.password, s.data.server.autostart = "stored", false
+    s:flush()
+
+    -- no environment at all: the stored setting decides and the stored table is used as-is
+    local plain = Settings.open(path)
+    assert_true(plain:should_autostart() == false, "without the environment the stored setting decides")
+    assert_true(plain:server_for_run() == plain.data.server,
+        "without overrides the running server shares the stored table")
+
+    -- a set-but-empty enable variable is no opinion: the stored setting still decides
+    local blank = Settings.open(path, env({ [E.enable] = "" }))
+    assert_true(blank:should_autostart() == false,
+        "an empty enable variable leaves the stored setting in charge")
+    s.data.server.autostart = true
+    s:flush()
+    assert_true(Settings.open(path, env({ [E.enable] = "" })):should_autostart() == true,
+        "and the stored setting can turn it on")
+
+    -- the environment decides regardless of the stored setting
+    assert_true(Settings.open(path, env({ [E.enable] = "1" })):should_autostart() == true,
+        "enable=1 starts with the stored setting on")
+    s.data.server.autostart = false
+    s:flush()
+    assert_true(Settings.open(path, env({ [E.enable] = "1" })):should_autostart() == true,
+        "enable=1 starts even with the stored setting off")
+    assert_true(Settings.open(path, env({ [E.enable] = "0" })):should_autostart() == false,
+        "enable=0 does not start")
+    s.data.server.autostart = true
+    s:flush()
+    assert_true(Settings.open(path, env({ [E.enable] = "no" })):should_autostart() == false,
+        "enable=no does not start even with the stored setting on")
+
+    -- host/port/password overrides are merged into the run, the stored values untouched
+    local run = Settings.open(path, env({
+        [E.host] = "10.9.8.7", [E.port] = "6001", [E.password] = "envsecret",
+    }))
+    local effective = run:server_for_run()
+    assert_true(effective.ip == "10.9.8.7" and effective.port == 6001
+        and effective.password == "envsecret", "the run must see the environment values")
+    assert_true(effective ~= run.data.server, "the run must not get the stored table itself")
+    assert_true(run.data.server.ip == "127.0.0.1" and run.data.server.port == 5901
+        and run.data.server.password == "stored", "the stored values must be untouched")
+
+    -- an empty password override really means "no password"; the other fields stay stored
+    local no_pw = Settings.open(path, env({ [E.password] = "" })):server_for_run()
+    assert_true(no_pw.password == "" and no_pw.ip == "127.0.0.1" and no_pw.port == 5901,
+        "an empty password is applied while the other stored values stay")
+end)
+
+check("server_environment_is_not_persisted", function()
+    local Settings = require("vnc/settings")
+    local E = Settings.ENV
+    local path = data_dir .. "/ui_smoke_env_store.lua"
+    os.remove(path)
+    os.remove(path .. ".old")
+
+    -- a canonical file, written the way the plugin writes it
+    local s = Settings.open(path)
+    s.data.server.ip, s.data.server.port = "127.0.0.1", 5901
+    s.data.server.password, s.data.server.autostart = "stored", false
+    s:flush()
+    local before = slurp(path)
+
+    -- reopen with a full set of overrides and force a flush (what an exit-time save does)
+    local run = Settings.open(path, function(name)
+        return ({ [E.enable] = "1", [E.host] = "10.9.8.7",
+                  [E.port] = "6001", [E.password] = "envsecret" })[name]
+    end)
+    assert_true(run:server_for_run().password == "envsecret", "the overrides are in effect for the run")
+    run:flush()
+    assert_true(slurp(path) == before,
+        "a flush after the overrides must leave the settings file byte-identical")
+
+    -- and nothing must have leaked into the stored table either
+    local reloaded = Settings.open(path)
+    assert_true(reloaded.data.server.ip == "127.0.0.1" and reloaded.data.server.port == 5901
+        and reloaded.data.server.password == "stored" and reloaded.data.server.autostart == false,
+        "the file still holds the stored values")
+end)
+
+check("server_autostart_starts_once_the_tick_runs", function()
+    local socket = require("socket")
+    local probe = assert(socket.bind("127.0.0.1", 0))
+    local _, port = probe:getsockname()
+    probe:close()
+
+    local server_settings = store.data.server
+    local saved = { ip = server_settings.ip, port = server_settings.port,
+                    password = server_settings.password, autostart = server_settings.autostart,
+                    env = plugin.settings.env }
+    server_settings.ip = "127.0.0.1"
+    server_settings.port = port
+    server_settings.password = ""
+    plugin.settings.env = {}
+
+    local ok, err = pcall(function()
+        -- off: the deferred tick starts nothing
+        server_settings.autostart = false
+        plugin:schedule_autostart()
+        UIManager:_checkTasks()
+        assert_true(not plugin.server:is_running(), "with autostart off nothing may start")
+
+        -- on: the start is deferred to the next UI loop turn, and then it happens
+        server_settings.autostart = true
+        plugin:schedule_autostart()
+        assert_true(not plugin.server:is_running(), "the start must be deferred, not immediate")
+        UIManager:_checkTasks()
+        assert_true(plugin.server:is_running(), "the next tick must start the server")
+        assert_true(plugin.server:status_text() == "127.0.0.1:" .. port,
+            "it must listen where the settings say, got " .. tostring(plugin.server:status_text()))
+
+        -- and it does not re-arm: a manual stop stays a stop
+        plugin.server:stop()
+        UIManager:_checkTasks()
+        assert_true(not plugin.server:is_running(), "a manual stop must not be undone")
+
+        -- the environment decides too, with the stored setting off
+        server_settings.autostart = false
+        plugin.settings.env = { enable = true }
+        plugin:schedule_autostart()
+        UIManager:_checkTasks()
+        assert_true(plugin.server:is_running(), "the environment must be able to start it")
+        plugin.server:stop()
+        UIManager:_checkTasks()
+        assert_true(not plugin.server:is_running(), "and it stops again")
+    end)
+
+    if plugin.server:is_running() then plugin.server:stop() end
+    server_settings.ip, server_settings.port = saved.ip, saved.port
+    server_settings.password, server_settings.autostart = saved.password, saved.autostart
+    plugin.settings.env = saved.env
+    if not ok then error(err, 0) end
 end)
 
 check("settings_file_is_kept_in_shape", function()
