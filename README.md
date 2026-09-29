@@ -9,8 +9,6 @@ started from the *Network* menu, lets a computer elsewhere watch and drive the r
 Both halves speak RFB 3.8, the protocol ordinary VNC servers and viewers (x11vnc, TigerVNC,
 TightVNC, RealVNC in compatibility mode, Remmina, phone apps, ...) all understand.
 
-Current version: **v0.5**.
-
 ## What you get
 
 - The remote framebuffer on the whole screen, scaled to fit, with zoom presets (fit screen, fit
