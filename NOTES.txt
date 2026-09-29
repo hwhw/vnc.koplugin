@@ -262,8 +262,9 @@ one silently opens the file manager. A plugin can still get an entry in, through
 MenuSorter into the submenu whose id is `start_with` (ui/elements/filemanager_menu_order.lua).
 Presence has to follow the flag *after* the menu is built (the file-manager menu is cached), so a
 `sub_item_table_func` filters the entry out when nothing is flagged - it is absent, not disabled -
-and the core label function is wrapped additively, because core's `text_func` returns nil for a
-value it does not know and would leave "Start with" with nothing after it. (TouchMenu resolves that
+and the core label function is wrapped additively, because core's `text_func` falls through
+(returning no value) for a value it does not know and would leave "Start with" with nothing after
+it. (TouchMenu resolves that
 function; the legacy non-touch `Menu` path reads the static table the sorter filled, so there the
 entry is unconditional - that path is only for a device with neither touch nor a d-pad.) The
 choice itself is stored as `start_with = "vnc_autoconnect"`. Core's boot branch cannot be
